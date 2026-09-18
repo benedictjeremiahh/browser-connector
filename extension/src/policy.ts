@@ -1,4 +1,4 @@
-import type { PermissionMode, Risk } from "./types";
+import type { Risk } from "./types";
 
 const READ_ONLY = new Set([
   "read_page",
@@ -21,7 +21,6 @@ export interface Classification {
 export function classifyRequest(
   method: string,
   params: Record<string, unknown>,
-  mode: PermissionMode,
   targetDescription = ""
 ): Classification {
   if (method === "tabs_context" && !params.createIfEmpty) {
@@ -41,7 +40,7 @@ export function classifyRequest(
     let highest: Risk = "read_only";
     for (const action of actions) {
       if (!isRecord(action) || typeof action.tool !== "string" || !isRecord(action.arguments)) continue;
-      const nested = classifyRequest(action.tool, action.arguments, mode).risk;
+      const nested = classifyRequest(action.tool, action.arguments).risk;
       if (nested === "critical") return { risk: "critical", reason: "Batch contains a Critical Action" };
       if (nested === "protected") highest = "protected";
       else if (nested === "routine" && highest === "read_only") highest = "routine";
@@ -60,7 +59,7 @@ export function classifyRequest(
   }
   return {
     risk: "routine",
-    reason: mode === "manual" ? "Manual mode approves every browser mutation" : "Routine browser mutation"
+    reason: "Routine browser mutation"
   };
 }
 

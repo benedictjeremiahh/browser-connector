@@ -3,12 +3,12 @@ import { describe, expect, it } from "vitest";
 
 describe("connector policy", () => {
   it("classifies Claude-shaped read tools as read-only", () => {
-    expect(classifyRequest("read_page", {}, "auto").risk).toBe("read_only");
-    expect(classifyRequest("read_network_requests", { includeResponseBody: true }, "auto").risk).toBe("protected");
+    expect(classifyRequest("read_page", {}).risk).toBe("read_only");
+    expect(classifyRequest("read_network_requests", { includeResponseBody: true }).risk).toBe("protected");
   });
 
   it("never treats arbitrary JavaScript as routine", () => {
-    expect(classifyRequest("javascript_tool", { source: "1 + 1" }, "auto").risk).toBe("protected");
+    expect(classifyRequest("javascript_tool", { source: "1 + 1" }).risk).toBe("protected");
   });
 
   it("inherits the highest batch risk", () => {
@@ -17,12 +17,12 @@ describe("connector policy", () => {
         { tool: "read_page", arguments: {} },
         { tool: "upload_file", arguments: {} }
       ]
-    }, "auto");
+    });
     expect(result.risk).toBe("protected");
   });
 
   it("recognizes critical target labels", () => {
-    expect(classifyRequest("computer", { action: "click", pageRef: "r1" }, "auto", "Place order").risk).toBe("critical");
+    expect(classifyRequest("computer", { action: "click", pageRef: "r1" }, "Place order").risk).toBe("critical");
   });
 
   it("restricts privileged schemes and keeps exact origins", () => {

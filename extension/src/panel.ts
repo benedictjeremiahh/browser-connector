@@ -5,10 +5,8 @@ const status = byId("status");
 const pairedHost = byId("paired-host");
 const leaseHost = byId("lease-host");
 const tabCount = byId("tab-count");
-const mode = byId("permission-mode") as HTMLSelectElement;
 const auditRoot = byId("audit-log");
 
-mode.addEventListener("change", () => void chrome.runtime.sendMessage({ type: "set_permission_mode", mode: mode.value }));
 byId("revoke-lease").addEventListener("click", () => void chrome.runtime.sendMessage({ type: "revoke_lease" }));
 byId("clear-log").addEventListener("click", () => void chrome.runtime.sendMessage({ type: "clear_log" }));
 byId("control-current").addEventListener("click", () => void controlCurrentTab());
@@ -30,7 +28,6 @@ function render(state: PanelState): void {
   pairedHost.textContent = state.pairedHosts.join(", ") || "None";
   leaseHost.textContent = state.leaseHostId ?? "None";
   tabCount.textContent = String(state.controlledTabIds.length);
-  mode.value = state.permissionMode;
   renderAudit(state);
 }
 

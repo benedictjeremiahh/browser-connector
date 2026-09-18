@@ -1,4 +1,3 @@
-export type PermissionMode = "manual" | "auto";
 export type Risk = "read_only" | "routine" | "protected" | "critical";
 export type GrantDecision = "once" | "session" | "always" | "deny";
 
@@ -46,7 +45,6 @@ export interface AuditEvent {
 }
 
 export interface PersistedState {
-  permissionMode: PermissionMode;
   pairedHosts: Record<string, string>;
   alwaysSiteGrants: string[];
   auditEvents: AuditEvent[];
@@ -57,15 +55,11 @@ export interface PanelState {
   pairedHosts: string[];
   leaseHostId?: string;
   controlledTabIds: number[];
-  permissionMode: PermissionMode;
   approvals: ApprovalRequest[];
   auditEvents: AuditEvent[];
 }
 
 export const DEFAULT_STATE: PersistedState = {
-  // Auto-approval build: agent hosts connect without panel actions, so the
-  // default permission mode no longer gates routine mutations behind a prompt.
-  permissionMode: "auto",
   pairedHosts: {},
   alwaysSiteGrants: [],
   auditEvents: []

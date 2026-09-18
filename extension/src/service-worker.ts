@@ -135,8 +135,7 @@ async function authorize(request: NativeRequest): Promise<{ risk: Risk; origin?:
 
   const { classification, targetDescription } = await classifyAuthorizedRequest(
     request.method,
-    request.params,
-    state.permissionMode
+    request.params
   );
   if (request.method === "browser_batch" && classification.risk === "critical") {
     throw connectorError(
@@ -145,8 +144,7 @@ async function authorize(request: NativeRequest): Promise<{ risk: Risk; origin?:
     );
   }
   const mustApproveAction = classification.risk === "protected"
-    || classification.risk === "critical"
-    || (classification.risk === "routine" && state.permissionMode === "manual");
+    || classification.risk === "critical";
   if (mustApproveAction) {
     const decision = await askApproval({
       kind: "action",
@@ -276,14 +274,6 @@ async function handlePanelMessage(message: unknown): Promise<unknown> {
     await broadcastState();
     return { ok: true };
   }
-  if (message.type === "set_permission_mode") {
-    const mode = message.mode === "auto" ? "auto" : "manual";
-    const state = await persistedState();
-    state.permissionMode = mode;
-    await savePersistedState(state);
-    await broadcastState();
-    return { ok: true };
-  }
   if (message.type === "control_tab") {
     const tabId = Number(message.tabId);
     const origin = String(message.origin ?? "");
@@ -365,7 +355,6 @@ interface SessionState {
 async function persistedState(): Promise<PersistedState> {
   const stored = await chrome.storage.local.get(DEFAULT_STATE) as Partial<PersistedState>;
   return {
-    permissionMode: stored.permissionMode === "auto" ? "auto" : "manual",
     pairedHosts: stored.pairedHosts ?? {},
     alwaysSiteGrants: stored.alwaysSiteGrants ?? [],
     auditEvents: stored.auditEvents ?? []
@@ -409,7 +398,6 @@ async function panelState(): Promise<PanelState> {
     pairedHosts: Object.keys(state.pairedHosts),
     leaseHostId: session.leaseHostId,
     controlledTabIds: session.controlledTabIds,
-    permissionMode: state.permissionMode,
     approvals: [...approvals.values()].map(({ request }) => request),
     auditEvents: [...state.auditEvents].reverse().slice(0, 50)
   };
@@ -447,8 +435,7 @@ function actionDataCategory(request: NativeRequest): string {
 
 async function classifyAuthorizedRequest(
   method: string,
-  params: Record<string, unknown>,
-  mode: PersistedState["permissionMode"]
+  params: Record<string, unknown>
 ): Promise<{ classification: ReturnType<typeof classifyRequest>; targetDescription: string }> {
   if (method !== "browser_batch") {
     let targetDescription = "";
@@ -459,7 +446,7 @@ async function classifyAuthorizedRequest(
         context?.destinationOrigin && `Cross-origin destination: ${context.destinationOrigin}`
       ].filter(Boolean).join("\n");
     }
-    return { classification: classifyRequest(method, params, mode, targetDescription), targetDescription };
+    return { classification: classifyRequest(method, params, targetDescription), targetDescription };
   }
 
   let classification: ReturnType<typeof classifyRequest> = {
@@ -469,7 +456,7 @@ async function classifyAuthorizedRequest(
   const descriptions: string[] = [];
   for (const action of Array.isArray(params.actions) ? params.actions : []) {
     if (!isRecord(action) || typeof action.tool !== "string" || !isRecord(action.arguments)) continue;
-    const nested = await classifyAuthorizedRequest(action.tool, action.arguments, mode);
+    const nested = await classifyAuthorizedRequest(action.tool, action.arguments);
     if (nested.targetDescription) descriptions.push(`${action.tool}: ${nested.targetDescription}`);
     if (riskRank(nested.classification.risk) > riskRank(classification.risk)) classification = nested.classification;
   }
