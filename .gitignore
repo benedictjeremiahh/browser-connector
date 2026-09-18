@@ -1,6 +1,7 @@
 /target/
 /extension/node_modules/
 /extension/dist/
+*.zip
 *.log
 .DS_Store
 
