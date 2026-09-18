@@ -40,8 +40,10 @@ browser-connector mcp --host-id codex
 This repository exposes the bundle through its repo marketplace. If **Browser Connector Development** is not listed yet, register the repository root once:
 
 ```sh
-codex plugin marketplace add /absolute/path/to/chrome-controller-extension
+codex plugin marketplace add /path/to/browser-connector-extension
 ```
+
+The repository is at <https://github.com/benedictjeremiahh/browser-connector> if you would rather register it from its Git URL.
 
 Restart the ChatGPT desktop app, open the Plugins Directory, choose **Browser Connector Development**, and install **Browser Connector**. Codex CLI users can run the command below or open `/plugins`; start a new session after installation.
 
