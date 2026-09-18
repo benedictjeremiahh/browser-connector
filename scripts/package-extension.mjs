@@ -1,19 +1,28 @@
 #!/usr/bin/env node
 /**
- * Build the extension and pack exactly what a browser store receives: the
- * contents of `extension/dist` at the root of the archive, with no build
- * directory or sourcemaps inside.
+ * Build the extension and pack exactly what the Chrome Web Store receives: the
+ * contents of `extension/dist` at the root of the archive, no build directory
+ * and no sourcemaps.
  *
- * The manifest keeps its `key`, so the packed extension keeps the id
- * `kppdjhnonomijdjifhobgeaipejojbho` the native-messaging manifest already
- * lists in `allowed_origins`. Removing it would hand the store a different id
- * and silently break every installed bridge.
+ * The manifest `key` is removed from the packaged copy. It exists so an
+ * unpacked or self-hosted install keeps a stable id — that is what
+ * `allowed_origins` in the native-messaging manifest names — but the Web Store
+ * rejects an upload whose manifest carries a `key` ("Bidang key tidak
+ * diperbolehkan dalam manifes") and assigns its own id instead.
+ *
+ * So the store id is not the development id. After the first upload, read the
+ * id the console shows and register the bridge against it:
+ *
+ *   browser-connector install --extension-id <store-id> --host-id codex
+ *
+ * `extension/dist` keeps its key, because the unpacked install still needs it.
  *
  *   node scripts/package-extension.mjs            -> browser-connector.zip
  *   BROWSER_CONNECTOR_ZIP=/tmp/x.zip node ...
  */
 import { execFileSync } from 'node:child_process';
-import { existsSync, rmSync, statSync } from 'node:fs';
+import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -28,12 +37,24 @@ if (!existsSync(join(dist, 'manifest.json'))) {
   process.exit(1);
 }
 
-rmSync(archive, { force: true });
-execFileSync('zip', ['-r', '-q', archive, '.', '-x', '*.map'], { cwd: dist, stdio: 'inherit' });
+const staging = mkdtempSync(join(tmpdir(), 'browser-connector-store-'));
+try {
+  cpSync(dist, staging, { recursive: true });
 
-const manifest = JSON.parse(execFileSync('unzip', ['-p', archive, 'manifest.json'], { encoding: 'utf8' }));
-const kb = Math.round(statSync(archive).size / 1024);
-console.log(`\n${archive}`);
-console.log(`  name ${manifest.name} ${manifest.version} · manifest v${manifest.manifest_version}`);
-console.log(`  key ${manifest.key ? 'present (id stays kppdjhnonomijdjifhobgeaipejojbho)' : 'ABSENT — the store id will differ'}`);
-console.log(`  ${kb} KB`);
+  const manifestPath = join(staging, 'manifest.json');
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+  const devKey = manifest.key;
+  delete manifest.key;
+  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+  rmSync(archive, { force: true });
+  execFileSync('zip', ['-r', '-q', archive, '.', '-x', '*.map'], { cwd: staging, stdio: 'inherit' });
+
+  const kb = Math.round(statSync(archive).size / 1024);
+  console.log(`\n${archive}`);
+  console.log(`  ${manifest.name} ${manifest.version} · manifest v${manifest.manifest_version} · ${kb} KB`);
+  console.log(`  key: removed${devKey ? ' (extension/dist keeps it for the unpacked install)' : ' (was already absent)'}`);
+  console.log('  the store assigns the id; register the bridge against it after the first upload');
+} finally {
+  rmSync(staging, { recursive: true, force: true });
+}

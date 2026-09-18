@@ -16,10 +16,21 @@ these fields are pasted by hand.
 | `store/promo-440x280.png` | Store listing → Small promo tile. |
 | `extension/public/icons/128.png` | Already inside the package; the console also wants a store icon. |
 
-The package keeps its manifest `key`, so the extension id stays
-`kppdjhnonomijdjifhobgeaipejojbho` — the id the installed native-messaging host
-already lists in `allowed_origins`. Do not strip it; a different id silently
-breaks every installed bridge.
+The package has **no `key` in its manifest**. The Web Store rejects an upload
+that carries one — *"Bidang key tidak diperbolehkan dalam manifes"* — and
+assigns the id itself, so **the store id is not the development id.** After the
+first upload, read the id the console shows and register the bridge against it:
+
+```sh
+browser-connector install --extension-id <store-id> --host-id <your-host-id>
+```
+
+Until then the native-messaging manifest still names
+`kppdjhnonomijdjifhobgeaipejojbho`, which is the id the **unpacked** install
+uses; `extension/dist` keeps its `key` precisely so that one does not change.
+Two installs, two ids, and `allowed_origins` can list only the ids you have
+actually registered — register the store id alongside the development one
+rather than replacing it.
 
 ## Store listing
 
@@ -117,9 +128,9 @@ The console asks for one per permission. Paste these:
 
 ## Console steps
 
-1. **Package** → upload `browser-connector.zip`. Confirm the id shown is
-   `kppdjhnonomijdjifhobgeaipejojbho`, the same id `docs/INSTALL.md` registers
-   the native-messaging host against.
+1. **Package** → upload `browser-connector.zip`. The manifest carries no `key`
+   (the store rejects one), so the id the console assigns is new. Note it down:
+   it is what step 3's `allowed_origins` must name.
 2. **Store listing** → name, summary, detailed description, category *Developer
    Tools*, language English, three screenshots, small promo tile, store icon.
 3. **Privacy practices** → single purpose, the justifications above, the data-use
