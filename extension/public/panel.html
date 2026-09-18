@@ -39,34 +39,12 @@
 
       <section>
         <div class="section-heading">
-          <h2>Approvals</h2><span id="approval-count" class="count">0</span>
-        </div>
-        <div id="approvals" class="empty">No requests waiting.</div>
-      </section>
-
-      <section>
-        <div class="section-heading">
           <h2>Recent activity</h2>
           <button id="clear-log" class="link">Clear</button>
         </div>
         <ol id="audit-log" class="audit"></ol>
       </section>
     </main>
-
-    <template id="approval-template">
-      <article class="approval">
-        <p class="approval-kind"></p>
-        <h3 class="approval-title"></h3>
-        <p class="approval-detail"></p>
-        <pre class="approval-preview"></pre>
-        <div class="approval-actions">
-          <button data-decision="once">Allow once</button>
-          <button data-decision="session" class="session">Allow for session</button>
-          <button data-decision="always" class="always">Always allow site</button>
-          <button data-decision="deny" class="danger">Deny</button>
-        </div>
-      </article>
-    </template>
 
     <script src="panel.js"></script>
   </body>

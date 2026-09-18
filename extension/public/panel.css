@@ -39,12 +39,6 @@ button.danger { background: transparent; color: var(--danger); border-color: #d9
 button.link { padding: 0; background: transparent; color: var(--muted); border: 0; }
 .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
 .empty { color: var(--muted); font-size: 13px; }
-.approval { margin-top: 10px; padding: 12px; border: 1px solid #d5b76d; border-radius: 9px; background: #fff9e9; color: #302815; }
-.approval-kind { margin-bottom: 4px; color: #856710; font-size: 10px; font-weight: 800; letter-spacing: .08em; }
-.approval-detail { color: #625736; }
-.approval-preview { overflow: auto; max-height: 180px; padding: 8px; background: #282b29; color: #e7eee9; white-space: pre-wrap; font-size: 11px; }
-.approval-actions { display: flex; flex-wrap: wrap; gap: 6px; }
-.approval-actions button { font-size: 12px; }
 .audit { margin: 0; padding-left: 20px; }
 .audit li { margin-bottom: 8px; }
 .audit time { display: block; color: var(--muted); font-size: 11px; }
@@ -52,7 +46,6 @@ button.link { padding: 0; background: transparent; color: var(--muted); border: 
 @media (prefers-color-scheme: dark) {
   :root { --bg: #171a18; --panel: #202522; --ink: #eef2ef; --muted: #a6b0a9; --line: #343b36; --accent: #51b58a; --accent-soft: #173c2e; }
   button { color: #102419; }
-  .approval { background: #352f1d; color: #f0e6c7; }
   button.secondary, button.danger { color: var(--ink); }
 }
 
