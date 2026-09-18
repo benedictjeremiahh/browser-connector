@@ -14,6 +14,7 @@ these fields are pasted by hand.
 | `store/screenshot-2-panel.png` (1280×800) | Store listing → Screenshots. |
 | `store/screenshot-3-flow.png` (1280×800) | Store listing → Screenshots. |
 | `store/promo-440x280.png` | Store listing → Small promo tile. |
+| `store/promo-marquee-1400x560.png` | Store listing → Marquee promo image. PNG, 24-bit, **no alpha**, which is what the field demands. |
 | `extension/public/icons/128.png` | Already inside the package; the console also wants a store icon. |
 
 The package has **no `key` in its manifest**. The Web Store rejects an upload
@@ -132,7 +133,8 @@ The console asks for one per permission. Paste these:
    (the store rejects one), so the id the console assigns is new. Note it down:
    it is what step 3's `allowed_origins` must name.
 2. **Store listing** → name, summary, detailed description, category *Developer
-   Tools*, language English, three screenshots, small promo tile, store icon.
+   Tools*, language English, three screenshots, the small promo tile and the
+   1400×560 marquee, store icon.
 3. **Privacy practices** → single purpose, the justifications above, the data-use
    declaration, the limited-use certifications, and the privacy policy URL.
 4. **Distribution** → visibility, and the countries you will ship to.
