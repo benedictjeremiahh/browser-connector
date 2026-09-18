@@ -1,0 +1,26 @@
+{
+  "name": "browser-connector",
+  "version": "0.1.0",
+  "description": "Control an explicitly authorized local Chrome session through provider-agnostic MCP tools.",
+  "author": {
+    "name": "Browser Connector contributors"
+  },
+  "license": "Apache-2.0",
+  "keywords": ["browser", "chrome", "automation", "mcp", "testing"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Browser Connector",
+    "shortDescription": "Use your visible, signed-in Chrome from Codex",
+    "longDescription": "Connect Codex to explicitly controlled Chrome tabs for semantic page reading, visible interaction, screenshots, console and network debugging, and approved file transfer. Browser authority and approvals remain local.",
+    "developerName": "Browser Connector contributors",
+    "category": "Developer Tools",
+    "capabilities": ["Read", "Write", "Interactive"],
+    "defaultPrompt": [
+      "Open my local app in Chrome and verify the latest change.",
+      "Inspect the current controlled tab for console and network errors.",
+      "Test this user flow in Chrome and report what fails."
+    ],
+    "brandColor": "#126A4A"
+  },
+  "mcpServers": "./.mcp.json"
+}

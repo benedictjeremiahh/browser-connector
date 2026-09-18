@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Browser Connector</title>
+    <link rel="stylesheet" href="panel.css">
+  </head>
+  <body>
+    <header>
+      <div class="brand">
+        <img class="brand-mark" src="icons/128.png" alt="" width="30" height="30">
+        <div>
+          <p class="eyebrow">LOCAL CONNECTOR</p>
+          <h1>Browser Connector</h1>
+        </div>
+      </div>
+      <span id="status" class="status disconnected">Disconnected</span>
+    </header>
+
+    <main>
+      <section>
+        <h2>Control</h2>
+        <dl class="facts">
+          <div><dt>Paired host</dt><dd id="paired-host">None</dd></div>
+          <div><dt>Control lease</dt><dd id="lease-host">None</dd></div>
+          <div><dt>Controlled tabs</dt><dd id="tab-count">0</dd></div>
+        </dl>
+        <label for="permission-mode">Permission mode</label>
+        <select id="permission-mode">
+          <option value="manual">Manual</option>
+          <option value="auto">Auto</option>
+        </select>
+        <div class="actions">
+          <button id="control-current">Control current tab</button>
+          <button id="revoke-lease" class="secondary">Revoke lease</button>
+        </div>
+      </section>
+
+      <section>
+        <div class="section-heading">
+          <h2>Approvals</h2><span id="approval-count" class="count">0</span>
+        </div>
+        <div id="approvals" class="empty">No requests waiting.</div>
+      </section>
+
+      <section>
+        <div class="section-heading">
+          <h2>Recent activity</h2>
+          <button id="clear-log" class="link">Clear</button>
+        </div>
+        <ol id="audit-log" class="audit"></ol>
+      </section>
+    </main>
+
+    <template id="approval-template">
+      <article class="approval">
+        <p class="approval-kind"></p>
+        <h3 class="approval-title"></h3>
+        <p class="approval-detail"></p>
+        <pre class="approval-preview"></pre>
+        <div class="approval-actions">
+          <button data-decision="once">Allow once</button>
+          <button data-decision="session" class="session">Allow for session</button>
+          <button data-decision="always" class="always">Always allow site</button>
+          <button data-decision="deny" class="danger">Deny</button>
+        </div>
+      </article>
+    </template>
+
+    <script src="panel.js"></script>
+  </body>
+</html>
+

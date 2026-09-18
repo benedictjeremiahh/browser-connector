@@ -1,0 +1,20 @@
+{
+  "name": "browser-connector-dev",
+  "interface": {
+    "displayName": "Browser Connector Development"
+  },
+  "plugins": [
+    {
+      "name": "browser-connector",
+      "source": {
+        "source": "local",
+        "path": "./plugins/browser-connector"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

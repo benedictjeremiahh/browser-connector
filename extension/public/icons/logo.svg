@@ -1,0 +1,15 @@
+<svg width="128" height="128" viewBox="0 0 128 128" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Browser Connector">
+  <title>Browser Connector</title>
+  <defs>
+    <linearGradient id="bc-tile" x1="16" y1="8" x2="112" y2="120" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#22A06B"/>
+      <stop offset="1" stop-color="#126A4A"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="30" fill="url(#bc-tile)"/>
+  <!-- The cursor: the agent acting on the page. -->
+  <path d="M24 14 L24 89 L42 72 L55 97 L69 91 L56 66 L81 66 Z"
+        fill="#FFFFFF" stroke="#0B1220" stroke-width="4" stroke-linejoin="round"/>
+  <!-- The connection: a local link to a paired host, not a browser tab. -->
+  <circle cx="98" cy="98" r="13" fill="none" stroke="#FFFFFF" stroke-width="7" opacity="0.92"/>
+</svg>

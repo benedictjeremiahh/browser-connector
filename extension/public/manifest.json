@@ -1,0 +1,40 @@
+{
+  "manifest_version": 3,
+  "name": "Browser Connector",
+  "version": "0.1.0",
+  "description": "Local provider-agnostic browser control for paired MCP agent hosts.",
+  "icons": {
+    "16": "icons/16.png",
+    "32": "icons/32.png",
+    "48": "icons/48.png",
+    "128": "icons/128.png"
+  },
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqTPM1JtE7jJDxWLbkVwUTFaMxHad8T7hmB2PWjBuDS6e70NE25HJJTojiEv6KU9SfNPgLj69OdzG5G1k9eeU75zyCdt78xuCo9Iy1zbH/lJkyo6d1UXVkKJmKmCaGywwfn2LLAnz64pXX+aN5+e/TMT8RgadamjLd9S8ivM0Wjyu3y2OEFO8lxLze8MFESWeBihtIblRH4fbZaoe7sdqgcIGHf5f5WZQpYw7lMU385MQXwi7cp1rwS42t+EBswuPaQZeYa9//pMyJYeJ0arCEBltbh7Oum2F3TF0e1gyWslUAU9m4QI28lx1UxRzjCxOR+qpgLRJnva2yJyjfARYZwIDAQAB",
+  "permissions": [
+    "sidePanel",
+    "storage",
+    "scripting",
+    "debugger",
+    "tabs",
+    "tabGroups",
+    "webNavigation",
+    "nativeMessaging"
+  ],
+  "host_permissions": ["http://*/*", "https://*/*"],
+  "background": {
+    "service_worker": "service-worker.js"
+  },
+  "side_panel": {
+    "default_path": "panel.html"
+  },
+  "action": {
+    "default_title": "Open Browser Connector",
+    "default_icon": {
+      "16": "icons/16.png",
+      "32": "icons/32.png",
+      "48": "icons/48.png",
+      "128": "icons/128.png"
+    }
+  },
+  "minimum_chrome_version": "130"
+}

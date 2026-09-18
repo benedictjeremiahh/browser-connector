@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "browser-connector": {
+      "command": "/bin/sh",
+      "args": ["-lc", "exec \"${BROWSER_CONNECTOR_BIN:-$HOME/.local/bin/browser-connector}\" mcp --host-id codex"]
+    }
+  }
+}
