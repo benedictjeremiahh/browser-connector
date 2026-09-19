@@ -54,6 +54,9 @@ export interface PanelState {
   nativeConnected: boolean;
   pairedHosts: string[];
   leaseHostId?: string;
+  /* One entry per Agent Host session. leaseHostId and controlledTabIds stay as the most
+     recent session's, so a panel that has not been taught about several keeps working. */
+  leases?: { sessionId: string; hostId?: string; tabIds: number[] }[];
   controlledTabIds: number[];
   approvals: ApprovalRequest[];
   auditEvents: AuditEvent[];

@@ -201,6 +201,14 @@ pub struct TabsCloseArgs {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LabelSessionArgs {
+    /// A short name for this session, shown as its tab group title. Name what this session is
+    /// working on; the browser already says what any single tab is showing.
+    pub label: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum NavigationAction {
     GoTo,
@@ -401,6 +409,19 @@ impl BrowserService {
     )]
     async fn tabs_close(&self, Parameters(args): Parameters<TabsCloseArgs>) -> CallToolResult {
         self.forward("tabs_close", args).await
+    }
+
+    #[tool(
+        description = "Name this session's tab group. The label is how a person tells two concurrent Agent Host sessions apart in the browser's tab strip, so use what this session is working on rather than what any one tab is showing.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn label_session(&self, Parameters(args): Parameters<LabelSessionArgs>) -> CallToolResult {
+        self.forward("label_session", args).await
     }
 
     #[tool(

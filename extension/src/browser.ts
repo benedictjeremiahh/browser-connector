@@ -45,7 +45,9 @@ export class BrowserController {
   private documentGenerations = new Map<number, number>();
   private consoleRecords = new Map<number, ConsoleRecord[]>();
   private networkRecords = new Map<number, NetworkRecord[]>();
-  private groupId?: number;
+  /* Keyed by the session, not by the title: an agent may rename its session at any time, and
+     a title-keyed map would lose the group and start a second one on every rename. */
+  private groupIds = new Map<string, number>();
 
   constructor() {
     chrome.webNavigation.onCommitted.addListener(({ tabId, frameId }) => {
@@ -63,10 +65,10 @@ export class BrowserController {
     });
   }
 
-  async dispatch(method: string, params: Record<string, unknown>, controlledTabIds: Set<number>): Promise<unknown> {
+  async dispatch(method: string, params: Record<string, unknown>, controlledTabIds: Set<number>, group: { key: string; label: string } = { key: "", label: "Browser Connector" }): Promise<unknown> {
     switch (method) {
-      case "tabs_context": return this.tabsContext(controlledTabIds, params.createIfEmpty === true);
-      case "tabs_create": return this.tabsCreate(controlledTabIds, asOptionalString(params.url));
+      case "tabs_context": return this.tabsContext(controlledTabIds, params.createIfEmpty === true, group);
+      case "tabs_create": return this.tabsCreate(controlledTabIds, asOptionalString(params.url), group);
       case "tabs_close": return this.tabsClose(controlledTabIds, asTabId(params.tabId));
       case "navigate": return this.navigate(asTabId(params.tabId), asString(params.action), asOptionalString(params.url));
       case "computer": return this.computer(params);
@@ -95,6 +97,15 @@ export class BrowserController {
     return result.result;
   }
 
+  /* Releasing one session detaches that session's tabs and leaves every other session's
+     attached. detachAll stays for the callers that really do mean everything. */
+  async detachTabs(tabIds: Iterable<number>): Promise<void> {
+    await Promise.all([...tabIds].map(async (tabId) => {
+      try { await chrome.debugger.detach({ tabId }); } catch { /* already detached */ }
+      this.attachedTabs.delete(tabId);
+    }));
+  }
+
   async detachAll(): Promise<void> {
     await Promise.all([...this.attachedTabs].map(async (tabId) => {
       try { await chrome.debugger.detach({ tabId }); } catch { /* already detached */ }
@@ -102,8 +113,8 @@ export class BrowserController {
     this.attachedTabs.clear();
   }
 
-  private async tabsContext(controlledTabIds: Set<number>, createIfEmpty: boolean): Promise<unknown> {
-    if (controlledTabIds.size === 0 && createIfEmpty) await this.tabsCreate(controlledTabIds, undefined);
+  private async tabsContext(controlledTabIds: Set<number>, createIfEmpty: boolean, group: { key: string; label: string }): Promise<unknown> {
+    if (controlledTabIds.size === 0 && createIfEmpty) await this.tabsCreate(controlledTabIds, undefined, group);
     const tabs = await Promise.all([...controlledTabIds].map((tabId) => chrome.tabs.get(tabId).catch(() => undefined)));
     return {
       tabs: tabs.filter(Boolean).map((tab) => ({
@@ -116,26 +127,37 @@ export class BrowserController {
     };
   }
 
-  private async tabsCreate(controlledTabIds: Set<number>, url?: string): Promise<unknown> {
+  private async tabsCreate(controlledTabIds: Set<number>, url?: string, group: { key: string; label: string } = { key: "", label: "Browser Connector" }): Promise<unknown> {
     if (url && isRestrictedUrl(url)) throw connectorError("restricted_url", `Cannot open privileged or unsupported URL: ${url}`);
     const tab = await chrome.tabs.create({ url: url ?? "about:blank", active: true });
     if (tab.id === undefined) throw connectorError("tab_create_failed", "Chrome did not return a tab ID");
     controlledTabIds.add(tab.id);
-    await this.ensureTabGroup(tab.id);
+    await this.ensureTabGroup(group, tab.id);
     return { tabId: tab.id, windowId: tab.windowId, url: tab.url ?? url ?? "about:blank" };
   }
 
-  private async ensureTabGroup(tabId: number): Promise<void> {
+  private async ensureTabGroup(group: { key: string; label: string }, tabId: number): Promise<void> {
     try {
-      if (this.groupId === undefined) {
-        this.groupId = await chrome.tabs.group({ tabIds: [tabId] });
-        await chrome.tabGroups.update(this.groupId, { title: "Browser Connector", color: "green", collapsed: false });
-      } else {
-        await chrome.tabs.group({ groupId: this.groupId, tabIds: [tabId] });
+      const existing = this.groupIds.get(group.key);
+      if (existing !== undefined) {
+        await chrome.tabs.group({ groupId: existing, tabIds: [tabId] });
+        if (group.label) await chrome.tabGroups.update(existing, { title: group.label }).catch(() => {});
+        return;
       }
+      const groupId = await chrome.tabs.group({ tabIds: [tabId] });
+      await chrome.tabGroups.update(groupId, { title: group.label, color: "green", collapsed: false });
+      this.groupIds.set(group.key, groupId);
     } catch {
-      this.groupId = undefined;
+      this.groupIds.delete(group.key);
     }
+  }
+
+  /* A rename before any tab exists has no group to update yet; the label is already stored on
+     the session, so the group picks it up when it is created. */
+  async renameGroup(group: { key: string; label: string }): Promise<void> {
+    const groupId = this.groupIds.get(group.key);
+    if (groupId === undefined) return;
+    try { await chrome.tabGroups.update(groupId, { title: group.label }); } catch { /* group closed */ }
   }
 
   /* Closing a tab is not merely releasing the lease: the tab is gone from the

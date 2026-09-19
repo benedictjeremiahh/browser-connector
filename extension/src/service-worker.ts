@@ -52,7 +52,7 @@ async function connectNative(): Promise<void> {
       void broadcastState();
       scheduleReconnect();
       leaseReleaseTimer = setTimeout(
-        () => void releaseLease(disconnectMessage ? `Agent Host disconnected: ${disconnectMessage}` : "Agent Host disconnected"),
+        () => void releaseAllSessions(disconnectMessage ? `Agent Host disconnected: ${disconnectMessage}` : "Agent Host disconnected"),
         15_000
       );
     });
@@ -77,9 +77,13 @@ async function handleNativeRequest(request: NativeRequest, port: chrome.runtime.
     const authorization = await authorize(request);
     risk = authorization.risk;
     origin = authorization.origin;
-    const controlled = await controlledTabs();
-    const result = await browser.dispatch(request.method, request.params, controlled);
-    await saveControlledTabs(controlled);
+    const controlled = await controlledTabs(request.sessionId);
+    const session = await sessionState(request.sessionId);
+    const group = { key: request.sessionId, label: sessionGroupLabel(session) };
+    const result = request.method === "label_session"
+      ? await labelSession(request, session)
+      : await browser.dispatch(request.method, request.params, controlled, group);
+    await saveControlledTabs(request.sessionId, controlled);
     response = { kind: "response", id: request.id, result };
     await audit(request, risk, origin, "succeeded");
   } catch (error) {
@@ -111,14 +115,10 @@ async function authorize(request: NativeRequest): Promise<{ risk: Risk; origin?:
     await savePersistedState(state);
   }
 
-  let session = await sessionState();
-  if (session.sessionId && session.sessionId !== request.sessionId) {
-    await releaseLease("Superseded by a new Agent Host session");
-    session = await sessionState();
-  }
-  if (session.leaseHostId && session.leaseHostId !== request.hostId) {
-    throw connectorError("browser_busy", `Browser Session is controlled by ${session.leaseHostId}`);
-  }
+  /* No supersede and no browser_busy. Both existed because one record had to represent every
+     session at once; with an entry per session there is no incumbent to displace and no other
+     session's lease to collide with. */
+  const session = await sessionState(request.sessionId);
   if (leaseReleaseTimer) {
     clearTimeout(leaseReleaseTimer);
     leaseReleaseTimer = undefined;
@@ -197,7 +197,7 @@ async function ensureSiteGrant(
 }
 
 function validateControlledTargets(method: string, params: Record<string, unknown>, controlled: Set<number>): void {
-  if (method === "tabs_context" || method === "tabs_create" || method === "resize_window") return;
+  if (method === "tabs_context" || method === "tabs_create" || method === "resize_window" || method === "label_session") return;
   if (method === "browser_batch") {
     const actions = Array.isArray(params.actions) ? params.actions : [];
     for (const action of actions) {
@@ -216,8 +216,9 @@ function validateControlledTargets(method: string, params: Record<string, unknow
 
 async function requestOrigins(method: string, params: Record<string, unknown>): Promise<string[]> {
   /* Closing a tab reads nothing and writes nothing on any origin, so it asks for
-     no site grant; the controlled-tab check still gates it. */
+     no site grant; the controlled-tab check still gates it. Naming touches no page either. */
   if (method === "tabs_close") return [];
+  if (method === "label_session") return [];
   if (method === "browser_batch") {
     const origins = new Set<string>();
     for (const action of Array.isArray(params.actions) ? params.actions : []) {
@@ -277,7 +278,8 @@ async function handlePanelMessage(message: unknown): Promise<unknown> {
   if (message.type === "control_tab") {
     const tabId = Number(message.tabId);
     const origin = String(message.origin ?? "");
-    const session = await sessionState();
+    const session = await mostRecentSession();
+    if (!session.sessionId) return { ok: false, error: "No Agent Host session to add the tab to" };
     session.controlledTabIds = [...new Set([...session.controlledTabIds, tabId])];
     if (origin) session.sessionSiteGrants = [...new Set([...session.sessionSiteGrants, origin])];
     await saveSessionState(session);
@@ -285,7 +287,7 @@ async function handlePanelMessage(message: unknown): Promise<unknown> {
     return { ok: true };
   }
   if (message.type === "revoke_lease") {
-    await releaseLease("Revoked by user");
+    await releaseAllSessions("Revoked by user");
     return { ok: true };
   }
   if (message.type === "clear_log") {
@@ -298,28 +300,36 @@ async function handlePanelMessage(message: unknown): Promise<unknown> {
   return { ok: false };
 }
 
-async function releaseLease(message: string): Promise<void> {
-  const session = await sessionState();
-  const hostId = session.leaseHostId;
-  await saveSessionState({ controlledTabIds: [], sessionSiteGrants: [] });
-  await browser.detachAll();
+async function auditLease(hostId: string | undefined, message: string): Promise<void> {
+  if (!hostId) return;
+  const state = await persistedState();
+  state.auditEvents.push({
+    id: crypto.randomUUID(), timestamp: Date.now(), hostId, method: "control_lease", outcome: "denied", risk: "routine", message
+  });
+  await savePersistedState(state);
+}
+
+async function releaseSession(session: SessionState, message: string): Promise<void> {
+  if (session.sessionId) await chrome.storage.session.remove(SESSION_PREFIX + session.sessionId);
+  await browser.detachTabs(session.controlledTabIds);
+  await auditLease(session.leaseHostId, message);
+}
+
+/* One native port carries every session, so its disconnect is the end of all of them. */
+async function releaseAllSessions(message: string): Promise<void> {
+  const sessions = [...(await allSessions()).values()];
+  for (const session of sessions) await releaseSession(session, message);
   for (const pending of approvals.values()) pending.resolve("deny");
   approvals.clear();
-  if (hostId) {
-    const state = await persistedState();
-    state.auditEvents.push({
-      id: crypto.randomUUID(), timestamp: Date.now(), hostId, method: "control_lease", outcome: "denied", risk: "routine", message
-    });
-    await savePersistedState(state);
-  }
   await broadcastState();
 }
 
 async function removeControlledTab(tabId: number): Promise<void> {
-  const session = await sessionState();
-  if (!session.controlledTabIds.includes(tabId)) return;
-  session.controlledTabIds = session.controlledTabIds.filter((id) => id !== tabId);
-  await saveSessionState(session);
+  for (const session of (await allSessions()).values()) {
+    if (!session.controlledTabIds.includes(tabId)) continue;
+    session.controlledTabIds = session.controlledTabIds.filter((id) => id !== tabId);
+    await saveSessionState(session);
+  }
   await broadcastState();
 }
 
@@ -348,8 +358,11 @@ async function pruneAudit(): Promise<void> {
 interface SessionState {
   leaseHostId?: string;
   sessionId?: string;
+  /* What this session is working on, as the agent named it. Absent until the agent says. */
+  label?: string;
   controlledTabIds: number[];
   sessionSiteGrants: string[];
+  touchedAt: number;
 }
 
 async function persistedState(): Promise<PersistedState> {
@@ -365,39 +378,96 @@ async function savePersistedState(state: PersistedState): Promise<void> {
   await chrome.storage.local.set(state);
 }
 
-async function sessionState(): Promise<SessionState> {
-  const value = await chrome.storage.session.get(["leaseHostId", "sessionId", "controlledTabIds", "sessionSiteGrants"]);
+const SESSION_PREFIX = "s:";
+
+/* The group title is how a person tells two sessions apart in the tab strip, so it carries a
+   readable slice of the session id rather than an opaque index. Chrome truncates long titles
+   from the end, which is why the id goes first and stays short. */
+function sessionGroupLabel(session: SessionState): string {
+  if (session.label) return session.label;
+  return session.sessionId ? `Browser Connector ${session.sessionId.slice(0, 8)}` : "Browser Connector";
+}
+
+/* Naming is session metadata, not a browser action, so it does not go through Browser.dispatch
+   — but it does go through authorize first, like everything else the native host asks for. */
+async function labelSession(request: NativeRequest, session: SessionState): Promise<unknown> {
+  const label = typeof request.params.label === "string" ? request.params.label.trim().slice(0, 60) : "";
+  if (!label) throw connectorError("invalid_arguments", "A label is required");
+  session.label = label;
+  await saveSessionState(session);
+  await browser.renameGroup({ key: request.sessionId, label });
+  return { labelled: label };
+}
+
+function normalizeSession(value: unknown, sessionId: string): SessionState {
+  const record = isRecord(value) ? value : {};
   return {
-    leaseHostId: typeof value.leaseHostId === "string" ? value.leaseHostId : undefined,
-    sessionId: typeof value.sessionId === "string" ? value.sessionId : undefined,
-    controlledTabIds: Array.isArray(value.controlledTabIds) ? value.controlledTabIds.map(Number) : [],
-    sessionSiteGrants: Array.isArray(value.sessionSiteGrants) ? value.sessionSiteGrants.map(String) : []
+    sessionId,
+    leaseHostId: typeof record.leaseHostId === "string" ? record.leaseHostId : undefined,
+    label: typeof record.label === "string" && record.label ? record.label : undefined,
+    controlledTabIds: Array.isArray(record.controlledTabIds) ? record.controlledTabIds.map(Number) : [],
+    sessionSiteGrants: Array.isArray(record.sessionSiteGrants) ? record.sessionSiteGrants.map(String) : [],
+    touchedAt: typeof record.touchedAt === "number" ? record.touchedAt : 0
   };
 }
 
+async function allSessions(): Promise<Map<string, SessionState>> {
+  const stored = await chrome.storage.session.get(null);
+  const sessions = new Map<string, SessionState>();
+  for (const [key, value] of Object.entries(stored)) {
+    if (!key.startsWith(SESSION_PREFIX)) continue;
+    const sessionId = key.slice(SESSION_PREFIX.length);
+    sessions.set(sessionId, normalizeSession(value, sessionId));
+  }
+  return sessions;
+}
+
+async function sessionState(sessionId: string): Promise<SessionState> {
+  return (await allSessions()).get(sessionId) ?? normalizeSession(undefined, sessionId);
+}
+
+/* The record carries its own id, so the callers that only ever held a record still work
+   unchanged — only the readers that used to imply "the" session had to be told which one. */
 async function saveSessionState(state: SessionState): Promise<void> {
-  await chrome.storage.session.set(state);
-  if (!state.leaseHostId) await chrome.storage.session.remove(["leaseHostId", "sessionId"]);
+  if (!state.sessionId) return;
+  await chrome.storage.session.set({
+    [SESSION_PREFIX + state.sessionId]: { ...state, touchedAt: Date.now() }
+  });
 }
 
-async function controlledTabs(): Promise<Set<number>> {
-  return new Set((await sessionState()).controlledTabIds);
+/* For callers holding no session: the panel's control_tab, and the tab-removed listener. The
+   most recently used session is exactly what "the" session meant when there was only one. It
+   is a stopgap, not a model — the panel has no session of its own to name yet. */
+async function mostRecentSession(): Promise<SessionState> {
+  const sessions = [...(await allSessions()).values()];
+  if (!sessions.length) return normalizeSession(undefined, "");
+  return sessions.reduce((a, b) => (b.touchedAt > a.touchedAt ? b : a));
 }
 
-async function saveControlledTabs(tabs: Set<number>): Promise<void> {
-  const session = await sessionState();
+async function controlledTabs(sessionId: string): Promise<Set<number>> {
+  return new Set((await sessionState(sessionId)).controlledTabIds);
+}
+
+async function saveControlledTabs(sessionId: string, tabs: Set<number>): Promise<void> {
+  const session = await sessionState(sessionId);
   session.controlledTabIds = [...tabs];
   await saveSessionState(session);
 }
 
 async function panelState(): Promise<PanelState> {
   const state = await persistedState();
-  const session = await sessionState();
+  const sessions = [...(await allSessions()).values()].sort((a, b) => b.touchedAt - a.touchedAt);
+  const recent = sessions[0];
   return {
     nativeConnected,
     pairedHosts: Object.keys(state.pairedHosts),
-    leaseHostId: session.leaseHostId,
-    controlledTabIds: session.controlledTabIds,
+    leaseHostId: recent?.leaseHostId,
+    controlledTabIds: recent?.controlledTabIds ?? [],
+    leases: sessions.map((session) => ({
+      sessionId: session.sessionId ?? "",
+      hostId: session.leaseHostId,
+      tabIds: session.controlledTabIds
+    })),
     approvals: [...approvals.values()].map(({ request }) => request),
     auditEvents: [...state.auditEvents].reverse().slice(0, 50)
   };

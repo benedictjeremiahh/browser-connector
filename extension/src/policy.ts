@@ -26,6 +26,9 @@ export function classifyRequest(
   if (method === "tabs_context" && !params.createIfEmpty) {
     return { risk: "read_only", reason: "Reads controlled-tab metadata" };
   }
+  if (method === "label_session") {
+    return { risk: "routine", reason: "Names this session's tab group" };
+  }
   if (READ_ONLY.has(method)) {
     if (method === "read_network_requests" && params.includeResponseBody === true) {
       return { risk: "protected", reason: "Reads a network response body" };
