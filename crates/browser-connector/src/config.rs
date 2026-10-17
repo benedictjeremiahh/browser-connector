@@ -56,7 +56,13 @@ struct NativeMessagingManifest<'a> {
     allowed_origins: Vec<String>,
 }
 
-pub fn install(extension_id: &str, host_id: &str, executable: &Path) -> Result<PathBuf> {
+pub struct Installed {
+    pub path: PathBuf,
+    /// Every extension id the native-messaging manifest now allows, in order.
+    pub allowed_origins: Vec<String>,
+}
+
+pub fn install(extension_id: &str, host_id: &str, executable: &Path) -> Result<Installed> {
     validate_extension_id(extension_id)?;
     let mut config = ConnectorConfig::load_or_create(host_id)?;
     config.host_id = host_id.to_owned();
@@ -66,16 +72,57 @@ pub fn install(extension_id: &str, host_id: &str, executable: &Path) -> Result<P
     let executable = executable
         .to_str()
         .context("browser-connector executable path is not UTF-8")?;
+    /* Registration adds an id and never drops one. The unpacked install and a Web Store
+       install have different ids and are both legitimately the same user's, so replacing
+       the list when the second is registered would silently cut the first one off. */
+    let path = chrome_native_manifest_path()?;
+    let allowed_origins = merged_origins(existing_origins(&path), extension_id);
     let manifest = NativeMessagingManifest {
         name: NATIVE_HOST_NAME,
         description: "Local native bridge for Browser Connector",
         path: executable,
         kind: "stdio",
-        allowed_origins: vec![format!("chrome-extension://{extension_id}/")],
+        allowed_origins: allowed_origins.clone(),
     };
-    let path = chrome_native_manifest_path()?;
     write_private_json(&path, &manifest)?;
-    Ok(path)
+    Ok(Installed {
+        path,
+        allowed_origins,
+    })
+}
+
+/* What the manifest already allows. Nothing to preserve when the file is absent, and a
+   manifest that cannot be parsed is one this call is about to replace with a well-formed
+   one anyway, so neither case is an error. */
+fn existing_origins(path: &Path) -> Vec<String> {
+    let Ok(bytes) = fs::read(path) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Vec::new();
+    };
+    value
+        .get("allowed_origins")
+        .and_then(|origins| origins.as_array())
+        .map(|origins| {
+            origins
+                .iter()
+                .filter_map(|origin| origin.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/* Existing ids keep their order; the id being registered moves to the end. Registering
+   the same id twice leaves one entry. */
+fn merged_origins(existing: Vec<String>, extension_id: &str) -> Vec<String> {
+    let origin = format!("chrome-extension://{extension_id}/");
+    let mut origins: Vec<String> = existing
+        .into_iter()
+        .filter(|registered| registered.as_str() != origin.as_str())
+        .collect();
+    origins.push(origin);
+    origins
 }
 
 pub fn config_path(host_id: &str) -> Result<PathBuf> {
@@ -211,5 +258,33 @@ mod tests {
         assert!(validate_host_id("generic-host_1").is_ok());
         assert!(validate_host_id("../escape").is_err());
         assert!(validate_host_id("Uppercase").is_err());
+    }
+
+    /* The unpacked install and a Web Store install have different ids. Registering the
+       second one used to replace the list and silently cut the first one off. */
+    #[test]
+    fn registering_an_extension_id_keeps_the_ones_already_registered() {
+        let existing = vec!["chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/".to_owned()];
+        let merged = merged_origins(existing, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        assert_eq!(
+            merged,
+            vec![
+                "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/",
+                "chrome-extension://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/",
+            ]
+        );
+    }
+
+    #[test]
+    fn re_registering_the_same_id_does_not_duplicate_it() {
+        let once = merged_origins(Vec::new(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let twice = merged_origins(once.clone(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(once, twice);
+        assert_eq!(once.len(), 1);
+    }
+
+    #[test]
+    fn an_absent_or_unreadable_manifest_preserves_nothing() {
+        assert!(existing_origins(Path::new("/nonexistent/native-host.json")).is_empty());
     }
 }

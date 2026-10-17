@@ -74,10 +74,24 @@ async fn main() -> Result<()> {
         } => {
             let executable =
                 executable.unwrap_or(std::env::current_exe().context("locate current executable")?);
-            let path = config::install(&extension_id, &host_id, &executable)?;
+            let installed = config::install(&extension_id, &host_id, &executable)?;
             println!(
                 "Installed Chrome native-messaging manifest: {}",
-                path.display()
+                installed.path.display()
+            );
+            /* Said out loud because registering a second id (the store's, next to the
+               unpacked install's) must not read as having replaced the first. */
+            println!(
+                "  allowed extension ids ({}): {}",
+                installed.allowed_origins.len(),
+                installed
+                    .allowed_origins
+                    .iter()
+                    .map(|origin| origin
+                        .trim_start_matches("chrome-extension://")
+                        .trim_end_matches('/'))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
             println!(
                 "Restart Chrome, open the Browser Connector side panel, and approve Host Pairing."

@@ -31,7 +31,18 @@ Until then the native-messaging manifest still names
 uses; `extension/dist` keeps its `key` precisely so that one does not change.
 Two installs, two ids, and `allowed_origins` can list only the ids you have
 actually registered — register the store id alongside the development one
-rather than replacing it.
+rather than replacing it. `install` adds an id and never drops one, so running
+it a second time is how that is done, and it prints how many ids the manifest
+now allows:
+
+```sh
+browser-connector install --extension-id kppdjhnonomijdjifhobgeaipejojbho --host-id codex
+browser-connector install --extension-id <store-id> --host-id codex
+#   allowed extension ids (2): kppdjhnonomijdjifhobgeaipejojbho, <store-id>
+```
+
+Chrome reads this file when it opens a native-messaging connection. If the
+panel still reports *disconnected* after registering, restart Chrome.
 
 ## Store listing
 
@@ -141,3 +152,28 @@ The console asks for one per permission. Paste these:
 5. **Submit for review.** Expect longer than usual: broad host permissions and
    `debugger` are the two things the review process names as slow, and
    `javascript_tool` will invite questions about executing agent-supplied code.
+
+## Shipping an update
+
+Nothing in the listing or the privacy practices changes for a normal feature
+release, so an update is three steps:
+
+1. Bump `version` in `extension/public/manifest.json`. The console refuses a
+   version that is not higher than the one it already has.
+2. Rebuild the package the store receives — never hand over a zip that still
+   carries the development `key`, which the console rejects:
+
+   ```sh
+   node scripts/package-extension.mjs
+   ```
+
+   It prints the version and size it packed, and stops if `extension/dist` has
+   no manifest, so a silent bad build cannot reach the console.
+3. **Package → Upload new package**, then **Submit for review**. An update does
+   not change the store id, so `allowed_origins` needs no edit.
+
+The one release that *does* need the native host registered is the first upload
+of a given id — see the note above. A review pass is not a test: submitting a
+package does not execute it, so run the extension from `extension/dist` before
+uploading. `./scripts/install-local.sh` rebuilds both halves, so what you
+exercised is what you are about to ship.
