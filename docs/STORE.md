@@ -1,9 +1,15 @@
 # Chrome Web Store submission pack
 
 Everything the developer console asks for, prepared. The store cannot be
-automated: Chrome blocks both the debugger and content scripts on
-`chrome.google.com/webstore` ("the extensions gallery cannot be scripted"), so
-these fields are pasted by hand.
+automated, but not for the reason it looks like: Chrome refuses the **debugger**
+on `chrome.google.com/webstore` ("the extensions gallery cannot be scripted"),
+and clicking and typing go through the debugger, so no field can be filled by
+driving the page. Reading is a different mechanism — `chrome.scripting` is not
+what Chrome blocks — so a controlled tab there can be inspected (its text, its
+elements, a form value) but never clicked. The developer console also sits behind
+a Google sign-in, which is a user-only step regardless.
+
+These fields are therefore pasted by hand, and the package is uploaded by hand.
 
 ## Files
 
