@@ -1,4 +1,5 @@
 import { BrowserController, connectorError, normalizeError } from "./browser";
+import { groupColor, sessionGroupLabel } from "./naming";
 import { classifyRequest, exactOrigin, hostPermissionPattern } from "./policy";
 import {
   DEFAULT_STATE,
@@ -79,7 +80,11 @@ async function handleNativeRequest(request: NativeRequest, port: chrome.runtime.
     origin = authorization.origin;
     const controlled = await controlledTabs(request.sessionId);
     const session = await sessionState(request.sessionId);
-    const group = { key: request.sessionId, label: sessionGroupLabel(session) };
+    const group = {
+      key: request.sessionId,
+      label: sessionGroupLabel(session),
+      color: groupColor(session.leaseHostId)
+    };
     const result = request.method === "label_session"
       ? await labelSession(request, session)
       : await browser.dispatch(request.method, request.params, controlled, group);
@@ -216,8 +221,10 @@ function validateControlledTargets(method: string, params: Record<string, unknow
 
 async function requestOrigins(method: string, params: Record<string, unknown>): Promise<string[]> {
   /* Closing a tab reads nothing and writes nothing on any origin, so it asks for
-     no site grant; the controlled-tab check still gates it. Naming touches no page either. */
+     no site grant; the controlled-tab check still gates it. Activating one only
+     chooses which controlled tab is in front, and naming touches no page either. */
   if (method === "tabs_close") return [];
+  if (method === "tabs_activate") return [];
   if (method === "label_session") return [];
   if (method === "browser_batch") {
     const origins = new Set<string>();
@@ -380,14 +387,6 @@ async function savePersistedState(state: PersistedState): Promise<void> {
 
 const SESSION_PREFIX = "s:";
 
-/* The group title is how a person tells two sessions apart in the tab strip, so it carries a
-   readable slice of the session id rather than an opaque index. Chrome truncates long titles
-   from the end, which is why the id goes first and stays short. */
-function sessionGroupLabel(session: SessionState): string {
-  if (session.label) return session.label;
-  return session.sessionId ? `Browser Connector ${session.sessionId.slice(0, 8)}` : "Browser Connector";
-}
-
 /* Naming is session metadata, not a browser action, so it does not go through Browser.dispatch
    — but it does go through authorize first, like everything else the native host asks for. */
 async function labelSession(request: NativeRequest, session: SessionState): Promise<unknown> {
@@ -395,7 +394,13 @@ async function labelSession(request: NativeRequest, session: SessionState): Prom
   if (!label) throw connectorError("invalid_arguments", "A label is required");
   session.label = label;
   await saveSessionState(session);
-  await browser.renameGroup({ key: request.sessionId, label });
+  /* The stored label is what the agent said; the title is that label wearing the
+     session's mark, which is why the title is recomputed here rather than reused. */
+  await browser.renameGroup({
+    key: request.sessionId,
+    label: sessionGroupLabel(session),
+    color: groupColor(session.leaseHostId)
+  });
   return { labelled: label };
 }
 

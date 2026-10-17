@@ -72,26 +72,42 @@ session.
 | Tool | What it does |
 | --- | --- |
 | `tabs_context` | Controlled tabs. Call this first. |
-| `tabs_create` | Open a tab inside the Control Lease's tab group. |
+| `tabs_create` | Open a tab in the Control Lease's group, reusing one already at that URL. |
+| `tabs_activate` | Bring a controlled tab to the front. |
 | `tabs_close` | Close a controlled tab. |
+| `label_session` | Name this session's tab group. |
 | `navigate` | Go to a URL, back, forward, or reload. |
-| `read_page` / `get_page_text` | Accessibility snapshot with refs / bounded visible text. |
+| `read_page` / `get_page_text` | Accessibility snapshot with refs / bounded visible text. `read_page` can scope to one element's subtree. |
 | `find` | Elements by visible text or semantics, as refs. |
 | `form_input` | Set a form control's value. Password fields are never read back. |
 | `javascript_tool` | Run JavaScript in the page, shown in full for approval. |
 | `read_console_messages` / `read_network_requests` | Bounded, filterable console and network records. |
-| `computer` | Visible mouse, keyboard, scroll, wait, and **screenshot**. |
+| `computer` | Visible mouse, keyboard, scroll, drag, wait, and **screenshot**, with a zoom crop. |
 | `upload_file` / `download_file` | Host-provided bytes to a file input / a file through a tab. |
 | `browser_batch` | Sequential, non-atomic, fail-fast batch of the above. JavaScript is excluded. |
 | `resize_window` | Resize the window holding a controlled tab. |
 
-Two behaviours worth knowing:
+A few behaviours worth knowing:
 
 - **Screenshots come back as images.** `computer` with `action: "screenshot"` returns an
   MCP image content block, so a client renders the pixels rather than a link to them.
-- **The cursor is visible.** Pointer actions draw a shadow-DOM overlay at the exact point
-  — an arrow, and a ring that pings on click — so you can see where the agent is acting,
-  and it appears in a screenshot taken after the action.
+  `zoom` crops to a region given in CSS pixels, and the image that comes back is that
+  region at the display's device pixel ratio, so it is larger than the numbers you passed.
+- **The cursor is visible.** Pointer and keyboard actions draw a shadow-DOM overlay at the
+  exact point — an arrow that glides in, a trail, a click ripple, and a label naming the
+  action — so you can see where the agent is acting and what it is doing, and it appears in
+  a screenshot taken after the action. `prefers-reduced-motion` turns the animation off and
+  leaves a static mark.
+- **`key` modifiers reach the page, and the macOS editing shortcuts are executed as
+  commands.** `{ key: "ArrowLeft", modifiers: "shift" }` selects through the renderer like a
+  real keystroke. Cmd+A/C/V/X/Z do not: macOS resolves those in its menu bar, which a
+  synthetic event never passes through, so the connector sends the corresponding editor
+  command alongside the event.
+
+Tab groups carry no icon of their own, so the group title is `🔌` plus the session label
+once the agent names one, and `🔌 <host>` until then — never an opaque id. Each host
+gets its own group color, so sessions from different hosts are distinguishable before
+you read their titles.
 
 ## Repository layout
 

@@ -20,6 +20,10 @@ _Avoid_: Cloud relay, agent daemon, Control Lease
 A user-selected, visible local browser context whose existing signed-in state may be used within Controlled Tabs without exposing credentials to the agent.
 _Avoid_: Headless browser, remote browser, credential store
 
+**Session Label**:
+The person-readable name an Agent Host gives its Browser Session, stating what that session is working on. It is how a person tells concurrent sessions apart in the tab strip, and a session works before it has one.
+_Avoid_: default title, tab title, group index
+
 **Control Lease**:
 Exclusive, revocable authority granted to one Agent Host to use a Browser Session for a limited time. Other hosts cannot observe or act through that Browser Session until the lease is released.
 _Avoid_: Connection, permanent ownership, concurrent control

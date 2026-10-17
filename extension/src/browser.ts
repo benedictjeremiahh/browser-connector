@@ -1,4 +1,12 @@
-import { boundedText, clampLimit, exactOrigin, isRestrictedUrl, redactUrl } from "./policy";
+import {
+  boundedText,
+  clampLimit,
+  exactOrigin,
+  isRestrictedUrl,
+  redactUrl,
+  sameNavigationTarget
+} from "./policy";
+import type { GroupColor } from "./naming";
 
 interface ConsoleRecord {
   timestamp: number;
@@ -22,21 +30,71 @@ export interface PageRefContext {
   destinationOrigin?: string;
 }
 
+export interface GroupDescriptor {
+  key: string;
+  label: string;
+  color?: GroupColor;
+}
+
+export interface Region {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export type CursorMode = "hover" | "move" | "click" | "drag" | "type" | "key" | "scroll";
+
+const CURSOR_LABELS: Record<CursorMode, string> = {
+  hover: "Hover",
+  move: "Move",
+  click: "Click",
+  drag: "Drag",
+  type: "Type",
+  key: "Key",
+  scroll: "Scroll"
+};
+
+const DEFAULT_GROUP: GroupDescriptor = { key: "", label: "🔌 Browser Connector" };
+
 const MAX_LOG_RECORDS = 2_000;
 const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
 const MAX_DOWNLOAD_BYTES = 10 * 1024 * 1024;
 const MAX_RESPONSE_BODY_BYTES = 256 * 1024;
+/* Distance the pointer glides before the button goes down, so a person watching
+   can follow the mark instead of seeing it appear already clicked. */
+const CLICK_DWELL_MS = 200;
+/* Intermediate mouseMoved events: HTML5 drag-and-drop and sortable lists ignore a
+   press and release with nothing in between. */
+const DRAG_STEPS = 8;
 
-/* The mark Codex draws where it is about to act. One string so the injected
-   script stays a single Runtime.evaluate call. */
+/* The mark drawn where the agent is about to act. One string so the injected
+   script stays a single Runtime.evaluate call.
+   The arrow glides to its target with a CSS transition and three lagging ghost
+   dots trail behind it; the label names the action, and the ring pings on click.
+   Reduced motion turns the transitions and animations off and leaves a static
+   mark, which is what someone who asked their OS for less motion still needs. */
 const CURSOR_MARKUP = [
   "<style>",
-  ".arrow{position:fixed;left:0;top:0;transform-origin:0 0;filter:drop-shadow(0 1px 2px rgba(0,0,0,.45))}",
-  ".ping{position:fixed;left:0;top:0;width:30px;height:30px;margin:-15px 0 0 -15px;border-radius:50%;border:2px solid #ff4d4f;opacity:0}",
-  ".ping.on{animation:bc-ping .55s cubic-bezier(.2,.7,.3,1)}",
-  "@keyframes bc-ping{from{opacity:.85;transform:scale(.25)}to{opacity:0;transform:scale(1.6)}}",
+  ".arrow{position:absolute;left:0;top:0;transform-origin:0 0;filter:drop-shadow(0 1px 2px rgba(0,0,0,.45));transition:transform .22s cubic-bezier(.22,.7,.3,1)}",
+  ".ghost{position:absolute;left:0;top:0;width:9px;height:9px;margin:-4.5px 0 0 -4.5px;border-radius:50%;background:#3b82f6;opacity:.4;transition:transform .3s cubic-bezier(.22,.7,.3,1)}",
+  ".ghost.g2{transition-delay:.05s;opacity:.26}",
+  ".ghost.g3{transition-delay:.1s;opacity:.14}",
+  ".ring{position:absolute;left:0;top:0}",
+  ".ping{width:34px;height:34px;margin:-17px 0 0 -17px;border-radius:50%;border:2px solid #3b82f6;opacity:0}",
+  ".ping.on{animation:bc-ping .6s cubic-bezier(.2,.7,.3,1)}",
+  ".label{position:absolute;left:16px;top:-30px;font:600 11px/1.7 -apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;letter-spacing:.02em;color:#fff;background:#111827;border:1px solid rgba(255,255,255,.22);border-radius:999px;padding:1px 9px;white-space:nowrap;opacity:0}",
+  ".label.on{animation:bc-label 1.5s ease-out}",
+  "@keyframes bc-ping{from{opacity:.9;transform:scale(.3)}to{opacity:0;transform:scale(1.7)}}",
+  /* The chip is offset with left/top, never with transform: the script positions
+     every part of the mark by writing transform, and a transform inside this
+     animation would override it and park the chip at the viewport origin. */
+  "@keyframes bc-label{0%{opacity:0}12%{opacity:1}70%{opacity:1}100%{opacity:0}}",
+  "@media (prefers-reduced-motion:reduce){.arrow,.ghost{transition:none}.ping.on{animation:none}.label{opacity:1}.label.on{animation:none}}",
   "</style>",
-  '<div class="ping"></div>',
+  '<div class="ghost g1"></div><div class="ghost g2"></div><div class="ghost g3"></div>',
+  '<div class="ring"><div class="ping"></div></div>',
+  '<div class="label"></div>',
   '<svg class="arrow" width="22" height="22" viewBox="0 0 22 22" aria-hidden="true"><path d="M1 1 L1 17.4 L5.5 13.4 L8.8 20.2 L11.5 18.9 L8.2 12.1 L14.4 12.1 Z" fill="#111827" stroke="#ffffff" stroke-width="1.3" stroke-linejoin="round"/></svg>'
 ].join("");
 
@@ -48,6 +106,9 @@ export class BrowserController {
   /* Keyed by the session, not by the title: an agent may rename its session at any time, and
      a title-keyed map would lose the group and start a second one on every rename. */
   private groupIds = new Map<string, number>();
+  /* Where the mark last acted, so a keystroke or a scroll can label itself at the
+     place the person is already looking, without needing coordinates of its own. */
+  private lastPoints = new Map<number, { x: number; y: number }>();
 
   constructor() {
     chrome.webNavigation.onCommitted.addListener(({ tabId, frameId }) => {
@@ -58,6 +119,7 @@ export class BrowserController {
       this.documentGenerations.delete(tabId);
       this.consoleRecords.delete(tabId);
       this.networkRecords.delete(tabId);
+      this.lastPoints.delete(tabId);
     });
     chrome.debugger.onEvent.addListener((source, method, params) => this.onDebuggerEvent(source.tabId, method, params));
     chrome.debugger.onDetach.addListener((source) => {
@@ -65,14 +127,15 @@ export class BrowserController {
     });
   }
 
-  async dispatch(method: string, params: Record<string, unknown>, controlledTabIds: Set<number>, group: { key: string; label: string } = { key: "", label: "Browser Connector" }): Promise<unknown> {
+  async dispatch(method: string, params: Record<string, unknown>, controlledTabIds: Set<number>, group: GroupDescriptor = DEFAULT_GROUP): Promise<unknown> {
     switch (method) {
       case "tabs_context": return this.tabsContext(controlledTabIds, params.createIfEmpty === true, group);
       case "tabs_create": return this.tabsCreate(controlledTabIds, asOptionalString(params.url), group);
+      case "tabs_activate": return this.tabsActivate(asTabId(params.tabId));
       case "tabs_close": return this.tabsClose(controlledTabIds, asTabId(params.tabId));
       case "navigate": return this.navigate(asTabId(params.tabId), asString(params.action), asOptionalString(params.url));
       case "computer": return this.computer(params);
-      case "read_page": return this.readPage(asTabId(params.tabId), params.maxBytes, params.cursor);
+      case "read_page": return this.readPage(asTabId(params.tabId), params.maxBytes, params.cursor, asOptionalString(params.scopeRef));
       case "get_page_text": return this.getPageText(asTabId(params.tabId), params.maxBytes, params.cursor);
       case "find": return this.find(asTabId(params.tabId), asString(params.query), params.limit, params.cursor);
       case "form_input": return this.formInput(asTabId(params.tabId), asString(params.pageRef), params.value);
@@ -113,7 +176,7 @@ export class BrowserController {
     this.attachedTabs.clear();
   }
 
-  private async tabsContext(controlledTabIds: Set<number>, createIfEmpty: boolean, group: { key: string; label: string }): Promise<unknown> {
+  private async tabsContext(controlledTabIds: Set<number>, createIfEmpty: boolean, group: GroupDescriptor): Promise<unknown> {
     if (controlledTabIds.size === 0 && createIfEmpty) await this.tabsCreate(controlledTabIds, undefined, group);
     const tabs = await Promise.all([...controlledTabIds].map((tabId) => chrome.tabs.get(tabId).catch(() => undefined)));
     return {
@@ -127,25 +190,63 @@ export class BrowserController {
     };
   }
 
-  private async tabsCreate(controlledTabIds: Set<number>, url?: string, group: { key: string; label: string } = { key: "", label: "Browser Connector" }): Promise<unknown> {
+  /* Reuse before create. An agent that asks for the page it is already working on
+     should land on that page, not on a second copy of it: two controlled copies of
+     one document make every Page Reference, console record and network record
+     ambiguous. Only this session's own Controlled Tabs are searched, so nothing
+     the user did not hand over becomes reachable (ADR-0017, ADR-0023). */
+  private async tabsCreate(controlledTabIds: Set<number>, url?: string, group: GroupDescriptor = DEFAULT_GROUP): Promise<unknown> {
     if (url && isRestrictedUrl(url)) throw connectorError("restricted_url", `Cannot open privileged or unsupported URL: ${url}`);
+    if (url) {
+      const existing = await this.reuseControlledTab(controlledTabIds, url);
+      if (existing !== undefined) {
+        await chrome.tabs.update(existing, { active: true }).catch(() => undefined);
+        const tab = await chrome.tabs.get(existing);
+        return { tabId: existing, windowId: tab.windowId, url: tab.url ? redactUrl(tab.url) : redactUrl(url), reused: true };
+      }
+    }
     const tab = await chrome.tabs.create({ url: url ?? "about:blank", active: true });
     if (tab.id === undefined) throw connectorError("tab_create_failed", "Chrome did not return a tab ID");
     controlledTabIds.add(tab.id);
     await this.ensureTabGroup(group, tab.id);
-    return { tabId: tab.id, windowId: tab.windowId, url: tab.url ?? url ?? "about:blank" };
+    return {
+      tabId: tab.id,
+      windowId: tab.windowId,
+      url: tab.url ? redactUrl(tab.url) : redactUrl(url ?? "about:blank"),
+      reused: false,
+      openElsewhere: url ? await this.countTabsOutsideBoundary(controlledTabIds, url) : 0
+    };
   }
 
-  private async ensureTabGroup(group: { key: string; label: string }, tabId: number): Promise<void> {
+  private async reuseControlledTab(controlledTabIds: Set<number>, url: string): Promise<number | undefined> {
+    for (const tabId of controlledTabIds) {
+      const tab = await chrome.tabs.get(tabId).catch(() => undefined);
+      if (tab?.url && sameNavigationTarget(tab.url, url)) return tabId;
+    }
+    return undefined;
+  }
+
+  /* The Controlled Tab boundary is what keeps tabs the user did not hand over
+     invisible. A count is not a tab: it answers "is this already open somewhere I
+     may not touch?" without naming anything outside the boundary, so tabs_context
+     can stay silent about their ids, titles and URLs. */
+  private async countTabsOutsideBoundary(controlledTabIds: Set<number>, url: string): Promise<number> {
+    const tabs = await chrome.tabs.query({});
+    return tabs.filter((tab) =>
+      tab.id !== undefined && !controlledTabIds.has(tab.id) && tab.url !== undefined && sameNavigationTarget(tab.url, url)
+    ).length;
+  }
+
+  private async ensureTabGroup(group: GroupDescriptor, tabId: number): Promise<void> {
     try {
       const existing = this.groupIds.get(group.key);
       if (existing !== undefined) {
         await chrome.tabs.group({ groupId: existing, tabIds: [tabId] });
-        if (group.label) await chrome.tabGroups.update(existing, { title: group.label }).catch(() => {});
+        if (group.label) await chrome.tabGroups.update(existing, { title: group.label, ...colorProperty(group) }).catch(() => {});
         return;
       }
       const groupId = await chrome.tabs.group({ tabIds: [tabId] });
-      await chrome.tabGroups.update(groupId, { title: group.label, color: "green", collapsed: false });
+      await chrome.tabGroups.update(groupId, { title: group.label, collapsed: false, ...colorProperty(group) });
       this.groupIds.set(group.key, groupId);
     } catch {
       this.groupIds.delete(group.key);
@@ -154,10 +255,19 @@ export class BrowserController {
 
   /* A rename before any tab exists has no group to update yet; the label is already stored on
      the session, so the group picks it up when it is created. */
-  async renameGroup(group: { key: string; label: string }): Promise<void> {
+  async renameGroup(group: GroupDescriptor): Promise<void> {
     const groupId = this.groupIds.get(group.key);
     if (groupId === undefined) return;
-    try { await chrome.tabGroups.update(groupId, { title: group.label }); } catch { /* group closed */ }
+    try { await chrome.tabGroups.update(groupId, { title: group.label, ...colorProperty(group) }); } catch { /* group closed */ }
+  }
+
+  /* Bringing a controlled tab forward reads nothing on any origin, so it asks for no
+     site grant; it only decides which of the tabs this session already holds is the
+     one a person is looking at. */
+  private async tabsActivate(tabId: number): Promise<unknown> {
+    const tab = await chrome.tabs.update(tabId, { active: true });
+    if (tab?.windowId !== undefined) await chrome.windows.update(tab.windowId, { focused: true }).catch(() => undefined);
+    return { tabId, windowId: tab?.windowId, active: true };
   }
 
   /* Closing a tab is not merely releasing the lease: the tab is gone from the
@@ -183,14 +293,14 @@ export class BrowserController {
     return { tabId, url: tab.url ? redactUrl(tab.url) : undefined, title: tab.title };
   }
 
-  private async readPage(tabId: number, requestedMax: unknown, cursor: unknown): Promise<unknown> {
+  private async readPage(tabId: number, requestedMax: unknown, cursor: unknown, scopeRef?: string): Promise<unknown> {
     const maxBytes = clampLimit(requestedMax, 65_536, 65_536);
     const offset = cursorOffset(cursor);
     const generation = this.documentGenerations.get(tabId) ?? 1;
     const [result] = await chrome.scripting.executeScript({
       target: { tabId },
       func: injectedReadPage,
-      args: [generation, maxBytes, offset]
+      args: [generation, maxBytes, offset, scopeRef ?? null]
     });
     return result?.result ?? { nodes: [], truncated: false, originalBytes: 0 };
   }
@@ -223,36 +333,29 @@ export class BrowserController {
     return { changed: true, pageRef };
   }
 
-  /* Codex shows the cursor where it is about to act; a raw CDP mouse event is
-     invisible, so anyone watching the tab sees nothing happen. The mark lives in
-     a shadow root so no page style can reach it, carries aria-hidden so it never
-     enters the accessibility snapshot the agent reads, and ignores pointer
-     events so it cannot swallow the click it is marking. It stays where it last
-     acted, which is what makes it visible in a screenshot taken afterwards.
-     Failures are swallowed: the mark is decoration and must never fail an
-     action. */
-  private async showCursor(tabId: number, point: { x: number; y: number }, click = false): Promise<void> {
-    const { x, y } = point;
-    const expression = `(() => {
-      const HOST_ID = "__browser_connector_cursor";
-      let host = document.getElementById(HOST_ID);
-      if (!host) {
-        host = document.createElement("div");
-        host.id = HOST_ID;
-        host.setAttribute("aria-hidden", "true");
-        host.style.cssText = "position:fixed;left:0;top:0;z-index:2147483647;pointer-events:none;";
-        host.attachShadow({ mode: "open" }).innerHTML = ${JSON.stringify(CURSOR_MARKUP)};
-        document.documentElement.appendChild(host);
-      }
-      const root = host.shadowRoot;
-      root.querySelector(".arrow").style.transform = "translate(${x}px, ${y}px)";
-      const ping = root.querySelector(".ping");
-      ping.style.left = "${x}px";
-      ping.style.top = "${y}px";
-      ${click ? 'ping.classList.remove("on"); void ping.offsetWidth; ping.classList.add("on");' : ""}
-    })()`;
+  /* A raw CDP mouse event is invisible, so anyone watching the tab sees nothing
+     happen. The mark lives in a shadow root so no page style can reach it, carries
+     aria-hidden so it never enters the accessibility snapshot the agent reads, and
+     ignores pointer events so it cannot swallow the click it is marking. It glides
+     to where the agent is about to act and stays there, which is what makes it
+     visible in a screenshot taken afterwards. Failures are swallowed: the mark is
+     decoration and must never fail an action. */
+  private async showCursor(tabId: number, point: { x: number; y: number } | undefined, mode: CursorMode): Promise<void> {
+    /* A keystroke or a bare scroll has no point of its own; it labels itself where
+       the eye already is. Nothing to aim at means no mark at all. */
+    const target = point ?? this.lastPoints.get(tabId);
+    if (!target) return;
+    this.lastPoints.set(tabId, target);
     try {
-      await this.cdp(tabId, "Runtime.evaluate", { expression });
+      await this.cdp(tabId, "Runtime.evaluate", { expression: cursorExpression(target.x, target.y, CURSOR_LABELS[mode]) });
+    } catch { /* the mark is decoration */ }
+  }
+
+  /* The ripple is the click's receipt, so it plays after the button goes down
+     rather than while the pointer is still gliding in. */
+  private async ping(tabId: number): Promise<void> {
+    try {
+      await this.cdp(tabId, "Runtime.evaluate", { expression: pingExpression() });
     } catch { /* the mark is decoration */ }
   }
 
@@ -261,7 +364,7 @@ export class BrowserController {
     const action = asString(params.action);
     if (action === "wait") {
       const waitMs = clampLimit(params.waitMs, 500, 10_000);
-      await new Promise((resolve) => setTimeout(resolve, waitMs));
+      await sleep(waitMs);
       return { waitedMs: waitMs };
     }
     await this.ensureDebugger(tabId);
@@ -272,42 +375,134 @@ export class BrowserController {
       }) as { data?: string };
       return { mimeType: "image/png", dataBase64: result.data ?? "", artifact: true };
     }
+    if (action === "zoom") {
+      const region = asRegion(params.region);
+      if (!region) throw connectorError("invalid_arguments", "zoom requires a region");
+      /* No mark is drawn here. A crop is an observation, and an arrow in it would
+         claim the agent acted at the middle of the region when it did not. */
+      const result = await this.cdp(tabId, "Page.captureScreenshot", {
+        format: "png",
+        clip: { ...region, scale: 1 }
+      }) as { data?: string };
+      return { mimeType: "image/png", dataBase64: result.data ?? "", artifact: true, region };
+    }
     if (action === "scroll") {
       const x = asOptionalNumber(params.deltaX) ?? 0;
       const y = asOptionalNumber(params.deltaY) ?? 600;
-      if (typeof params.x === "number" && typeof params.y === "number") {
-        await this.showCursor(tabId, { x: asNumber(params.x), y: asNumber(params.y) });
-      }
+      const to = typeof params.x === "number" && typeof params.y === "number"
+        ? { x: asNumber(params.x), y: asNumber(params.y) }
+        : undefined;
+      await this.showCursor(tabId, to, "scroll");
       await this.cdp(tabId, "Runtime.evaluate", { expression: `window.scrollBy(${JSON.stringify(x)}, ${JSON.stringify(y)})` });
       return { scrolled: { x, y } };
     }
     if (action === "type") {
-      if (typeof params.pageRef === "string") await this.focusRef(tabId, params.pageRef);
+      if (typeof params.pageRef === "string") {
+        await this.focusRef(tabId, params.pageRef);
+        await this.showCursor(tabId, await this.pointForRef(tabId, params.pageRef), "type");
+      } else {
+        await this.showCursor(tabId, undefined, "type");
+      }
       await this.cdp(tabId, "Input.insertText", { text: asString(params.text) });
       return { typed: true };
     }
     if (action === "key") {
       const key = asString(params.key);
-      await this.cdp(tabId, "Input.dispatchKeyEvent", { type: "keyDown", key });
-      await this.cdp(tabId, "Input.dispatchKeyEvent", { type: "keyUp", key });
-      return { key };
+      const modifiers = parseModifiers(params.modifiers);
+      const repeat = clampLimit(params.repeat, 1, 100);
+      await this.showCursor(tabId, undefined, "key");
+      for (let index = 0; index < repeat; index += 1) {
+        await this.dispatchKey(tabId, key, modifiers, index > 0);
+      }
+      return { key, modifiers: modifierNames(modifiers), repeat };
     }
-    const point = typeof params.pageRef === "string"
-      ? await this.pointForRef(tabId, params.pageRef)
-      : { x: asNumber(params.x), y: asNumber(params.y) };
-    if (action === "move") {
-      await this.showCursor(tabId, point);
+    if (action === "drag") {
+      const from = await this.pointFrom(params, "pageRef", "x", "y", tabId);
+      const to = await this.pointFrom(params, "toPageRef", "toX", "toY", tabId);
+      await this.showCursor(tabId, from, "drag");
+      await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", button: "left", buttons: 1, ...from });
+      await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", button: "left", buttons: 1, clickCount: 1, ...from });
+      for (let step = 1; step <= DRAG_STEPS; step += 1) {
+        await this.cdp(tabId, "Input.dispatchMouseEvent", {
+          type: "mouseMoved",
+          button: "left",
+          buttons: 1,
+          x: from.x + ((to.x - from.x) * step) / DRAG_STEPS,
+          y: from.y + ((to.y - from.y) * step) / DRAG_STEPS
+        });
+      }
+      await this.showCursor(tabId, to, "drag");
+      await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", button: "left", buttons: 0, clickCount: 1, ...to });
+      return { dragged: { from, to } };
+    }
+
+    const point = await this.pointFrom(params, "pageRef", "x", "y", tabId);
+    if (action === "move" || action === "hover") {
+      await this.showCursor(tabId, point, "hover");
       await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", ...point });
       return { moved: point };
     }
-    if (action === "click" || action === "double_click") {
+    if (action === "click" || action === "double_click" || action === "right_click" || action === "middle_click") {
       const clickCount = action === "double_click" ? 2 : 1;
-      await this.showCursor(tabId, point, true);
-      await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", button: "left", clickCount, ...point });
-      await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", button: "left", clickCount, ...point });
-      return { clicked: point, clickCount };
+      const button = action === "right_click"
+        ? "right"
+        : action === "middle_click"
+          ? "middle"
+          : asOptionalString(params.button) ?? "left";
+      if (!["left", "right", "middle"].includes(button)) throw connectorError("invalid_arguments", `Unknown mouse button: ${button}`);
+      const held = button === "left" ? 1 : button === "right" ? 2 : 4;
+      const modifiers = parseModifiers(params.modifiers);
+      await this.showCursor(tabId, point, "click");
+      await sleep(CLICK_DWELL_MS);
+      await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", ...point, modifiers });
+      await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", button, buttons: held, clickCount, ...point, modifiers });
+      await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", button, buttons: 0, clickCount, ...point, modifiers });
+      await this.ping(tabId);
+      return { clicked: point, clickCount, button };
     }
     throw connectorError("invalid_arguments", `Unknown computer action: ${action}`);
+  }
+
+  /* One keystroke, with modifiers applied to both edges. A printable character is
+     typed (keyDown carries text); a combination or a named key is dispatched raw,
+     because Cmd+A is not the character "a" and must not insert one. */
+  private async dispatchKey(tabId: number, key: string, modifiers: number, autoRepeat = false): Promise<void> {
+    const descriptor = keyDescriptor(key);
+    const printable = key.length === 1 && modifiers === 0;
+    const base = {
+      key: descriptor.key,
+      code: descriptor.code,
+      windowsVirtualKeyCode: descriptor.virtualKeyCode,
+      /* macOS takes the native code when it resolves an editing command; falling
+         back keeps a key this table does not know from losing its code. */
+      nativeVirtualKeyCode: descriptor.macVirtualKeyCode ?? descriptor.virtualKeyCode,
+      modifiers
+    };
+    await this.cdp(tabId, "Input.dispatchKeyEvent", {
+      ...base,
+      type: printable ? "keyDown" : "rawKeyDown",
+      autoRepeat,
+      text: printable ? key : undefined,
+      unmodifiedText: printable ? key : undefined,
+      commands: printable ? undefined : commandList(key, modifiers)    });
+    await this.cdp(tabId, "Input.dispatchKeyEvent", { ...base, type: "keyUp" });
+  }
+
+  /* A point is either an element reference or a pair of coordinates, and which one
+     a caller meant is the same question for a click, a drag and a move. */
+  private async pointFrom(
+    params: Record<string, unknown>,
+    refKey: string,
+    xKey: string,
+    yKey: string,
+    tabId: number
+  ): Promise<{ x: number; y: number }> {
+    if (typeof params[refKey] === "string") return this.pointForRef(tabId, params[refKey] as string);
+    if (typeof params[xKey] === "number" && typeof params[yKey] === "number") {
+      return { x: asNumber(params[xKey]), y: asNumber(params[yKey]) };
+    }
+    if (refKey === "pageRef") throw connectorError("invalid_arguments", "A Page Reference or both coordinates are required");
+    throw connectorError("invalid_arguments", `A ${refKey} or both ${xKey}/${yKey} are required`);
   }
 
   private async javascriptTool(tabId: number, source: string): Promise<unknown> {
@@ -489,9 +684,30 @@ export class BrowserController {
   }
 }
 
-function injectedReadPage(generation: number, maxBytes: number, offset: number): unknown {
+function injectedReadPage(generation: number, maxBytes: number, offset: number, scopeRef: string | null): unknown {
   const selector = "a,button,input,select,textarea,[role],[contenteditable=true],summary,[tabindex],h1,h2,h3,h4,h5,h6,p,li";
   const elements = [...document.querySelectorAll<HTMLElement>(selector)];
+  /* Ref numbering is the index in that global list and stays that way even when the
+     read is scoped: a ref from an unscoped read has to resolve inside a scoped one,
+     and re-indexing to the subtree would make one ref mean two things. */
+  let scope: HTMLElement | null = null;
+  if (scopeRef) {
+    scope = document.querySelector<HTMLElement>(`[data-browser-connector-ref="${CSS.escape(scopeRef)}"]`);
+    if (!scope?.isConnected) {
+      return {
+        title: document.title,
+        url: location.origin + location.pathname,
+        documentGeneration: generation,
+        scopeRef,
+        staleScopeRef: true,
+        nodes: [],
+        truncated: false,
+        nextCursor: null,
+        returnedBytes: 0,
+        untrusted: true
+      };
+    }
+  }
   const nodes: Array<Record<string, unknown>> = [];
   let bytes = 0;
   let truncated = false;
@@ -499,6 +715,7 @@ function injectedReadPage(generation: number, maxBytes: number, offset: number):
   for (let index = offset; index < elements.length && nodes.length < 500; index += 1) {
     nextIndex = index + 1;
     const element = elements[index]!;
+    if (scope && element !== scope && !scope.contains(element)) continue;
     const rect = element.getBoundingClientRect();
     if (rect.width === 0 && rect.height === 0) continue;
     const ref = `p${generation}-${index}`;
@@ -524,6 +741,7 @@ function injectedReadPage(generation: number, maxBytes: number, offset: number):
     title: document.title,
     url: location.origin + location.pathname,
     documentGeneration: generation,
+    ...(scopeRef ? { scopeRef } : {}),
     nodes,
     truncated,
     nextCursor: truncated ? String(nextIndex) : null,
@@ -699,6 +917,199 @@ function asTabId(value: unknown): number {
   const id = asNumber(value);
   if (!Number.isInteger(id) || id < 0) throw connectorError("invalid_arguments", "Expected a valid tab ID");
   return id;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+const CURSOR_HOST_ID = "__browser_connector_cursor";
+
+/* The overlay is injected as one string, so it is built here and tested for being
+   parseable: a syntax error would be swallowed by showCursor's catch, and a mark that
+   never appears is not something a user can report back as a broken cursor. */
+export function cursorExpression(x: number, y: number, label: string): string {
+  return `(() => {
+    const HOST_ID = ${JSON.stringify(CURSOR_HOST_ID)};
+    let host = document.getElementById(HOST_ID);
+    if (!host) {
+      host = document.createElement("div");
+      host.id = HOST_ID;
+      host.setAttribute("aria-hidden", "true");
+      host.style.cssText = "position:fixed;left:0;top:0;z-index:2147483647;pointer-events:none;";
+      host.attachShadow({ mode: "open" }).innerHTML = ${JSON.stringify(CURSOR_MARKUP)};
+      document.documentElement.appendChild(host);
+    }
+    const root = host.shadowRoot;
+    if (!root) return;
+    const transform = "translate(" + ${x} + "px, " + ${y} + "px)";
+    for (const selector of [".arrow", ".ring", ".label", ".ghost.g1", ".ghost.g2", ".ghost.g3"]) {
+      const element = root.querySelector(selector);
+      if (element) element.style.transform = transform;
+    }
+    const chip = root.querySelector(".label");
+    if (chip) {
+      chip.textContent = ${JSON.stringify(label)};
+      chip.classList.remove("on");
+      void chip.offsetWidth;
+      chip.classList.add("on");
+    }
+  })()`;
+}
+
+export function pingExpression(): string {
+  return `(() => {
+    const host = document.getElementById(${JSON.stringify(CURSOR_HOST_ID)});
+    const ping = host && host.shadowRoot ? host.shadowRoot.querySelector(".ping") : null;
+    if (!ping) return;
+    ping.classList.remove("on");
+    void ping.offsetWidth;
+    ping.classList.add("on");
+  })()`;
+}
+
+/* The tab group's color, when the caller asked for one. Chrome's Color enum is a
+   closed set of literal strings, which is what GroupColor already is. */
+function colorProperty(group: GroupDescriptor): { color?: `${chrome.tabGroups.Color}` } {
+  return group.color ? { color: group.color } : {};
+}
+
+function asRegion(value: unknown): Region | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (!isRecord(value)) throw connectorError("invalid_arguments", "region must be an object");
+  const region = {
+    x: asNumber(value.x),
+    y: asNumber(value.y),
+    width: asNumber(value.width),
+    height: asNumber(value.height)
+  };
+  if (region.width <= 0 || region.height <= 0) throw connectorError("invalid_arguments", "region width and height must be positive");
+  return region;
+}
+
+/* CDP's modifier bitmask: Alt 1, Ctrl 2, Meta 4, Shift 8. "cmd" and "command" are
+   the same key as "meta" — a name from the keyboard, not from the wire. */
+const MODIFIER_BITS: Record<string, number> = {
+  alt: 1,
+  ctrl: 2,
+  control: 2,
+  meta: 4,
+  cmd: 4,
+  command: 4,
+  shift: 8
+};
+
+export function parseModifiers(value: unknown): number {
+  if (typeof value !== "string" || !value.trim()) return 0;
+  let mask = 0;
+  for (const part of value.toLowerCase().split("+")) {
+    const name = part.trim();
+    const bit = MODIFIER_BITS[name];
+    if (bit === undefined) throw connectorError("invalid_arguments", `Unknown key modifier: ${name}`);
+    mask |= bit;
+  }
+  return mask;
+}
+
+export function modifierNames(mask: number): string[] {
+  return [["alt", 1], ["ctrl", 2], ["meta", 4], ["shift", 8]]
+    .filter(([, bit]) => (mask & (bit as number)) !== 0)
+    .map(([name]) => name as string);
+}
+
+/* macOS virtual key codes (kVK_ANSI_*). Chrome resolves an editing command — Select
+   All, Copy, Paste, Undo — from the platform key code, not from the key name, so a
+   combination sent with only the Windows code arrives intact and then does nothing.
+   The connector is macOS-only, which is the reason this table exists at all. */
+const MAC_LETTER_CODES: Record<string, number> = {
+  A: 0, B: 11, C: 8, D: 2, E: 14, F: 3, G: 5, H: 4, I: 34, J: 38, K: 40, L: 37,
+  M: 46, N: 45, O: 31, P: 35, Q: 12, R: 15, S: 1, T: 17, U: 32, V: 9, W: 13,
+  X: 7, Y: 16, Z: 6
+};
+
+const MAC_DIGIT_CODES: Record<string, number> = {
+  "0": 29, "1": 18, "2": 19, "3": 20, "4": 21, "5": 23, "6": 22, "7": 26, "8": 28, "9": 25
+};
+
+export interface KeyDescriptor {
+  key: string;
+  code?: string;
+  virtualKeyCode?: number;
+  macVirtualKeyCode?: number;
+}
+
+const NAMED_KEYS: Record<string, KeyDescriptor> = {
+  enter: { key: "Enter", code: "Enter", virtualKeyCode: 13, macVirtualKeyCode: 36 },
+  return: { key: "Enter", code: "Enter", virtualKeyCode: 13, macVirtualKeyCode: 36 },
+  tab: { key: "Tab", code: "Tab", virtualKeyCode: 9, macVirtualKeyCode: 48 },
+  escape: { key: "Escape", code: "Escape", virtualKeyCode: 27, macVirtualKeyCode: 53 },
+  esc: { key: "Escape", code: "Escape", virtualKeyCode: 27, macVirtualKeyCode: 53 },
+  backspace: { key: "Backspace", code: "Backspace", virtualKeyCode: 8, macVirtualKeyCode: 51 },
+  delete: { key: "Delete", code: "Delete", virtualKeyCode: 46, macVirtualKeyCode: 117 },
+  space: { key: " ", code: "Space", virtualKeyCode: 32, macVirtualKeyCode: 49 },
+  arrowup: { key: "ArrowUp", code: "ArrowUp", virtualKeyCode: 38, macVirtualKeyCode: 126 },
+  arrowdown: { key: "ArrowDown", code: "ArrowDown", virtualKeyCode: 40, macVirtualKeyCode: 125 },
+  arrowleft: { key: "ArrowLeft", code: "ArrowLeft", virtualKeyCode: 37, macVirtualKeyCode: 123 },
+  arrowright: { key: "ArrowRight", code: "ArrowRight", virtualKeyCode: 39, macVirtualKeyCode: 124 },
+  home: { key: "Home", code: "Home", virtualKeyCode: 36, macVirtualKeyCode: 115 },
+  end: { key: "End", code: "End", virtualKeyCode: 35, macVirtualKeyCode: 119 },
+  pageup: { key: "PageUp", code: "PageUp", virtualKeyCode: 33, macVirtualKeyCode: 116 },
+  pagedown: { key: "PageDown", code: "PageDown", virtualKeyCode: 34, macVirtualKeyCode: 121 }
+};
+
+/* A key combination needs a physical code, a virtual key code and a native key
+   code, not just the character: `{ key: "a" }` on its own inserts an "a" instead of
+   selecting all. Letters and digits get theirs derived; a key this table does not
+   know is passed through as its name so a named key it has never heard of still
+   reaches the page. */
+export function keyDescriptor(key: string): KeyDescriptor {
+  const named = NAMED_KEYS[key.toLowerCase()];
+  if (named) return named;
+  if (key.length === 1) {
+    const upper = key.toUpperCase();
+    if (/^[A-Z]$/.test(upper)) {
+      return { key, code: `Key${upper}`, virtualKeyCode: upper.charCodeAt(0), macVirtualKeyCode: MAC_LETTER_CODES[upper] };
+    }
+    if (/^[0-9]$/.test(key)) {
+      return { key, code: `Digit${key}`, virtualKeyCode: key.charCodeAt(0), macVirtualKeyCode: MAC_DIGIT_CODES[key] };
+    }
+  }
+  return { key };
+}
+
+/* macOS resolves the standard editing shortcuts — Select All, Copy, Paste, Cut,
+   Undo — in the menu bar rather than in the renderer, so a synthetic key event
+   never reaches them: the page receives a correct Cmd+A keydown and nothing
+   selects. Sending the editor command alongside the key event is what Chrome's own
+   DevTools front end does for exactly this reason.
+   Only the macOS modifiers are mapped. On macOS Ctrl+A moves to the start of the
+   line, so mapping Ctrl to SelectAll would be actively wrong, and the connector is
+   macOS-only. */
+const EDITING_COMMANDS: Array<{ key: string; modifiers: number; command: string }> = [
+  { key: "a", modifiers: 4, command: "SelectAll" },
+  { key: "c", modifiers: 4, command: "Copy" },
+  { key: "v", modifiers: 4, command: "Paste" },
+  { key: "x", modifiers: 4, command: "Cut" },
+  { key: "z", modifiers: 4, command: "Undo" },
+  { key: "z", modifiers: 12, command: "Redo" }
+];
+
+/* A command, not a keystroke: it runs even where a page has bound the shortcut to
+   something else. The key event still arrives first, so a page that handles Cmd+A
+   itself sees it. */
+export function editingCommand(key: string, modifiers: number): string | undefined {
+  return EDITING_COMMANDS.find(
+    (entry) => entry.key === key.toLowerCase() && entry.modifiers === modifiers
+  )?.command;
+}
+
+function commandList(key: string, modifiers: number): string[] | undefined {
+  const command = editingCommand(key, modifiers);
+  return command ? [command] : undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function isPageRefContext(value: unknown): value is PageRefContext {

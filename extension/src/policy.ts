@@ -66,6 +66,26 @@ export function classifyRequest(
   };
 }
 
+/* The comparable identity of a navigable address. A fragment is a position inside
+   a document rather than a different document, so two tabs that differ only by
+   hash are the same target; anything that is not http(s) has no comparable
+   identity at all. */
+export function navigationTarget(value: string): string | undefined {
+  try {
+    const url = new URL(value);
+    if (!["http:", "https:"].includes(url.protocol)) return undefined;
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return undefined;
+  }
+}
+
+export function sameNavigationTarget(left: string, right: string): boolean {
+  const a = navigationTarget(left);
+  return a !== undefined && a === navigationTarget(right);
+}
+
 export function isRestrictedUrl(value: string): boolean {
   try {
     const url = new URL(value);

@@ -24,13 +24,15 @@ The MCP bridge and Native Broker are subcommands of one standalone binary. Chrom
 
 ## MCP v1 tools
 
-- Context: `tabs_context`, `tabs_create`
+- Context: `tabs_context`, `tabs_create`, `tabs_activate`
 - Navigation and input: `navigate`, `computer`, `form_input`, `resize_window`
 - Observation: `read_page`, `get_page_text`, `find`, `read_console_messages`, `read_network_requests`
 - Advanced: `javascript_tool`, `browser_batch`
 - Files: `upload_file`, `download_file`
 
 All observations are bounded and pageable. Page, console, and network output is Untrusted Browser Content. Element Page References are opaque and become stale when their tab or document generation changes.
+
+`tabs_create` reuses a Controlled Tab already at the requested URL before it opens a new one, and reports how many tabs outside the control boundary hold that URL. `computer` covers click (left, right, middle), double click, hover, drag, typing, key presses with modifiers and repeat, scroll, wait, and screenshot with a region crop.
 
 ## Permissions and safety
 
