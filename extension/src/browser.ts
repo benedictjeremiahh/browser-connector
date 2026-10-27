@@ -136,7 +136,7 @@ export class BrowserController {
       case "navigate": return this.navigate(asTabId(params.tabId), asString(params.action), asOptionalString(params.url));
       case "computer": return this.computer(params);
       case "read_page": return this.readPage(asTabId(params.tabId), params.maxBytes, params.cursor, asOptionalString(params.scopeRef));
-      case "get_page_text": return this.getPageText(asTabId(params.tabId), params.maxBytes, params.cursor);
+      case "get_page_text": return this.getPageText(asTabId(params.tabId), params.maxBytes, params.cursor, asOptionalString(params.scopeRef));
       case "find": return this.find(asTabId(params.tabId), asString(params.query), params.limit, params.cursor);
       case "form_input": return this.formInput(asTabId(params.tabId), asString(params.pageRef), params.value);
       case "javascript_tool": return this.javascriptTool(asTabId(params.tabId), asString(params.source));
@@ -154,7 +154,7 @@ export class BrowserController {
     const [result] = await chrome.scripting.executeScript({
       target: { tabId },
       func: injectedDescribeRef,
-      args: [pageRef]
+      args: [pageRef, this.documentGenerations.get(tabId) ?? 1]
     });
     if (!isPageRefContext(result?.result)) return { description: "" };
     return result.result;
@@ -266,7 +266,13 @@ export class BrowserController {
      one a person is looking at. */
   private async tabsActivate(tabId: number): Promise<unknown> {
     const tab = await chrome.tabs.update(tabId, { active: true });
-    if (tab?.windowId !== undefined) await chrome.windows.update(tab.windowId, { focused: true }).catch(() => undefined);
+    if (tab?.windowId !== undefined) {
+      const window = await chrome.windows.get(tab.windowId);
+      await chrome.windows.update(tab.windowId, {
+        ...(window.state === "minimized" ? { state: "normal" as const } : {}),
+        focused: true
+      });
+    }
     return { tabId, windowId: tab?.windowId, active: true };
   }
 
@@ -283,12 +289,26 @@ export class BrowserController {
   private async navigate(tabId: number, action: string, url?: string): Promise<unknown> {
     if (action === "go_to") {
       if (!url || isRestrictedUrl(url)) throw connectorError("restricted_url", `Cannot navigate to ${url ?? "an empty URL"}`);
-      await chrome.tabs.update(tabId, { url, active: true });
-    } else if (action === "reload") await chrome.tabs.reload(tabId);
-    else if (action === "back") await chrome.tabs.goBack(tabId);
-    else if (action === "forward") await chrome.tabs.goForward(tabId);
+      await waitForNavigationComplete(tabId, () => chrome.tabs.update(tabId, { url, active: true }));
+    } else if (action === "reload") await waitForNavigationComplete(tabId, () => chrome.tabs.reload(tabId));
+    else if (action === "back" || action === "forward") {
+      try {
+        await waitForNavigationComplete(tabId, () => action === "back" ? chrome.tabs.goBack(tabId) : chrome.tabs.goForward(tabId));
+      } catch (error) {
+        // A browser API history-boundary error can disagree with its renderer's
+        // history. Never use this fallback for permission or debugger failures.
+        if (!(error instanceof Error) || !/Cannot find (?:a )?(?:next|previous) page in history\.?$/i.test(error.message)) throw error;
+        await this.ensureDebugger(tabId);
+        const history = await this.cdp(tabId, "Page.getNavigationHistory") as { currentIndex?: unknown; entries?: unknown[] };
+        if (!Number.isSafeInteger(history.currentIndex) || !Array.isArray(history.entries)
+          || Number(history.currentIndex) < 0 || Number(history.currentIndex) >= history.entries.length) throw error;
+        const targetIndex = Number(history.currentIndex) + (action === "back" ? -1 : 1);
+        const target = history.entries[targetIndex];
+        if (!isRecord(target) || !Number.isSafeInteger(target.id) || typeof target.url !== "string" || isRestrictedUrl(target.url)) throw error;
+        await waitForNavigationComplete(tabId, () => this.cdp(tabId, "Page.navigateToHistoryEntry", { entryId: target.id }));
+      }
+    }
     else throw connectorError("invalid_arguments", `Unknown navigation action: ${action}`);
-    await waitForTabComplete(tabId, 15_000);
     const tab = await chrome.tabs.get(tabId);
     return { tabId, url: tab.url ? redactUrl(tab.url) : undefined, title: tab.title };
   }
@@ -305,10 +325,22 @@ export class BrowserController {
     return result?.result ?? { nodes: [], truncated: false, originalBytes: 0 };
   }
 
-  private async getPageText(tabId: number, requestedMax: unknown, cursor: unknown): Promise<unknown> {
+  private async getPageText(tabId: number, requestedMax: unknown, cursor: unknown, scopeRef?: string): Promise<unknown> {
     const maxBytes = clampLimit(requestedMax, 65_536, 65_536);
-    const [result] = await chrome.scripting.executeScript({ target: { tabId }, func: injectedGetPageText });
-    return { ...pageText(String(result?.result ?? ""), cursorOffset(cursor), maxBytes), untrusted: true };
+    const generation = this.documentGenerations.get(tabId) ?? 1;
+    const [result] = await chrome.scripting.executeScript({ target: { tabId }, func: injectedGetPageText, args: [scopeRef ?? null, generation] });
+    const payload = result?.result;
+    const scoped = scopeRef !== undefined;
+    const scopedPayload = isRecord(payload) ? payload : undefined;
+    const staleScopeRef = scoped && (!scopedPayload || scopedPayload.staleScopeRef === true || typeof scopedPayload.text !== "string");
+    const text = scoped
+      ? staleScopeRef ? "" : scopedPayload!.text as string
+      : typeof payload === "string" ? payload : isRecord(payload) && typeof payload.text === "string" ? payload.text : "";
+    return {
+      ...pageText(text, cursorOffset(cursor), maxBytes),
+      untrusted: true,
+      ...(scoped ? { scopeRef, staleScopeRef } : {})
+    };
   }
 
   private async find(tabId: number, query: string, requestedLimit: unknown, cursor: unknown): Promise<unknown> {
@@ -327,7 +359,7 @@ export class BrowserController {
     const [result] = await chrome.scripting.executeScript({
       target: { tabId },
       func: injectedFormInput,
-      args: [pageRef, value]
+      args: [pageRef, value, this.documentGenerations.get(tabId) ?? 1]
     });
     if (!result?.result) throw connectorError("stale_page_ref", `Page Reference is stale: ${pageRef}`);
     return { changed: true, pageRef };
@@ -418,22 +450,34 @@ export class BrowserController {
     }
     if (action === "drag") {
       const from = await this.pointFrom(params, "pageRef", "x", "y", tabId);
-      const to = await this.pointFrom(params, "toPageRef", "toX", "toY", tabId);
       await this.showCursor(tabId, from, "drag");
-      await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", button: "left", buttons: 1, ...from });
-      await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", button: "left", buttons: 1, clickCount: 1, ...from });
-      for (let step = 1; step <= DRAG_STEPS; step += 1) {
-        await this.cdp(tabId, "Input.dispatchMouseEvent", {
-          type: "mouseMoved",
-          button: "left",
-          buttons: 1,
-          x: from.x + ((to.x - from.x) * step) / DRAG_STEPS,
-          y: from.y + ((to.y - from.y) * step) / DRAG_STEPS
-        });
+      await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", button: "none", buttons: 0, ...from });
+      let release = from;
+      try {
+        await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", button: "left", buttons: 1, clickCount: 1, ...from });
+        // Resolving a reference may scroll. Press at the source before making
+        // the destination visible, so the source coordinate cannot go stale.
+        const to = await this.pointFrom(params, "toPageRef", "toX", "toY", tabId);
+        release = to;
+        for (let step = 1; step <= DRAG_STEPS; step += 1) {
+          await this.cdp(tabId, "Input.dispatchMouseEvent", {
+            type: "mouseMoved",
+            button: "left",
+            buttons: 1,
+            x: from.x + ((to.x - from.x) * step) / DRAG_STEPS,
+            y: from.y + ((to.y - from.y) * step) / DRAG_STEPS
+          });
+        }
+        await this.showCursor(tabId, to, "drag");
+        return { dragged: { from, to } };
+      } catch (error) {
+        const failure = normalizeError(error);
+        throw connectorError(failure.code, failure.message, true);
+      } finally {
+        try {
+          await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", button: "left", buttons: 0, clickCount: 1, ...release });
+        } catch { throw connectorError("drag_interrupted", "The pointer release could not be confirmed; inspect the tab before retrying.", true); }
       }
-      await this.showCursor(tabId, to, "drag");
-      await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", button: "left", buttons: 0, clickCount: 1, ...to });
-      return { dragged: { from, to } };
     }
 
     const point = await this.pointFrom(params, "pageRef", "x", "y", tabId);
@@ -560,8 +604,19 @@ export class BrowserController {
 
   private async resizeWindow(windowId: number, width: number, height: number): Promise<unknown> {
     if (width < 320 || height < 240 || width > 7680 || height > 4320) throw connectorError("invalid_dimensions", "Window dimensions are outside supported bounds");
-    const window = await chrome.windows.update(windowId, { width, height });
-    return { windowId: window.id, width: window.width, height: window.height };
+    const before = await chrome.windows.get(windowId);
+    if (before.state && before.state !== "normal") {
+      throw connectorError("window_not_resizable", `The browser window is ${before.state}; restore a normal window before resizing.`);
+    }
+    await chrome.windows.update(windowId, { width, height });
+    const deadline = Date.now() + 1_000;
+    let window = await chrome.windows.get(windowId);
+    while ((window.width !== width || window.height !== height) && Date.now() < deadline) {
+      await sleep(50);
+      window = await chrome.windows.get(windowId);
+    }
+    if (window.width !== width || window.height !== height) throw connectorError("window_resize_unconfirmed", "The browser did not confirm the requested window dimensions.", true);
+    return { windowId: window.id, width: window.width, height: window.height, state: window.state };
   }
 
   private async uploadFile(params: Record<string, unknown>): Promise<unknown> {
@@ -572,7 +627,7 @@ export class BrowserController {
     const [result] = await chrome.scripting.executeScript({
       target: { tabId },
       func: injectedUpload,
-      args: [pageRef, asString(params.name), asString(params.mimeType), dataBase64]
+      args: [pageRef, asString(params.name), asString(params.mimeType), dataBase64, this.documentGenerations.get(tabId) ?? 1]
     });
     if (!result?.result) throw connectorError("upload_failed", "Target is stale or is not a file input");
     return { uploaded: true, name: params.name };
@@ -631,13 +686,13 @@ export class BrowserController {
   }
 
   private async pointForRef(tabId: number, pageRef: string): Promise<{ x: number; y: number }> {
-    const [result] = await chrome.scripting.executeScript({ target: { tabId }, func: injectedRefPoint, args: [pageRef] });
+    const [result] = await chrome.scripting.executeScript({ target: { tabId }, func: injectedRefPoint, args: [pageRef, this.documentGenerations.get(tabId) ?? 1] });
     if (!result?.result) throw connectorError("stale_page_ref", `Page Reference is stale: ${pageRef}`);
     return result.result as { x: number; y: number };
   }
 
   private async focusRef(tabId: number, pageRef: string): Promise<void> {
-    const [result] = await chrome.scripting.executeScript({ target: { tabId }, func: injectedFocusRef, args: [pageRef] });
+    const [result] = await chrome.scripting.executeScript({ target: { tabId }, func: injectedFocusRef, args: [pageRef, this.documentGenerations.get(tabId) ?? 1] });
     if (!result?.result) throw connectorError("stale_page_ref", `Page Reference is stale: ${pageRef}`);
   }
 
@@ -685,14 +740,30 @@ export class BrowserController {
 }
 
 function injectedReadPage(generation: number, maxBytes: number, offset: number, scopeRef: string | null): unknown {
+  const global = globalThis as typeof globalThis & {
+    __browserConnectorPageRefState?: { document: Document; generation: number; refs: WeakMap<Element, string>; next: number };
+  };
+  let state = global.__browserConnectorPageRefState;
+  if (!state || state.document !== document || state.generation !== generation) {
+    state = { document, generation, refs: new WeakMap<Element, string>(), next: state?.next ?? 0 };
+    global.__browserConnectorPageRefState = state;
+  }
+  const refFor = (element: HTMLElement): string => {
+    const existing = state!.refs.get(element);
+    if (existing) { element.dataset.browserConnectorRef = existing; return existing; }
+    const ref = `p${generation}-${state!.next++}`;
+    state!.refs.set(element, ref);
+    element.dataset.browserConnectorRef = ref;
+    return ref;
+  };
   const selector = "a,button,input,select,textarea,[role],[contenteditable=true],summary,[tabindex],h1,h2,h3,h4,h5,h6,p,li";
   const elements = [...document.querySelectorAll<HTMLElement>(selector)];
-  /* Ref numbering is the index in that global list and stays that way even when the
-     read is scoped: a ref from an unscoped read has to resolve inside a scoped one,
-     and re-indexing to the subtree would make one ref mean two things. */
+  /* Cursor positions still use the global traversal, even for scoped reads. Stable
+     references come from the shared WeakMap so a find ref resolves in this traversal. */
   let scope: HTMLElement | null = null;
-  if (scopeRef) {
-    scope = document.querySelector<HTMLElement>(`[data-browser-connector-ref="${CSS.escape(scopeRef)}"]`);
+  if (scopeRef !== null) {
+    const scopeCandidates = [...elements, ...document.querySelectorAll<HTMLElement>("*")];
+    scope = scopeCandidates.find(element => state!.refs.get(element) === scopeRef) ?? null;
     if (!scope?.isConnected) {
       return {
         title: document.title,
@@ -718,8 +789,7 @@ function injectedReadPage(generation: number, maxBytes: number, offset: number, 
     if (scope && element !== scope && !scope.contains(element)) continue;
     const rect = element.getBoundingClientRect();
     if (rect.width === 0 && rect.height === 0) continue;
-    const ref = `p${generation}-${index}`;
-    element.dataset.browserConnectorRef = ref;
+    const ref = refFor(element);
     const input = element instanceof HTMLInputElement ? element : undefined;
     const name = (element.getAttribute("aria-label") || element.getAttribute("title") || input?.placeholder || element.innerText || "").trim().replace(/\s+/g, " ").slice(0, 500);
     const node: Record<string, unknown> = {
@@ -732,7 +802,7 @@ function injectedReadPage(generation: number, maxBytes: number, offset: number, 
     if (input && input.type !== "password") node.value = input.value.slice(0, 500);
     if (input?.type === "password") node.value = "[redacted]";
     const size = new TextEncoder().encode(JSON.stringify(node)).length;
-    if (bytes + size > maxBytes) { truncated = true; break; }
+    if (bytes + size > maxBytes) { truncated = true; nextIndex = index; break; }
     nodes.push(node);
     bytes += size;
   }
@@ -750,12 +820,38 @@ function injectedReadPage(generation: number, maxBytes: number, offset: number, 
   };
 }
 
-function injectedGetPageText(): string {
+function injectedGetPageText(scopeRef: string | null, generation: number): { text: string; scopeRef?: string; staleScopeRef?: true } {
+  if (scopeRef !== null) {
+    const global = globalThis as typeof globalThis & {
+      __browserConnectorPageRefState?: { document: Document; generation: number; refs: WeakMap<Element, string>; next: number };
+    };
+    const state = global.__browserConnectorPageRefState;
+    if (!state || state.document !== document || state.generation !== generation) return { text: "", scopeRef, staleScopeRef: true };
+    const root = [...document.querySelectorAll<HTMLElement>("*")].find(element => state.refs.get(element) === scopeRef && element.isConnected);
+    if (!root?.isConnected) return { text: "", scopeRef, staleScopeRef: true };
+    return { text: root.innerText ?? root.textContent ?? "", scopeRef };
+  }
   const root = document.querySelector("main,article,[role=main]") ?? document.body;
-  return (root as HTMLElement).innerText ?? root.textContent ?? "";
+  return { text: (root as HTMLElement).innerText ?? root.textContent ?? "" };
 }
 
 function injectedFind(generation: number, query: string, limit: number, offset: number): unknown {
+  const global = globalThis as typeof globalThis & {
+    __browserConnectorPageRefState?: { document: Document; generation: number; refs: WeakMap<Element, string>; next: number };
+  };
+  let state = global.__browserConnectorPageRefState;
+  if (!state || state.document !== document || state.generation !== generation) {
+    state = { document, generation, refs: new WeakMap<Element, string>(), next: state?.next ?? 0 };
+    global.__browserConnectorPageRefState = state;
+  }
+  const refFor = (element: HTMLElement): string => {
+    const existing = state!.refs.get(element);
+    if (existing) { element.dataset.browserConnectorRef = existing; return existing; }
+    const ref = `p${generation}-${state!.next++}`;
+    state!.refs.set(element, ref);
+    element.dataset.browserConnectorRef = ref;
+    return ref;
+  };
   const needle = query.toLowerCase();
   const elements = [...document.querySelectorAll<HTMLElement>("body *")];
   const matches: unknown[] = [];
@@ -769,15 +865,19 @@ function injectedFind(generation: number, query: string, limit: number, offset: 
     if (rect.width === 0 && rect.height === 0) continue;
     if (skipped < offset) { skipped += 1; continue; }
     if (matches.length >= limit) { hasMore = true; break; }
-    const ref = `p${generation}-f${index}`;
-    element.dataset.browserConnectorRef = ref;
+    const ref = refFor(element);
     matches.push({ ref, role: element.getAttribute("role") || element.tagName.toLowerCase(), name: haystack.slice(0, 500) });
   }
   return { matches, nextCursor: hasMore ? String(offset + matches.length) : null, truncated: hasMore };
 }
 
-function injectedDescribeRef(pageRef: string): { description: string; destinationOrigin?: string } {
-  const element = document.querySelector<HTMLElement>(`[data-browser-connector-ref="${CSS.escape(pageRef)}"]`);
+function injectedDescribeRef(pageRef: string, generation: number): { description: string; destinationOrigin?: string } {
+  const global = globalThis as typeof globalThis & {
+    __browserConnectorPageRefState?: { document: Document; generation: number; refs: WeakMap<Element, string>; next: number };
+  };
+  const state = global.__browserConnectorPageRefState;
+  if (!state || state.document !== document || state.generation !== generation) return { description: "" };
+  const element = [...document.querySelectorAll<HTMLElement>("*")].find(candidate => state.refs.get(candidate) === pageRef && candidate.isConnected);
   if (!element) return { description: "" };
   const description = [element.getAttribute("aria-label"), element.getAttribute("title"), element.getAttribute("name"), element.innerText]
     .filter(Boolean)
@@ -801,24 +901,39 @@ function injectedDescribeRef(pageRef: string): { description: string; destinatio
   }
 }
 
-function injectedRefPoint(pageRef: string): { x: number; y: number } | null {
-  const element = document.querySelector<HTMLElement>(`[data-browser-connector-ref="${CSS.escape(pageRef)}"]`);
-  if (!element?.isConnected) return null;
+function injectedRefPoint(pageRef: string, generation: number): { x: number; y: number } | null {
+  const global = globalThis as typeof globalThis & {
+    __browserConnectorPageRefState?: { document: Document; generation: number; refs: WeakMap<Element, string>; next: number };
+  };
+  const state = global.__browserConnectorPageRefState;
+  if (!state || state.document !== document || state.generation !== generation) return null;
+  const element = [...document.querySelectorAll<HTMLElement>("*")].find(candidate => state.refs.get(candidate) === pageRef && candidate.isConnected);
+  if (!element) return null;
   element.scrollIntoView({ block: "center", inline: "center" });
   const rect = element.getBoundingClientRect();
   return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
 }
 
-function injectedFocusRef(pageRef: string): boolean {
-  const element = document.querySelector<HTMLElement>(`[data-browser-connector-ref="${CSS.escape(pageRef)}"]`);
-  if (!element?.isConnected) return false;
+function injectedFocusRef(pageRef: string, generation: number): boolean {
+  const global = globalThis as typeof globalThis & {
+    __browserConnectorPageRefState?: { document: Document; generation: number; refs: WeakMap<Element, string>; next: number };
+  };
+  const state = global.__browserConnectorPageRefState;
+  if (!state || state.document !== document || state.generation !== generation) return false;
+  const element = [...document.querySelectorAll<HTMLElement>("*")].find(candidate => state.refs.get(candidate) === pageRef && candidate.isConnected);
+  if (!element) return false;
   element.focus();
   return document.activeElement === element;
 }
 
-function injectedFormInput(pageRef: string, value: unknown): boolean {
-  const element = document.querySelector<HTMLElement>(`[data-browser-connector-ref="${CSS.escape(pageRef)}"]`);
-  if (!element?.isConnected) return false;
+function injectedFormInput(pageRef: string, value: unknown, generation: number): boolean {
+  const global = globalThis as typeof globalThis & {
+    __browserConnectorPageRefState?: { document: Document; generation: number; refs: WeakMap<Element, string>; next: number };
+  };
+  const state = global.__browserConnectorPageRefState;
+  if (!state || state.document !== document || state.generation !== generation) return false;
+  const element = [...document.querySelectorAll<HTMLElement>("*")].find(candidate => state.refs.get(candidate) === pageRef && candidate.isConnected);
+  if (!element) return false;
   if (element instanceof HTMLInputElement) {
     if (element.type === "checkbox" || element.type === "radio") element.checked = Boolean(value);
     else element.value = String(value ?? "");
@@ -830,8 +945,13 @@ function injectedFormInput(pageRef: string, value: unknown): boolean {
   return true;
 }
 
-function injectedUpload(pageRef: string, name: string, mimeType: string, dataBase64: string): boolean {
-  const input = document.querySelector<HTMLInputElement>(`[data-browser-connector-ref="${CSS.escape(pageRef)}"]`);
+function injectedUpload(pageRef: string, name: string, mimeType: string, dataBase64: string, generation: number): boolean {
+  const global = globalThis as typeof globalThis & {
+    __browserConnectorPageRefState?: { document: Document; generation: number; refs: WeakMap<Element, string>; next: number };
+  };
+  const state = global.__browserConnectorPageRefState;
+  if (!state || state.document !== document || state.generation !== generation) return false;
+  const input = [...document.querySelectorAll<HTMLInputElement>("*")].find(candidate => state.refs.get(candidate) === pageRef && candidate.isConnected);
   if (!input || input.type !== "file") return false;
   const binary = atob(dataBase64);
   const bytes = new Uint8Array(binary.length);
@@ -844,20 +964,46 @@ function injectedUpload(pageRef: string, name: string, mimeType: string, dataBas
   return true;
 }
 
-async function waitForTabComplete(tabId: number, timeoutMs: number): Promise<void> {
-  const tab = await chrome.tabs.get(tabId);
-  if (tab.status === "complete") return;
-  await new Promise<void>((resolve) => {
-    const timer = setTimeout(done, timeoutMs);
-    function listener(changedTabId: number, info: { status?: string }): void {
-      if (changedTabId === tabId && info.status === "complete") done();
-    }
-    function done(): void {
+async function waitForNavigationComplete(tabId: number, action: () => Promise<unknown>, timeoutMs = 15_000): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    let started = false;
+    let loadingObserved = false;
+    let completed = false;
+    let actionCompleted = false;
+    const timer = setTimeout(() => finish(connectorError("navigation_timeout", "The navigation did not complete before its deadline; inspect the tab before retrying.", true)), timeoutMs);
+    function finish(error?: unknown): void {
+      if (settled) return;
+      if (!error && (!completed || !actionCompleted)) return;
+      settled = true;
       clearTimeout(timer);
-      chrome.tabs.onUpdated.removeListener(listener);
-      resolve();
+      chrome.tabs.onUpdated.removeListener(updated);
+      chrome.webNavigation.onCommitted.removeListener(committed);
+      if (error) reject(error); else resolve();
     }
-    chrome.tabs.onUpdated.addListener(listener);
+    function updated(changedTabId: number, info: chrome.tabs.OnUpdatedInfo, tab: chrome.tabs.Tab): void {
+      if (!started || changedTabId !== tabId) return;
+      if (info.status === "loading") loadingObserved = true;
+      if (info.status === "complete" && loadingObserved || info.url !== undefined && tab.status === "complete" && !tab.pendingUrl) {
+        completed = true;
+        finish();
+      }
+    }
+    function committed(details: chrome.webNavigation.WebNavigationTransitionCallbackDetails): void {
+      if (!started || details.tabId !== tabId || details.frameId !== 0) return;
+      loadingObserved = true;
+      void chrome.tabs.get(tabId).then(tab => {
+        if (!settled && tab.status === "complete") { completed = true; finish(); }
+      }, error => finish(error));
+    }
+    // Subscribe before invoking the API: a fast navigation can finish before
+    // its promise resolves, while the old document can still report complete.
+    chrome.tabs.onUpdated.addListener(updated);
+    chrome.webNavigation.onCommitted.addListener(committed);
+    void Promise.resolve().then(() => { started = true; return action(); }).then(() => {
+      actionCompleted = true;
+      finish();
+    }, error => finish(error));
   });
 }
 

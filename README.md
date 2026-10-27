@@ -77,13 +77,13 @@ session.
 | `tabs_close` | Close a controlled tab. |
 | `label_session` | Name this session's tab group. |
 | `navigate` | Go to a URL, back, forward, or reload. |
-| `read_page` / `get_page_text` | Accessibility snapshot with refs / bounded visible text. `read_page` can scope to one element's subtree. |
+| `read_page` / `get_page_text` | Accessibility snapshot with refs / bounded visible text. Both can scope to one element's subtree. |
 | `find` | Elements by visible text or semantics, as refs. |
 | `form_input` | Set a form control's value. Password fields are never read back. |
-| `javascript_tool` | Run JavaScript in the page, shown in full for approval. |
+| `javascript_tool` | Run JavaScript in the page. The extension auto-approves calls in this build and records them in its audit log; an Agent Host may apply its own policy gate. |
 | `read_console_messages` / `read_network_requests` | Bounded, filterable console and network records. |
 | `computer` | Visible mouse, keyboard, scroll, drag, wait, and **screenshot**, with a zoom crop. |
-| `upload_file` / `download_file` | Host-provided bytes to a file input / a file through a tab. |
+| `upload_file` / `download_file` | Send host-provided bytes to a file input / fetch bounded response bytes through a tab. The extension auto-approves calls in this build and records them in its audit log. |
 | `browser_batch` | Sequential, non-atomic, fail-fast batch of the above. JavaScript is excluded. |
 | `resize_window` | Resize the window holding a controlled tab. |
 
