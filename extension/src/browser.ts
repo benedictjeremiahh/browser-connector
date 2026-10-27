@@ -1,3 +1,4 @@
+import { TabMarkers } from "./tab-marker";
 import {
   boundedText,
   clampLimit,
@@ -109,6 +110,7 @@ export class BrowserController {
   /* Where the mark last acted, so a keystroke or a scroll can label itself at the
      place the person is already looking, without needing coordinates of its own. */
   private lastPoints = new Map<number, { x: number; y: number }>();
+  private markers = new TabMarkers();
 
   constructor() {
     chrome.webNavigation.onCommitted.addListener(({ tabId, frameId }) => {
@@ -127,7 +129,14 @@ export class BrowserController {
     });
   }
 
+  /* Every call re-syncs the favicon marks, so a tab is marked however it became controlled. */
   async dispatch(method: string, params: Record<string, unknown>, controlledTabIds: Set<number>, group: GroupDescriptor = DEFAULT_GROUP): Promise<unknown> {
+    const result = await this.dispatchMethod(method, params, controlledTabIds, group);
+    await this.markers.sync(controlledTabIds).catch(() => undefined);
+    return result;
+  }
+
+  private async dispatchMethod(method: string, params: Record<string, unknown>, controlledTabIds: Set<number>, group: GroupDescriptor): Promise<unknown> {
     switch (method) {
       case "tabs_context": return this.tabsContext(controlledTabIds, params.createIfEmpty === true, group);
       case "tabs_create": return this.tabsCreate(controlledTabIds, asOptionalString(params.url), group);
@@ -163,7 +172,9 @@ export class BrowserController {
   /* Releasing one session detaches that session's tabs and leaves every other session's
      attached. detachAll stays for the callers that really do mean everything. */
   async detachTabs(tabIds: Iterable<number>): Promise<void> {
-    await Promise.all([...tabIds].map(async (tabId) => {
+    const ids = [...tabIds];
+    await this.markers.clear(ids).catch(() => undefined);
+    await Promise.all(ids.map(async (tabId) => {
       try { await chrome.debugger.detach({ tabId }); } catch { /* already detached */ }
       this.attachedTabs.delete(tabId);
     }));
@@ -200,12 +211,12 @@ export class BrowserController {
     if (url) {
       const existing = await this.reuseControlledTab(controlledTabIds, url);
       if (existing !== undefined) {
-        await chrome.tabs.update(existing, { active: true }).catch(() => undefined);
         const tab = await chrome.tabs.get(existing);
         return { tabId: existing, windowId: tab.windowId, url: tab.url ? redactUrl(tab.url) : redactUrl(url), reused: true };
       }
     }
-    const tab = await chrome.tabs.create({ url: url ?? "about:blank", active: true });
+    /* Work tabs open in the background: the person keeps the tab they are using (ADR-0024). */
+    const tab = await chrome.tabs.create({ url: url ?? "about:blank", active: false });
     if (tab.id === undefined) throw connectorError("tab_create_failed", "Chrome did not return a tab ID");
     controlledTabIds.add(tab.id);
     await this.ensureTabGroup(group, tab.id);
@@ -289,7 +300,7 @@ export class BrowserController {
   private async navigate(tabId: number, action: string, url?: string): Promise<unknown> {
     if (action === "go_to") {
       if (!url || isRestrictedUrl(url)) throw connectorError("restricted_url", `Cannot navigate to ${url ?? "an empty URL"}`);
-      await waitForNavigationComplete(tabId, () => chrome.tabs.update(tabId, { url, active: true }));
+      await waitForNavigationComplete(tabId, () => chrome.tabs.update(tabId, { url }));
     } else if (action === "reload") await waitForNavigationComplete(tabId, () => chrome.tabs.reload(tabId));
     else if (action === "back" || action === "forward") {
       try {
@@ -675,6 +686,10 @@ export class BrowserController {
       await chrome.debugger.sendCommand({ tabId }, "Runtime.enable");
       await chrome.debugger.sendCommand({ tabId }, "Network.enable");
       await chrome.debugger.sendCommand({ tabId }, "Page.enable");
+      /* A background tab must keep rendering and behave as focused, or screenshots stall and
+         focus-dependent pages misbehave while the person works in another tab (ADR-0024). */
+      await chrome.debugger.sendCommand({ tabId }, "Emulation.setFocusEmulationEnabled", { enabled: true }).catch(() => undefined);
+      await chrome.debugger.sendCommand({ tabId }, "Page.setWebLifecycleState", { state: "active" }).catch(() => undefined);
       this.attachedTabs.add(tabId);
     } catch (error) {
       throw connectorError("debugger_conflict", `Cannot attach Chrome debugger. Close DevTools or another debugger first. ${String(error)}`);
