@@ -437,7 +437,7 @@ impl BrowserService {
     }
 
     #[tool(
-        description = "Bring a controlled tab to the front of its window. Reads nothing on any origin.",
+        description = "Show a controlled tab to the person. Never needed for tools to work: every tool, including screenshots, works on background tabs. Declined (deferred: true) while the person uses that window; do not retry. Only call it when the person asks to see the tab.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -602,7 +602,7 @@ impl BrowserService {
     }
 
     #[tool(
-        description = "Resize the visible browser window containing a controlled tab.",
+        description = "Set the viewport size of this session's tabs in a window, for example 360 wide for a phone-width check. The person's window is never resized: the size is emulated inside the tabs, and screenshots and clicks follow it.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,

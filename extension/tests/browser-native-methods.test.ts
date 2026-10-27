@@ -25,8 +25,10 @@ function harness() {
     tab.status = "complete";
     updated.emit(7, { status: "complete", url }, { ...tab });
   }
+  const windowTabs: Array<{ id: number }> = [{ id: 7 }];
   const tabs = {
     onUpdated: updated, onRemoved: event(),
+    query: vi.fn(async () => windowTabs.map(item => ({ ...item, windowId: 9 }))),
     get: vi.fn(async () => ({ ...tab })),
     update: vi.fn(async (_id: number, args: { active?: boolean; url?: string }) => {
       if (args.active !== undefined) tab.active = args.active;
@@ -63,7 +65,7 @@ function harness() {
   const controller = new BrowserController();
   /* Long-lived listeners (the favicon mark) register at construction; a method must leave none behind. */
   const baseline = updated.size();
-  return { controller, baseline, tabs, windows, debuggerApi, scripting, tab, window, updated, committed, trace, navigate };
+  return { controller, baseline, windowTabs, tabs, windows, debuggerApi, scripting, tab, window, updated, committed, trace, navigate };
 }
 
 afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers(); });
@@ -109,34 +111,26 @@ describe("native browser method completion", () => {
     expect(boundary.debuggerApi.sendCommand.mock.calls.some(call => call[1] === "Page.navigateToHistoryEntry")).toBe(false);
   });
 
-  it("restores a minimized window only when explicitly activating its controlled tab", async () => {
+  it("never brings a tab forward in a window the person is using, and never focuses a window", async () => {
     const h = harness();
-    h.window.state = "minimized";
-    await h.controller.dispatch("tabs_activate", { tabId: 7 }, new Set([7]));
-    expect(h.windows.update).toHaveBeenCalledWith(9, { state: "normal", focused: true });
-    expect(h.window.state).toBe("normal");
-  });
-
-  it("verifies resized bounds without silently leaving fullscreen", async () => {
-    const h = harness();
-    await expect(h.controller.dispatch("resize_window", { windowId: 9, width: 1000, height: 700 }, new Set([7])))
-      .resolves.toMatchObject({ width: 1000, height: 700, state: "normal" });
-    expect(h.windows.get).toHaveBeenCalledTimes(2);
-    h.window.state = "fullscreen";
-    h.windows.update.mockClear();
-    await expect(h.controller.dispatch("resize_window", { windowId: 9, width: 900, height: 600 }, new Set([7])))
-      .rejects.toMatchObject({ code: "window_not_resizable", outcomeUnknown: false });
+    h.windowTabs.push({ id: 3 });
+    await expect(h.controller.dispatch("tabs_activate", { tabId: 7 }, new Set([7])))
+      .resolves.toMatchObject({ tabId: 7, active: false, deferred: true });
+    expect(h.tabs.update).not.toHaveBeenCalled();
+    h.windowTabs.splice(0, h.windowTabs.length, { id: 7 });
+    await expect(h.controller.dispatch("tabs_activate", { tabId: 7 }, new Set([7]))).resolves.toMatchObject({ active: true });
+    expect(h.tabs.update).toHaveBeenCalledWith(7, { active: true });
     expect(h.windows.update).not.toHaveBeenCalled();
   });
 
-  it("reports unknown resize outcome if the browser never applies the requested bounds", async () => {
-    vi.useFakeTimers();
+  it("emulates a requested viewport in the session's tabs instead of resizing the person's window", async () => {
     const h = harness();
-    h.windows.update.mockImplementation(async () => ({ ...h.window, width: 1000, height: 700 }));
-    const result = h.controller.dispatch("resize_window", { windowId: 9, width: 1000, height: 700 }, new Set([7]));
-    const failure = expect(result).rejects.toMatchObject({ code: "window_resize_unconfirmed", outcomeUnknown: true });
-    await vi.advanceTimersByTimeAsync(1_001);
-    await failure;
+    await expect(h.controller.dispatch("resize_window", { windowId: 9, width: 360, height: 800 }, new Set([7])))
+      .resolves.toMatchObject({ width: 360, height: 800, emulated: true, tabIds: [7] });
+    expect(h.windows.update).not.toHaveBeenCalled();
+    expect(h.debuggerApi.sendCommand).toHaveBeenCalledWith({ tabId: 7 }, "Emulation.setDeviceMetricsOverride", { width: 360, height: 800, deviceScaleFactor: 0, mobile: true });
+    await expect(h.controller.dispatch("resize_window", { windowId: 9, width: 360, height: 800 }, new Set([99])))
+      .rejects.toMatchObject({ code: "tab_not_controlled" });
   });
 
   it("presses the drag source before resolving a destination that may scroll", async () => {

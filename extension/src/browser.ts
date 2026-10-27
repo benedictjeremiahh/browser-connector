@@ -101,6 +101,8 @@ const CURSOR_MARKUP = [
 
 export class BrowserController {
   private attachedTabs = new Set<number>();
+  /* A requested viewport survives a debugger re-attach; it ends with the tab or its lease. */
+  private viewports = new Map<number, { width: number; height: number; mobile: boolean }>();
   private documentGenerations = new Map<number, number>();
   private consoleRecords = new Map<number, ConsoleRecord[]>();
   private networkRecords = new Map<number, NetworkRecord[]>();
@@ -122,6 +124,7 @@ export class BrowserController {
       this.consoleRecords.delete(tabId);
       this.networkRecords.delete(tabId);
       this.lastPoints.delete(tabId);
+      this.viewports.delete(tabId);
     });
     chrome.debugger.onEvent.addListener((source, method, params) => this.onDebuggerEvent(source.tabId, method, params));
     chrome.debugger.onDetach.addListener((source) => {
@@ -140,7 +143,7 @@ export class BrowserController {
     switch (method) {
       case "tabs_context": return this.tabsContext(controlledTabIds, params.createIfEmpty === true, group);
       case "tabs_create": return this.tabsCreate(controlledTabIds, asOptionalString(params.url), group);
-      case "tabs_activate": return this.tabsActivate(asTabId(params.tabId));
+      case "tabs_activate": return this.tabsActivate(asTabId(params.tabId), controlledTabIds);
       case "tabs_close": return this.tabsClose(controlledTabIds, asTabId(params.tabId));
       case "navigate": return this.navigate(asTabId(params.tabId), asString(params.action), asOptionalString(params.url));
       case "computer": return this.computer(params);
@@ -151,7 +154,7 @@ export class BrowserController {
       case "javascript_tool": return this.javascriptTool(asTabId(params.tabId), asString(params.source));
       case "read_console_messages": return this.readConsole(asTabId(params.tabId), params);
       case "read_network_requests": return this.readNetwork(asTabId(params.tabId), params);
-      case "resize_window": return this.resizeWindow(asNumber(params.windowId), asNumber(params.width), asNumber(params.height));
+      case "resize_window": return this.emulateViewport(asNumber(params.windowId), asNumber(params.width), asNumber(params.height), controlledTabIds);
       case "upload_file": return this.uploadFile(params);
       case "download_file": return this.downloadFile(asTabId(params.tabId), asString(params.url));
       case "browser_batch": return this.browserBatch(params, controlledTabIds);
@@ -177,6 +180,7 @@ export class BrowserController {
     await Promise.all(ids.map(async (tabId) => {
       try { await chrome.debugger.detach({ tabId }); } catch { /* already detached */ }
       this.attachedTabs.delete(tabId);
+      this.viewports.delete(tabId);
     }));
   }
 
@@ -288,16 +292,18 @@ export class BrowserController {
   /* Bringing a controlled tab forward reads nothing on any origin, so it asks for no
      site grant; it only decides which of the tabs this session already holds is the
      one a person is looking at. */
-  private async tabsActivate(tabId: number): Promise<unknown> {
-    const tab = await chrome.tabs.update(tabId, { active: true });
-    if (tab?.windowId !== undefined) {
-      const window = await chrome.windows.get(tab.windowId);
-      await chrome.windows.update(tab.windowId, {
-        ...(window.state === "minimized" ? { state: "normal" as const } : {}),
-        focused: true
-      });
+  /* The agent never takes the person's screen (ADR-0026). A tab is brought forward only inside a
+     window that holds nothing but this session's tabs, and the window itself is never focused or
+     raised. Anywhere else the request is declined: background tabs already render as focused, so
+     no tool needs the tab in front. */
+  private async tabsActivate(tabId: number, controlledTabIds: Set<number>): Promise<unknown> {
+    const tab = await chrome.tabs.get(tabId);
+    const windowTabs = await chrome.tabs.query({ windowId: tab.windowId });
+    if (windowTabs.some((other) => other.id === undefined || !controlledTabIds.has(other.id))) {
+      return { tabId, windowId: tab.windowId, active: tab.active, deferred: true, reason: "The person is using this window, so the tab stays in the background. Every tool works on background tabs; do not retry." };
     }
-    return { tabId, windowId: tab?.windowId, active: true };
+    await chrome.tabs.update(tabId, { active: true });
+    return { tabId, windowId: tab.windowId, active: true };
   }
 
   /* Closing a tab is not merely releasing the lease: the tab is gone from the
@@ -626,21 +632,28 @@ export class BrowserController {
     return { records, truncated: nextCursor !== null, nextCursor, untrusted: true };
   }
 
-  private async resizeWindow(windowId: number, width: number, height: number): Promise<unknown> {
-    if (width < 320 || height < 240 || width > 7680 || height > 4320) throw connectorError("invalid_dimensions", "Window dimensions are outside supported bounds");
-    const before = await chrome.windows.get(windowId);
-    if (before.state && before.state !== "normal") {
-      throw connectorError("window_not_resizable", `The browser window is ${before.state}; restore a normal window before resizing.`);
+  /* Resizing the person's real window would rearrange their screen, so a size request emulates
+     that viewport inside this session's tabs in the window instead (ADR-0026). Screenshots, clicks
+     and layout all follow the emulated size; the window is untouched. Narrow widths also emulate a
+     touch device, which is what a phone-width check means. */
+  private async emulateViewport(windowId: number, width: number, height: number, controlledTabIds: Set<number>): Promise<unknown> {
+    if (width < 320 || height < 240 || width > 7680 || height > 4320) throw connectorError("invalid_dimensions", "Viewport dimensions are outside supported bounds");
+    const tabs = (await chrome.tabs.query({ windowId })).flatMap((tab) => tab.id !== undefined && controlledTabIds.has(tab.id) ? [tab.id] : []);
+    if (!tabs.length) throw connectorError("tab_not_controlled", "This window holds no Controlled Tab to size");
+    const viewport = { width, height, mobile: width <= 480 };
+    for (const tabId of tabs) {
+      this.viewports.set(tabId, viewport);
+      await this.ensureDebugger(tabId);
+      await this.applyViewport(tabId);
     }
-    await chrome.windows.update(windowId, { width, height });
-    const deadline = Date.now() + 1_000;
-    let window = await chrome.windows.get(windowId);
-    while ((window.width !== width || window.height !== height) && Date.now() < deadline) {
-      await sleep(50);
-      window = await chrome.windows.get(windowId);
-    }
-    if (window.width !== width || window.height !== height) throw connectorError("window_resize_unconfirmed", "The browser did not confirm the requested window dimensions.", true);
-    return { windowId: window.id, width: window.width, height: window.height, state: window.state };
+    return { windowId, width, height, emulated: true, tabIds: tabs };
+  }
+
+  private async applyViewport(tabId: number): Promise<void> {
+    const viewport = this.viewports.get(tabId);
+    if (!viewport) return;
+    await this.cdp(tabId, "Emulation.setDeviceMetricsOverride", { width: viewport.width, height: viewport.height, deviceScaleFactor: 0, mobile: viewport.mobile });
+    await this.cdp(tabId, "Emulation.setTouchEmulationEnabled", { enabled: viewport.mobile }).catch(() => undefined);
   }
 
   private async uploadFile(params: Record<string, unknown>): Promise<unknown> {
@@ -704,6 +717,7 @@ export class BrowserController {
       await chrome.debugger.sendCommand({ tabId }, "Emulation.setFocusEmulationEnabled", { enabled: true }).catch(() => undefined);
       await chrome.debugger.sendCommand({ tabId }, "Page.setWebLifecycleState", { state: "active" }).catch(() => undefined);
       this.attachedTabs.add(tabId);
+      await this.applyViewport(tabId).catch(() => undefined);
     } catch (error) {
       throw connectorError("debugger_conflict", `Cannot attach Chrome debugger. Close DevTools or another debugger first. ${String(error)}`);
     }
