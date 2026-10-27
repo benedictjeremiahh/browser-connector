@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { BrowserController } from "../src/browser";
+import { injectedMarkIcon, injectedOriginalIcon } from "../src/tab-marker";
 
 function event() {
   const listeners = new Set<(...args: unknown[]) => void>();
@@ -50,14 +51,19 @@ function harness() {
     })
   };
   const scripting = {
-    executeScript: vi.fn(async (args: { args?: unknown[] }): Promise<Array<{ result: { x: number; y: number } | null }>> => {
+    executeScript: vi.fn(async (args: { func?: unknown; args?: unknown[] }): Promise<Array<{ result: { x: number; y: number } | null }>> => {
+      /* The favicon mark is not part of the method under test. */
+      if (args.func === injectedMarkIcon || args.func === injectedOriginalIcon) return [{ result: null }];
       const ref = args.args?.[0];
       trace.push(`resolve:${ref}`);
       return [{ result: ref === "p1-start" ? { x: 20, y: 40 } : { x: 50, y: 80 } }];
     })
   };
   vi.stubGlobal("chrome", { tabs, windows, debugger: debuggerApi, scripting, webNavigation: { onCommitted: committed } });
-  return { controller: new BrowserController(), tabs, windows, debuggerApi, scripting, tab, window, updated, committed, trace, navigate };
+  const controller = new BrowserController();
+  /* Long-lived listeners (the favicon mark) register at construction; a method must leave none behind. */
+  const baseline = updated.size();
+  return { controller, baseline, tabs, windows, debuggerApi, scripting, tab, window, updated, committed, trace, navigate };
 }
 
 afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers(); });
@@ -67,7 +73,7 @@ describe("native browser method completion", () => {
     const h = harness();
     await expect(h.controller.dispatch("navigate", { tabId: 7, action: "go_to", url: "https://example.test/new" }, new Set([7])))
       .resolves.toMatchObject({ tabId: 7, url: "https://example.test/new" });
-    expect(h.updated.size()).toBe(0);
+    expect(h.updated.size()).toBe(h.baseline);
     expect(h.committed.size()).toBe(1); // The controller's document-generation listener remains.
   });
 
@@ -79,7 +85,7 @@ describe("native browser method completion", () => {
     const failure = expect(result).rejects.toMatchObject({ code: "navigation_timeout", outcomeUnknown: true });
     await vi.advanceTimersByTimeAsync(15_001);
     await failure;
-    expect(h.updated.size()).toBe(0);
+    expect(h.updated.size()).toBe(h.baseline);
   });
 
   it("uses the renderer's exact prior history entry only after a native history-boundary error", async () => {

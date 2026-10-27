@@ -264,6 +264,19 @@ export class BrowserController {
     }
   }
 
+  /* Adopted tabs bring their group with them: the session continues in the group the work
+     already lives in rather than pulling the tabs into a new one (ADR-0025). */
+  async adoptGroup(group: GroupDescriptor, tabIds: number[]): Promise<void> {
+    if (this.groupIds.has(group.key)) {
+      for (const tabId of tabIds) await this.ensureTabGroup(group, tabId);
+      return;
+    }
+    const tabs = await Promise.all(tabIds.map((tabId) => chrome.tabs.get(tabId).catch(() => undefined)));
+    const groupId = tabs.find((tab) => tab && tab.groupId !== undefined && tab.groupId >= 0)?.groupId;
+    if (groupId !== undefined) this.groupIds.set(group.key, groupId);
+    for (const tabId of tabIds) await this.ensureTabGroup(group, tabId);
+  }
+
   /* A rename before any tab exists has no group to update yet; the label is already stored on
      the session, so the group picks it up when it is created. */
   async renameGroup(group: GroupDescriptor): Promise<void> {

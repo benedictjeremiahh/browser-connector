@@ -1,4 +1,5 @@
 import { BrowserController, connectorError, normalizeError } from "./browser";
+import { adoptableTabs, type AgentTabRecords } from "./adoption";
 import { groupColor, sessionGroupLabel } from "./naming";
 import { classifyRequest, exactOrigin, hostPermissionPattern } from "./policy";
 import {
@@ -86,8 +87,9 @@ async function handleNativeRequest(request: NativeRequest, port: chrome.runtime.
       color: groupColor(session.leaseHostId)
     };
     const result = request.method === "label_session"
-      ? await labelSession(request, session)
+      ? await labelSession(request, session, controlled)
       : await browser.dispatch(request.method, request.params, controlled, group);
+    if (request.method === "tabs_create") await recordAgentTab(result, session);
     await saveControlledTabs(request.sessionId, controlled);
     response = { kind: "response", id: request.id, result };
     await audit(request, risk, origin, "succeeded");
@@ -332,6 +334,11 @@ async function releaseAllSessions(message: string): Promise<void> {
 }
 
 async function removeControlledTab(tabId: number): Promise<void> {
+  const records = await agentTabRecords();
+  if (records[tabId]) {
+    delete records[tabId];
+    await chrome.storage.session.set({ [AGENT_TABS_KEY]: records });
+  }
   for (const session of (await allSessions()).values()) {
     if (!session.controlledTabIds.includes(tabId)) continue;
     session.controlledTabIds = session.controlledTabIds.filter((id) => id !== tabId);
@@ -389,19 +396,41 @@ const SESSION_PREFIX = "s:";
 
 /* Naming is session metadata, not a browser action, so it does not go through Browser.dispatch
    — but it does go through authorize first, like everything else the native host asks for. */
-async function labelSession(request: NativeRequest, session: SessionState): Promise<unknown> {
+async function labelSession(request: NativeRequest, session: SessionState, controlled: Set<number>): Promise<unknown> {
   const label = typeof request.params.label === "string" ? request.params.label.trim().slice(0, 60) : "";
   if (!label) throw connectorError("invalid_arguments", "A label is required");
   session.label = label;
   await saveSessionState(session);
+  const records = await agentTabRecords();
+  for (const tabId of controlled) if (records[tabId]) records[tabId]!.label = label;
+  /* The same work resuming in a new session takes back the tabs it opened (ADR-0025). */
+  const liveControlled = new Set([...(await allSessions()).values()].flatMap((other) => other.sessionId === request.sessionId ? [] : other.controlledTabIds));
+  const openTabs = new Set((await chrome.tabs.query({})).flatMap((tab) => tab.id === undefined ? [] : [tab.id]));
+  const adopted = adoptableTabs(records, session, liveControlled, openTabs).filter((tabId) => !controlled.has(tabId));
+  for (const tabId of adopted) controlled.add(tabId);
+  await chrome.storage.session.set({ [AGENT_TABS_KEY]: records });
+  const group = { key: request.sessionId, label: sessionGroupLabel(session), color: groupColor(session.leaseHostId) };
+  if (adopted.length) await browser.adoptGroup(group, adopted);
   /* The stored label is what the agent said; the title is that label wearing the
      session's mark, which is why the title is recomputed here rather than reused. */
-  await browser.renameGroup({
-    key: request.sessionId,
-    label: sessionGroupLabel(session),
-    color: groupColor(session.leaseHostId)
-  });
-  return { labelled: label };
+  await browser.renameGroup(group);
+  return adopted.length ? { labelled: label, adoptedTabIds: adopted } : { labelled: label };
+}
+
+const AGENT_TABS_KEY = "agentTabs";
+
+async function agentTabRecords(): Promise<AgentTabRecords> {
+  const stored = (await chrome.storage.session.get(AGENT_TABS_KEY))[AGENT_TABS_KEY];
+  return isRecord(stored) ? stored as AgentTabRecords : {};
+}
+
+/* Only a tab the agent itself opened is recorded, so adoption can never reach a tab the person
+   opened or handed over through the panel. */
+async function recordAgentTab(result: unknown, session: SessionState): Promise<void> {
+  if (!isRecord(result) || result.reused !== false || typeof result.tabId !== "number" || !session.leaseHostId) return;
+  const records = await agentTabRecords();
+  records[result.tabId] = { hostId: session.leaseHostId, ...(session.label ? { label: session.label } : {}) };
+  await chrome.storage.session.set({ [AGENT_TABS_KEY]: records });
 }
 
 function normalizeSession(value: unknown, sessionId: string): SessionState {
