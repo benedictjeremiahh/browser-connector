@@ -3,7 +3,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -24,6 +24,10 @@ use crate::config::{ConnectorConfig, broker_socket_path};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// A host that knows what the work is called (a task runner, for example) can name the session
+/// before the agent opens any tab, so the session joins that work's tab group instead of opening
+/// a new one when the agent forgets to call label_session first.
+pub const SESSION_LABEL_ENV: &str = "BROWSER_CONNECTOR_SESSION_LABEL";
 
 #[derive(Clone)]
 pub struct BrowserRelay {
@@ -37,6 +41,8 @@ struct RelayInner {
     session_id: String,
     host_id: String,
     pairing_secret: String,
+    default_label: Option<String>,
+    labelled: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -59,10 +65,23 @@ struct BrokerHandshake {
 
 impl BrowserRelay {
     pub async fn start(config: ConnectorConfig) -> Result<Self> {
-        Self::start_at(config, broker_socket_path()?).await
+        let label = std::env::var(SESSION_LABEL_ENV).ok();
+        Self::start_labelled(config, broker_socket_path()?, label).await
     }
 
+    #[cfg(test)]
     async fn start_at(config: ConnectorConfig, socket_path: PathBuf) -> Result<Self> {
+        Self::start_labelled(config, socket_path, None).await
+    }
+
+    async fn start_labelled(
+        config: ConnectorConfig,
+        socket_path: PathBuf,
+        label: Option<String>,
+    ) -> Result<Self> {
+        let default_label = label
+            .map(|label| label.trim().chars().take(60).collect::<String>())
+            .filter(|label| !label.is_empty());
         Ok(Self {
             inner: Arc::new(RelayInner {
                 connection: Mutex::new(None),
@@ -71,11 +90,29 @@ impl BrowserRelay {
                 session_id: Uuid::new_v4().to_string(),
                 host_id: config.host_id,
                 pairing_secret: config.pairing_secret,
+                default_label,
+                labelled: AtomicBool::new(false),
             }),
         })
     }
 
     pub async fn call(&self, method: &str, params: Value) -> Result<Value> {
+        if method == "label_session" {
+            self.inner.labelled.store(true, Ordering::Release);
+        } else if let Some(label) = &self.inner.default_label
+            && !self.inner.labelled.swap(true, Ordering::AcqRel)
+            && self
+                .send("label_session", json!({ "label": label }))
+                .await
+                .is_err()
+        {
+            // Naming is best effort; the agent's own request still runs, and the next one retries.
+            self.inner.labelled.store(false, Ordering::Release);
+        }
+        self.send(method, params).await
+    }
+
+    async fn send(&self, method: &str, params: Value) -> Result<Value> {
         let id = self.inner.next_request_id.fetch_add(1, Ordering::Relaxed);
         let request = json!({
             "kind": "request",
@@ -288,6 +325,65 @@ mod tests {
         .unwrap();
         assert_eq!(second, json!({"tabs":[]}));
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_host_supplied_label_names_the_session_before_its_first_browser_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket_path = temp.path().join("native.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let relay = BrowserRelay::start_labelled(
+            test_config(),
+            socket_path,
+            Some("  Runner · Delivery note · 1a2b  ".to_owned()),
+        )
+        .await
+        .unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufStream::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).await.unwrap();
+            stream
+                .write_all(b"{\"kind\":\"mcp_connected\"}\n")
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            let mut methods = Vec::new();
+            for _ in 0..3 {
+                line.clear();
+                stream.read_line(&mut line).await.unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                methods.push((request["method"].clone(), request["params"].clone()));
+                let reply = json!({"kind":"response","id":request["id"],"result":{}});
+                stream
+                    .write_all(format!("{reply}\n").as_bytes())
+                    .await
+                    .unwrap();
+                stream.flush().await.unwrap();
+            }
+            methods
+        });
+
+        relay
+            .call("tabs_create", json!({"url": "http://localhost:5180/"}))
+            .await
+            .unwrap();
+        relay.call("tabs_context", json!({})).await.unwrap();
+        let methods = server.await.unwrap();
+        assert_eq!(
+            methods[0],
+            (
+                json!("label_session"),
+                json!({"label": "Runner · Delivery note · 1a2b"})
+            )
+        );
+        assert_eq!(methods[1].0, json!("tabs_create"));
+        assert_eq!(
+            methods[2].0,
+            json!("tabs_context"),
+            "the session is named only once"
+        );
     }
 
     #[tokio::test]
