@@ -158,18 +158,30 @@ async fn serve_client(
     pending: PendingMap,
     next_broker_id: Arc<AtomicU64>,
 ) -> Result<()> {
+    let mut connected: Option<ClientHandshake> = None;
     let result = serve_client_inner(
         client_id,
         stream,
-        browser_tx,
+        browser_tx.clone(),
         pending.clone(),
         next_broker_id,
+        &mut connected,
     )
     .await;
     pending
         .lock()
         .await
         .retain(|_, response| response.client_id != client_id);
+    // The extension cannot see an MCP client go away; without this its session stays "live"
+    // forever and the next session with the same label cannot take back its tabs.
+    if let Some(handshake) = connected {
+        let ended = serde_json::json!({
+            "kind": "session_ended",
+            "sessionId": handshake.session_id,
+            "hostId": handshake.host_id,
+        });
+        let _ = browser_tx.send(serde_json::to_vec(&ended)?).await;
+    }
     result
 }
 
@@ -179,6 +191,7 @@ async fn serve_client_inner(
     browser_tx: mpsc::Sender<Vec<u8>>,
     pending: PendingMap,
     next_broker_id: Arc<AtomicU64>,
+    connected: &mut Option<ClientHandshake>,
 ) -> Result<()> {
     let mut stream = BufStream::new(stream);
     let mut line = String::new();
@@ -197,6 +210,7 @@ async fn serve_client_inner(
     }
     stream.write_all(b"{\"kind\":\"mcp_connected\"}\n").await?;
     stream.flush().await?;
+    *connected = Some(handshake);
 
     let (responses, mut response_rx) = mpsc::channel::<Value>(CLIENT_QUEUE_SIZE);
     loop {
@@ -303,6 +317,43 @@ mod tests {
         let mut input = bytes.as_slice();
         let decoded = read_native_message(&mut input).await.unwrap();
         assert_eq!(decoded, br#"{"ok":true}"#);
+    }
+
+    #[tokio::test]
+    async fn tells_the_extension_when_an_mcp_session_disconnects() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket_path = temp.path().join("native.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let (_extension_to_host, host_input) = tokio::io::duplex(64 * 1024);
+        let (host_output, mut host_to_extension) = tokio::io::duplex(64 * 1024);
+        let broker =
+            tokio::spawn(async move { serve_native_io(listener, host_input, host_output).await });
+
+        {
+            let stream = UnixStream::connect(&socket_path).await.unwrap();
+            let mut stream = BufStream::new(stream);
+            let handshake = json!({"kind": "mcp_connect", "session_id": "ending-session", "host_id": "opencode"});
+            stream
+                .write_all(format!("{handshake}\n").as_bytes())
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            let mut ack = String::new();
+            stream.read_line(&mut ack).await.unwrap();
+        }
+
+        let message = timeout(
+            Duration::from_secs(5),
+            read_native_message(&mut host_to_extension),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&message).unwrap(),
+            json!({"kind": "session_ended", "sessionId": "ending-session", "hostId": "opencode"})
+        );
+        broker.abort();
     }
 
     #[tokio::test]

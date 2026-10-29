@@ -1,6 +1,7 @@
 import { BrowserController, connectorError, normalizeError } from "./browser";
 import { adoptableTabs, type AgentTabRecords } from "./adoption";
 import { groupColor, sessionGroupLabel } from "./naming";
+import { SessionEndings, isSessionEnded } from "./session-endings";
 import { classifyRequest, exactOrigin, hostPermissionPattern } from "./policy";
 import {
   DEFAULT_STATE,
@@ -46,6 +47,7 @@ async function connectNative(): Promise<void> {
     nativeConnected = true;
     port.onMessage.addListener((message: unknown) => {
       if (isNativeRequest(message)) void handleNativeRequest(message, port);
+      else if (isSessionEnded(message)) sessionEndings.ended(message.sessionId);
     });
     port.onDisconnect.addListener(() => {
       const disconnectMessage = chrome.runtime.lastError?.message;
@@ -71,7 +73,17 @@ function scheduleReconnect(): void {
   reconnectTimer = setTimeout(() => void connectNative(), 2_000);
 }
 
+const sessionEndings = new SessionEndings(async (sessionId) => {
+  const session = (await allSessions()).get(sessionId);
+  if (!session) return;
+  /* An ordinary end is not a revoked lease, so unlike releaseSession it records no denial. */
+  await chrome.storage.session.remove(SESSION_PREFIX + sessionId);
+  await browser.detachTabs(session.controlledTabIds);
+  await broadcastState();
+});
+
 async function handleNativeRequest(request: NativeRequest, port: chrome.runtime.Port): Promise<void> {
+  sessionEndings.resumed(request.sessionId);
   let response: NativeResponse;
   let risk: Risk = "routine";
   let origin: string | undefined;
