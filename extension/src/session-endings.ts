@@ -10,8 +10,10 @@ export class SessionEndings {
   constructor(
     private readonly release: (sessionId: string) => Promise<void>,
     private readonly graceMs = 5_000,
-    private readonly schedule: (callback: () => void, ms: number) => ReturnType<typeof setTimeout> = setTimeout,
-    private readonly cancel: (timer: ReturnType<typeof setTimeout>) => void = clearTimeout
+    /* Wrapped, never stored bare: called as this.schedule, Chrome's setTimeout receives this object
+       as its receiver and throws "Illegal invocation", which silently broke every release. */
+    private readonly schedule: (callback: () => void, ms: number) => ReturnType<typeof setTimeout> = (callback, ms) => setTimeout(callback, ms),
+    private readonly cancel: (timer: ReturnType<typeof setTimeout>) => void = timer => clearTimeout(timer)
   ) {}
 
   ended(sessionId: string): void {

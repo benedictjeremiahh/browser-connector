@@ -34,3 +34,20 @@ describe("SessionEndings", () => {
     expect(isSessionEnded(null)).toBe(false);
   });
 });
+
+describe("default timers", () => {
+  it("calls the browser's timers with their own receiver, as Chrome requires", async () => {
+    const realSetTimeout = globalThis.setTimeout;
+    const strict = function (this: unknown, callback: () => void, ms: number) {
+      if (this !== undefined && this !== globalThis) throw new TypeError("Illegal invocation");
+      return realSetTimeout(callback, ms);
+    };
+    vi.stubGlobal("setTimeout", strict);
+    const released: string[] = [];
+    const endings = new SessionEndings(async id => { released.push(id); }, 1);
+    expect(() => endings.ended("s1")).not.toThrow();
+    await new Promise(resolve => realSetTimeout(resolve, 20));
+    expect(released).toEqual(["s1"]);
+    vi.unstubAllGlobals();
+  });
+});
