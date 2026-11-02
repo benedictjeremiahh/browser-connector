@@ -7,13 +7,14 @@ into. It is a Manifest V3 Chrome extension plus a Rust MCP server that speaks ST
 any agent host that can launch a local MCP server can use it — Codex, Claude, or your own.
 Nothing leaves the machine and no account exists.
 
-**This is a development tool, and it auto-approves.** Any connected agent host can read
-and act on any site the browser can reach, without a prompt, including wherever you are
-signed in. That is the point — it removes the approval friction from a build–test–debug
-loop — but it is a real posture, not a no-op, and it is recorded in
-[ADR-0022](docs/adr/0022-auto-approve-for-a-local-development-tool.md), which supersedes
-the stricter decisions this project started with (ADR-0003, ADR-0011). The Connector Panel
-still records every call in an audit log; it is a status view, not a consent surface.
+**This is a development tool, and it asks only where it matters.** Pages served from this
+machine (`localhost`, `127.0.0.1`, `[::1]`, `*.localhost`, `*.test`) need no approval. Any other
+site waits for you in the Connector Panel, once, for the session, or always, and every
+`javascript_tool`, `upload_file` and `download_file` call is approved on its own.
+[ADR-0029](docs/adr/0029-ask-before-unlisted-sites-scripts-and-file-transfer.md) records this
+floor, which narrows the auto-approve posture of
+[ADR-0022](docs/adr/0022-auto-approve-for-a-local-development-tool.md). The panel records every
+call in an audit log.
 
 ## How it works
 
@@ -81,10 +82,10 @@ session.
 | `find` | Elements by visible text or semantics, as refs. |
 | `assert` | Check several expectations in one call (text shown or gone, URL, title, an element's state or value, a count) and get pass or fail for each, without a screenshot. |
 | `form_input` | Set a form control's value. Password fields are never read back. |
-| `javascript_tool` | Run JavaScript in the page. The extension auto-approves calls in this build and records them in its audit log; an Agent Host may apply its own policy gate. |
+| `javascript_tool` | Run JavaScript in the page. Each call waits for approval in the Connector Panel, which shows its full source; an Agent Host may apply its own policy gate too. |
 | `read_console_messages` / `read_network_requests` | Bounded, filterable console and network records. |
 | `computer` | Visible mouse, keyboard, scroll, drag, wait, and **screenshot**, with a zoom crop. |
-| `upload_file` / `download_file` | Send host-provided bytes to a file input / fetch bounded response bytes through a tab. The extension auto-approves calls in this build and records them in its audit log. |
+| `upload_file` / `download_file` | Send host-provided bytes to a file input / fetch bounded response bytes through a tab. Each call waits for approval in the Connector Panel. |
 | `browser_batch` | Sequential, non-atomic, fail-fast batch of the above. JavaScript is excluded. |
 | `resize_window` | Resize the window holding a controlled tab. |
 

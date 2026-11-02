@@ -19,6 +19,11 @@
     </header>
 
     <main>
+      <section id="approvals-section" hidden>
+        <h2>Waiting for you</h2>
+        <ol id="approvals" class="approvals"></ol>
+      </section>
+
       <section>
         <h2>Control</h2>
         <dl class="facts">
@@ -30,6 +35,12 @@
           <button id="control-current">Control current tab</button>
           <button id="revoke-lease" class="secondary">Revoke lease</button>
         </div>
+      </section>
+
+      <section>
+        <h2>Allowed sites</h2>
+        <p class="note">Local development pages (localhost, 127.0.0.1, *.localhost, *.test) are always allowed.</p>
+        <ul id="allowed-sites" class="sites"></ul>
       </section>
 
       <section>

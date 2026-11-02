@@ -1,5 +1,7 @@
 # Auto-approve, for a local development tool
 
+Narrowed by ADR-0029: unlisted sites, scripts and file transfer ask again.
+
 Supersedes the approval requirements of ADR-0003, ADR-0005, ADR-0006, ADR-0010,
 ADR-0011, ADR-0012 and ADR-0015, 2026-09-17.
 

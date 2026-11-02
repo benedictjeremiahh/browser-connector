@@ -2,7 +2,7 @@ import { BrowserController, connectorError, normalizeError, type GroupDescriptor
 import { RELEASED_TAB_TTL_MS, adoptableTabs, releasedTabsToClose, reusableReleasedTab, type AgentTabRecords } from "./adoption";
 import { groupColor, sessionGroupLabel } from "./naming";
 import { SessionEndings, isSessionEnded } from "./session-endings";
-import { classifyRequest, exactOrigin, hostPermissionPattern, redactUrl, sameNavigationTarget } from "./policy";
+import { classifyRequest, exactOrigin, hostPermissionPattern, isLocalDevelopmentOrigin, methodsNeedingApproval, redactUrl, sameNavigationTarget } from "./policy";
 import {
   DEFAULT_STATE,
   type ApprovalRequest,
@@ -16,6 +16,9 @@ import {
 } from "./types";
 
 const NATIVE_HOST = "io.browser_connector.native";
+/* Below the relay's 60 second request timeout, so an unanswered approval reaches the agent as a denial
+   rather than as an outcome it cannot know. */
+const APPROVAL_TIMEOUT_MS = 50_000;
 const AUDIT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const browser = new BrowserController();
 const approvals = new Map<string, { request: ApprovalRequest; resolve: (decision: GrantDecision) => void }>();
@@ -27,7 +30,25 @@ let leaseReleaseTimer: ReturnType<typeof setTimeout> | undefined;
 chrome.runtime.onInstalled.addListener(() => {
   void chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
   void pruneAudit();
+  void dropAutoApprovedSiteGrants();
 });
+
+/* The auto-approve build stored an "always" grant for every origin it touched, so those grants
+   record where agents went, not what a person allowed. They are cleared once, when this build is
+   first installed. */
+const SITE_GRANT_FLOOR_KEY = "siteGrantFloor";
+async function dropAutoApprovedSiteGrants(): Promise<void> {
+  const stored = await chrome.storage.local.get(SITE_GRANT_FLOOR_KEY);
+  if (stored[SITE_GRANT_FLOOR_KEY] === 1) return;
+  const state = await persistedState();
+  state.alwaysSiteGrants = [];
+  await savePersistedState(state);
+  for (const session of (await allSessions()).values()) {
+    session.sessionSiteGrants = [];
+    await saveSessionState(session);
+  }
+  await chrome.storage.local.set({ [SITE_GRANT_FLOOR_KEY]: 1 });
+}
 
 chrome.runtime.onStartup.addListener(() => void connectNative());
 /* Released agent tabs are swept on a timer the browser keeps, since the worker itself may sleep. */
@@ -168,16 +189,17 @@ async function authorize(request: NativeRequest): Promise<{ risk: Risk; origin?:
       "Critical Actions cannot be batched; request each one separately so it receives its own consequence warning"
     );
   }
-  const mustApproveAction = classification.risk === "protected"
-    || classification.risk === "critical";
-  if (mustApproveAction) {
+  /* Protected and Critical classifications are recorded, not gated; only code execution and file
+     transfer wait for a person (ADR-0029). */
+  const gated = methodsNeedingApproval(request.method, request.params);
+  if (gated.length) {
     const decision = await askApproval({
       kind: "action",
       risk: classification.risk,
       hostId: request.hostId,
       method: request.method,
       origin: origins[0],
-      title: actionTitle(request.method, classification.risk),
+      title: actionTitle(gated[0]!, classification.risk),
       detail: classification.reason,
       preview: actionPreview(request, targetDescription, origins),
       allowPersistentGrant: false,
@@ -194,6 +216,7 @@ async function ensureSiteGrant(
   state: PersistedState,
   session: SessionState
 ): Promise<void> {
+  if (isLocalDevelopmentOrigin(origin)) return;
   const hasGrant = state.alwaysSiteGrants.includes(origin) || session.sessionSiteGrants.includes(origin);
   const hasChromePermission = await chrome.permissions.contains({ origins: [hostPermissionPattern(origin)] });
   if (hasGrant && hasChromePermission) return;
@@ -274,16 +297,29 @@ async function requestOrigins(method: string, params: Record<string, unknown>): 
   return [...origins];
 }
 
-// Auto-approval build: host pairing, site grants and action approval all
-// resolve without the side panel, so a connected Agent Host needs no user
-// action. The panel becomes a status and audit view.
-//
-// This deliberately removes the Control Lease / Site Grant / Protected Action
-// gate. Chrome host permissions are declared statically in the manifest, so the
-// per-origin prompt is gone too. "always" persists site grants so the decision
-// is not re-evaluated per request.
-async function askApproval(_input: Omit<ApprovalRequest, "id" | "createdAt">): Promise<GrantDecision> {
-  return "always";
+/* Host Pairing still resolves without a person: a paired host can reach nothing until a Site Grant
+   or a local development origin lets it. Site and action approvals wait for the Connector Panel,
+   and an unanswered one is denied (ADR-0029). */
+async function askApproval(input: Omit<ApprovalRequest, "id" | "createdAt">): Promise<GrantDecision> {
+  if (input.kind === "pairing") return "always";
+  const request: ApprovalRequest = { ...input, id: crypto.randomUUID(), createdAt: Date.now() };
+  const decision = await new Promise<GrantDecision>((resolve) => {
+    const timer = setTimeout(() => resolve("deny"), APPROVAL_TIMEOUT_MS);
+    approvals.set(request.id, { request, resolve: (value) => { clearTimeout(timer); resolve(value); } });
+    void showPendingApprovals();
+    void broadcastState();
+  });
+  approvals.delete(request.id);
+  await showPendingApprovals();
+  await broadcastState();
+  return decision;
+}
+
+async function showPendingApprovals(): Promise<void> {
+  try {
+    await chrome.action.setBadgeText({ text: approvals.size ? String(approvals.size) : "" });
+    if (approvals.size) await chrome.action.setBadgeBackgroundColor({ color: "#b3261e" });
+  } catch { /* badge is a hint only */ }
 }
 
 async function handlePanelMessage(message: unknown): Promise<unknown> {
@@ -310,6 +346,13 @@ async function handlePanelMessage(message: unknown): Promise<unknown> {
     session.controlledTabIds = [...new Set([...session.controlledTabIds, tabId])];
     if (origin) session.sessionSiteGrants = [...new Set([...session.sessionSiteGrants, origin])];
     await saveSessionState(session);
+    await broadcastState();
+    return { ok: true };
+  }
+  if (message.type === "revoke_site") {
+    const state = await persistedState();
+    state.alwaysSiteGrants = state.alwaysSiteGrants.filter(origin => origin !== String(message.origin));
+    await savePersistedState(state);
     await broadcastState();
     return { ok: true };
   }
@@ -570,6 +613,7 @@ async function panelState(): Promise<PanelState> {
       tabIds: session.controlledTabIds
     })),
     approvals: [...approvals.values()].map(({ request }) => request),
+    allowedSites: [...state.alwaysSiteGrants].sort(),
     auditEvents: [...state.auditEvents].reverse().slice(0, 50)
   };
 }

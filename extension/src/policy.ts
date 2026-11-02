@@ -106,6 +106,28 @@ export function exactOrigin(value: string): string | undefined {
   }
 }
 
+/* A page served from this machine for development. Agents work on these all day, so they need no
+   site approval; every other origin does, because the browser is signed in to real accounts. */
+export function isLocalDevelopmentOrigin(origin: string): boolean {
+  let host: string;
+  try { host = new URL(origin).hostname.toLowerCase(); } catch { return false; }
+  return host === "localhost" || host === "127.0.0.1" || host === "[::1]"
+    || host.endsWith(".localhost") || host.endsWith(".test");
+}
+
+/* Methods that run code in a page or move a file across the browser boundary. Each call is
+   approved on its own, wherever it runs. */
+export const APPROVAL_METHODS = new Set(["javascript_tool", "upload_file", "download_file"]);
+
+export function methodsNeedingApproval(method: string, params: Record<string, unknown>): string[] {
+  if (method !== "browser_batch") return APPROVAL_METHODS.has(method) ? [method] : [];
+  const actions = Array.isArray(params.actions) ? params.actions : [];
+  return actions.flatMap(action => {
+    const tool = typeof action === "object" && action !== null ? (action as { tool?: unknown }).tool : undefined;
+    return typeof tool === "string" && APPROVAL_METHODS.has(tool) ? [tool] : [];
+  });
+}
+
 export function hostPermissionPattern(origin: string): string {
   return `${origin}/*`;
 }

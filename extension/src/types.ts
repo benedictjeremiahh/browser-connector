@@ -59,6 +59,8 @@ export interface PanelState {
   leases?: { sessionId: string; hostId?: string; tabIds: number[] }[];
   controlledTabIds: number[];
   approvals: ApprovalRequest[];
+  /* Origins with an "always" Site Grant. Local development origins need none and are not listed. */
+  allowedSites?: string[];
   auditEvents: AuditEvent[];
 }
 

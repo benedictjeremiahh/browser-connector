@@ -1,7 +1,25 @@
-import { boundedText, classifyRequest, exactOrigin, isRestrictedUrl, redactUrl } from "../src/policy";
+import { boundedText, classifyRequest, exactOrigin, isLocalDevelopmentOrigin, isRestrictedUrl, methodsNeedingApproval, redactUrl } from "../src/policy";
 import { describe, expect, it } from "vitest";
 
 describe("connector policy", () => {
+  it("allows local development origins without a Site Grant, and nothing that only looks local", () => {
+    for (const origin of ["http://localhost:5180", "http://127.0.0.1:3170", "http://[::1]:8080", "http://app.localhost", "https://shop.test"]) {
+      expect(isLocalDevelopmentOrigin(origin)).toBe(true);
+    }
+    for (const origin of ["https://localhost.example.com", "https://mail.google.com", "http://127.0.0.2", "https://test.dev", "http://example.testing"]) {
+      expect(isLocalDevelopmentOrigin(origin)).toBe(false);
+    }
+  });
+
+  it("asks for each script run and file transfer, including inside a batch", () => {
+    expect(methodsNeedingApproval("javascript_tool", {})).toEqual(["javascript_tool"]);
+    expect(methodsNeedingApproval("download_file", {})).toEqual(["download_file"]);
+    expect(methodsNeedingApproval("computer", { action: "click" })).toEqual([]);
+    expect(methodsNeedingApproval("browser_batch", { actions: [
+      { tool: "find", arguments: {} }, { tool: "upload_file", arguments: {} }
+    ] })).toEqual(["upload_file"]);
+  });
+
   it("classifies Claude-shaped read tools as read-only", () => {
     expect(classifyRequest("read_page", {}).risk).toBe("read_only");
     expect(classifyRequest("read_network_requests", { includeResponseBody: true }).risk).toBe("protected");

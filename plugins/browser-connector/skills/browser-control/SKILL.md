@@ -26,7 +26,7 @@ Use Browser Connector only when the user asks to work in their real local browse
 
 ## Safety and recovery
 
-- The Connector Panel independently enforces Site Grants and Protected/Critical Action approval. Never attempt to bypass or weaken it.
+- The Connector Panel asks the person before a site other than a local development origin, and before every `javascript_tool`, `upload_file` and `download_file` call. An unanswered request is denied after 50 seconds: say what you are waiting for and retry once the person is there. Never attempt to bypass or weaken it.
 - Login, CAPTCHA, passkeys, biometrics, password-manager UI, and browser permission dialogs are user-only steps. Pause and ask the user to complete them.
 - Never request cookies, authorization headers, passwords, or browser-storage secrets.
 - A failed mutation may return `outcome_unknown`. Re-read browser state before deciding what to do and never blindly replay the mutation.
