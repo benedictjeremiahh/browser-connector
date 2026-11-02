@@ -8,6 +8,15 @@ import {
   sameNavigationTarget
 } from "./policy";
 import type { GroupColor } from "./naming";
+import {
+  RUNTIME_MISSING,
+  injectedAssert,
+  injectedInstallRuntime,
+  type PageExpectation,
+  type PageExpectationResult,
+  type RuntimeGlobal
+} from "./page-runtime";
+import { SnapshotStore, diffNodes, type PageNode } from "./snapshots";
 
 interface ConsoleRecord {
   timestamp: number;
@@ -79,6 +88,9 @@ const SETTLE_QUIET_MS = 300;
 const SETTLE_MAX_MS = 2_000;
 const WAIT_DEFAULT_MS = 10_000;
 const WAIT_MAX_MS = 30_000;
+const ASSERT_MAX_MS = 10_000;
+const ASSERT_MAX_EXPECTATIONS = 50;
+const ASSERT_POLL_MS = 200;
 const SCREENSHOT_LONG_EDGE = 1_600;
 const VIEWPORT_PRESETS: Record<string, { width: number; height: number }> = {
   mobile: { width: 390, height: 844 },
@@ -134,6 +146,9 @@ export class BrowserController {
      place the person is already looking, without needing coordinates of its own. */
   private lastPoints = new Map<number, { x: number; y: number }>();
   private markers = new TabMarkers();
+  private snapshots = new SnapshotStore();
+  /* The document generation the in-page runtime was last installed for, per tab. */
+  private runtimeInstalled = new Map<number, number>();
 
   constructor() {
     chrome.webNavigation.onCommitted.addListener(({ tabId, frameId }) => {
@@ -146,6 +161,8 @@ export class BrowserController {
       this.networkRecords.delete(tabId);
       this.lastPoints.delete(tabId);
       this.viewports.delete(tabId);
+      this.snapshots.clear(tabId);
+      this.runtimeInstalled.delete(tabId);
     });
     chrome.debugger.onEvent.addListener((source, method, params) => this.onDebuggerEvent(source.tabId, method, params));
     chrome.debugger.onDetach.addListener((source) => {
@@ -168,12 +185,13 @@ export class BrowserController {
       case "tabs_close": return this.tabsClose(controlledTabIds, asTabId(params.tabId));
       case "navigate": return this.settled(asTabId(params.tabId), params, () => this.navigate(asTabId(params.tabId), asString(params.action), asOptionalString(params.url)));
       case "computer": return SETTLING_ACTIONS.has(String(params.action)) ? this.settled(asTabId(params.tabId), params, () => this.computer(params)) : this.computer(params);
-      case "read_page": return this.readPage(asTabId(params.tabId), params.maxBytes, params.cursor, asOptionalString(params.scopeRef), params.filter === "all" ? "all" : "interactive", params.viewportOnly === true);
+      case "read_page": return this.readPage(asTabId(params.tabId), params.maxBytes, params.cursor, asOptionalString(params.scopeRef), params.filter === "all" ? "all" : "interactive", params.viewportOnly === true, asOptionalString(params.diffFrom));
       case "get_page_text": return this.getPageText(asTabId(params.tabId), params.maxBytes, params.cursor, asOptionalString(params.scopeRef));
       case "find": return this.find(asTabId(params.tabId), asString(params.query), params.limit, params.cursor);
       case "form_input": return this.settled(asTabId(params.tabId), params, () => this.formInput(asTabId(params.tabId), asString(params.pageRef), params.value));
       case "fill_form": return this.settled(asTabId(params.tabId), params, () => this.fillForm(asTabId(params.tabId), params.fields));
       case "wait_for": return this.waitFor(asTabId(params.tabId), params);
+      case "assert": return this.assertExpectations(asTabId(params.tabId), params);
       case "javascript_tool": return this.javascriptTool(asTabId(params.tabId), asString(params.source));
       case "read_console_messages": return this.readConsole(asTabId(params.tabId), params);
       case "read_network_requests": return this.readNetwork(asTabId(params.tabId), params);
@@ -289,6 +307,46 @@ export class BrowserController {
     }
   }
 
+  /* One call, several expectations, a pass or fail for each. Text, element and count checks run in
+     the page; the URL and the title are checked here against the redacted values the agent already
+     sees, so an expectation cannot be used to guess a part of a URL that was redacted. */
+  private async assertExpectations(tabId: number, params: Record<string, unknown>): Promise<unknown> {
+    const expectations = parseExpectations(params.expect);
+    const timeout = params.timeoutMs === undefined || params.timeoutMs === null ? 0 : Math.min(Math.max(0, Math.floor(asNumber(params.timeoutMs))), ASSERT_MAX_MS);
+    const started = Date.now();
+    while (true) {
+      const results = await this.assertOnce(tabId, expectations);
+      const passed = results.every(result => result.passed);
+      if (passed || Date.now() - started >= timeout) {
+        return { passed, failed: results.filter(result => !result.passed).length, results, ...(timeout > 0 ? { waitedMs: Date.now() - started } : {}), untrusted: true };
+      }
+      await sleep(ASSERT_POLL_MS);
+    }
+  }
+
+  private async assertOnce(tabId: number, expectations: ParsedExpectation[]): Promise<Array<PageExpectationResult & { kind: string }>> {
+    const outcomes = new Map<number, PageExpectationResult>();
+    const tab = await chrome.tabs.get(tabId);
+    const subjects = { url_matches: tab.url ? redactUrl(tab.url) : "", title_matches: tab.title ?? "" };
+    for (const expectation of expectations) {
+      if (expectation.kind !== "url_matches" && expectation.kind !== "title_matches") continue;
+      const subject = subjects[expectation.kind];
+      outcomes.set(expectation.index, { index: expectation.index, passed: matchesPattern(subject, expectation.pattern), observed: clipObserved(subject) });
+    }
+    const inPage = expectations.filter((expectation): expectation is PageExpectation & { kind: PageExpectation["kind"] } => expectation.kind !== "url_matches" && expectation.kind !== "title_matches");
+    if (inPage.length) {
+      let found: PageExpectationResult[] | undefined;
+      try {
+        const raw = await this.runInPage(tabId, injectedAssert, [inPage, this.documentGenerations.get(tabId) ?? 1]);
+        if (Array.isArray(raw)) found = raw as PageExpectationResult[];
+      } catch { /* mid-navigation or a page the extension cannot script */ }
+      for (const expectation of inPage) {
+        outcomes.set(expectation.index, found?.find(result => result.index === expectation.index) ?? { index: expectation.index, passed: false, observed: "the page could not be read" });
+      }
+    }
+    return expectations.map(expectation => ({ ...outcomes.get(expectation.index)!, kind: expectation.kind }));
+  }
+
   /* A new tab is a navigation too: a single-page app renders after load, so the tab is reported once it settles. */
   private async tabsCreateSettled(controlledTabIds: Set<number>, params: Record<string, unknown>, group: GroupDescriptor): Promise<unknown> {
     const created = await this.tabsCreate(controlledTabIds, asOptionalString(params.url), group);
@@ -297,13 +355,32 @@ export class BrowserController {
   }
 
   async describePageRef(tabId: number, pageRef: string): Promise<PageRefContext> {
-    const [result] = await chrome.scripting.executeScript({
-      target: { tabId },
-      func: injectedDescribeRef,
-      args: [pageRef, this.documentGenerations.get(tabId) ?? 1]
-    });
-    if (!isPageRefContext(result?.result)) return { description: "" };
-    return result.result;
+    const result = await this.runInPage(tabId, injectedDescribeRef, [pageRef, this.documentGenerations.get(tabId) ?? 1]);
+    if (!isPageRefContext(result)) return { description: "" };
+    return result;
+  }
+
+  /* Runs a function in the page with the shared runtime (shadow roots, iframes, Page References)
+     installed. The runtime is installed once per document; if a page lost it anyway, the function
+     says so and it is installed again. */
+  private async runInPage<Args extends unknown[], Result>(tabId: number, func: (...args: Args) => Result, args: Args): Promise<unknown> {
+    for (let attempt = 0; ; attempt += 1) {
+      const generation = this.documentGenerations.get(tabId) ?? 1;
+      if (this.runtimeInstalled.get(tabId) !== generation) {
+        await chrome.scripting.executeScript({ target: { tabId }, func: injectedInstallRuntime, args: [] });
+        this.runtimeInstalled.set(tabId, generation);
+      }
+      try {
+        const [result] = await chrome.scripting.executeScript({ target: { tabId }, func, args });
+        return result?.result as unknown;
+      } catch (error) {
+        if (attempt === 0 && String((error as Error)?.message ?? error).includes(RUNTIME_MISSING)) {
+          this.runtimeInstalled.delete(tabId);
+          continue;
+        }
+        throw error;
+      }
+    }
   }
 
   /* Releasing one session detaches that session's tabs and leaves every other session's
@@ -311,6 +388,7 @@ export class BrowserController {
   async detachTabs(tabIds: Iterable<number>): Promise<void> {
     const ids = [...tabIds];
     await this.markers.clear(ids).catch(() => undefined);
+    for (const tabId of ids) this.snapshots.clear(tabId);
     await Promise.all(ids.map(async (tabId) => {
       try { await chrome.debugger.detach({ tabId }); } catch { /* already detached */ }
       this.attachedTabs.delete(tabId);
@@ -477,16 +555,11 @@ export class BrowserController {
     return { tabId, url: tab.url ? redactUrl(tab.url) : undefined, title: tab.title };
   }
 
-  private async readPage(tabId: number, requestedMax: unknown, cursor: unknown, scopeRef: string | undefined, filter: "interactive" | "all", viewportOnly: boolean): Promise<unknown> {
+  private async readPage(tabId: number, requestedMax: unknown, cursor: unknown, scopeRef: string | undefined, filter: "interactive" | "all", viewportOnly: boolean, diffFrom?: string): Promise<unknown> {
     const maxBytes = clampLimit(requestedMax, 65_536, 65_536);
     const offset = cursorOffset(cursor);
     const generation = this.documentGenerations.get(tabId) ?? 1;
-    const [result] = await chrome.scripting.executeScript({
-      target: { tabId },
-      func: injectedReadPage,
-      args: [generation, maxBytes, offset, scopeRef ?? null, filter, viewportOnly]
-    });
-    const page = result?.result as unknown;
+    const page = await this.runInPage(tabId, injectedReadPage, [generation, maxBytes, offset, scopeRef ?? null, filter, viewportOnly]);
     if (!isRecord(page)) return { nodes: [], truncated: false, originalBytes: 0 };
     /* Links can carry tokens in their path (/reset/<token>); they go through the same redaction as every URL. */
     const origin = typeof page.url === "string" ? safeOrigin(page.url) : undefined;
@@ -497,14 +570,29 @@ export class BrowserController {
       const redacted = redactUrl(absolute);
       node.href = origin && redacted.startsWith(origin + "/") ? redacted.slice(origin.length) : redacted;
     }
-    return page;
+    if (!Array.isArray(page.nodes) || page.staleScopeRef === true) return page;
+    /* A snapshot is the node list of one read; it can only be diffed against a read shaped the same way. */
+    const nodes = page.nodes as PageNode[];
+    const key = JSON.stringify([filter, viewportOnly, scopeRef ?? null, offset]);
+    const complete = page.truncated !== true;
+    const previous = diffFrom ? this.snapshots.find(tabId, diffFrom) : undefined;
+    page.snapshotId = this.snapshots.record(tabId, { generation, key, complete, nodes });
+    if (!diffFrom) return page;
+    const unavailable = !previous ? "the snapshot is unknown or expired"
+      : previous.generation !== generation ? "the page navigated since that snapshot"
+      : previous.key !== key ? "that snapshot was read with a different filter, scope, viewportOnly or cursor"
+      : !previous.complete || !complete ? "a read was truncated, so missing nodes cannot be told from nodes beyond the cut; narrow it with scopeRef or viewportOnly"
+      : undefined;
+    if (unavailable) return { ...page, diffUnavailable: `${unavailable}; returning the full tree` };
+    const { nodes: _full, returnedBytes: _bytes, ...rest } = page;
+    const { summary, ...changes } = diffNodes(previous!.nodes, nodes);
+    return { ...rest, diffFrom, diff: changes, summary };
   }
 
   private async getPageText(tabId: number, requestedMax: unknown, cursor: unknown, scopeRef?: string): Promise<unknown> {
     const maxBytes = clampLimit(requestedMax, 65_536, 65_536);
     const generation = this.documentGenerations.get(tabId) ?? 1;
-    const [result] = await chrome.scripting.executeScript({ target: { tabId }, func: injectedGetPageText, args: [scopeRef ?? null, generation] });
-    const payload = result?.result;
+    const payload = await this.runInPage(tabId, injectedGetPageText, [scopeRef ?? null, generation]);
     const scoped = scopeRef !== undefined;
     const scopedPayload = isRecord(payload) ? payload : undefined;
     const staleScopeRef = scoped && (!scopedPayload || scopedPayload.staleScopeRef === true || typeof scopedPayload.text !== "string");
@@ -522,12 +610,8 @@ export class BrowserController {
     const limit = clampLimit(requestedLimit, 20, 50);
     const offset = cursorOffset(cursor);
     const generation = this.documentGenerations.get(tabId) ?? 1;
-    const [result] = await chrome.scripting.executeScript({
-      target: { tabId },
-      func: injectedFind,
-      args: [generation, query, limit, offset]
-    });
-    const found = (result?.result as { matches?: unknown[] } | undefined) ?? { matches: [], nextCursor: null };
+    const result = await this.runInPage(tabId, injectedFind, [generation, query, limit, offset]);
+    const found = (result as { matches?: unknown[] } | undefined) ?? { matches: [], nextCursor: null };
     /* An empty result on a page that is still rendering looks the same as a real miss. */
     const empty = !found.matches?.length;
     return { ...found, untrusted: true, ...(empty ? { hint: "No match. If the page may still be rendering, wait_for a text you expect on it and search again; otherwise try another word from the label." } : {}) };
@@ -536,12 +620,7 @@ export class BrowserController {
   /* Writes through the element's native value setter, so frameworks that track the value (React)
      see the change, then reads it back: a value the page rejected is reported, not assumed. */
   private async formInput(tabId: number, pageRef: string, value: unknown): Promise<{ pageRef: string; changed: boolean; matched: boolean; actual?: unknown; untrusted?: boolean }> {
-    const [result] = await chrome.scripting.executeScript({
-      target: { tabId },
-      func: injectedFormInput,
-      args: [pageRef, value, this.documentGenerations.get(tabId) ?? 1]
-    });
-    const outcome = result?.result as unknown;
+    const outcome = await this.runInPage(tabId, injectedFormInput, [pageRef, value, this.documentGenerations.get(tabId) ?? 1]);
     if (outcome === false || outcome === null || outcome === undefined) throw connectorError("stale_page_ref", `Page Reference is stale: ${pageRef}`);
     if (isRecord(outcome) && outcome.unsupported === true) throw connectorError("invalid_arguments", `${pageRef} is not a text input, textarea, select or editable element. A custom select (role combobox) is used by clicking it, then clicking the option found with find; a file input uses upload_file.`);
     if (isRecord(outcome) && typeof outcome.refused === "string") throw connectorError("element_disabled", `${pageRef} is ${outcome.refused}`);
@@ -877,12 +956,8 @@ export class BrowserController {
     const pageRef = asString(params.pageRef);
     const dataBase64 = asString(params.dataBase64);
     if (Math.floor(dataBase64.length * 0.75) > MAX_UPLOAD_BYTES) throw connectorError("file_too_large", "Upload exceeds 10 MiB");
-    const [result] = await chrome.scripting.executeScript({
-      target: { tabId },
-      func: injectedUpload,
-      args: [pageRef, asString(params.name), asString(params.mimeType), dataBase64, this.documentGenerations.get(tabId) ?? 1]
-    });
-    if (!result?.result) throw connectorError("upload_failed", "Target is stale or is not a file input");
+    const uploaded = await this.runInPage(tabId, injectedUpload, [pageRef, asString(params.name), asString(params.mimeType), dataBase64, this.documentGenerations.get(tabId) ?? 1]);
+    if (!uploaded) throw connectorError("upload_failed", "Target is stale or is not a file input");
     return { uploaded: true, name: params.name };
   }
 
@@ -946,8 +1021,7 @@ export class BrowserController {
   /* With hitTest, the point is one where the element itself would receive the click: a point covered
      by an overlay, a hidden element or a disabled control is an error that names the cause. */
   private async pointForRef(tabId: number, pageRef: string, hitTest = false): Promise<{ x: number; y: number }> {
-    const [result] = await chrome.scripting.executeScript({ target: { tabId }, func: injectedRefPoint, args: [pageRef, this.documentGenerations.get(tabId) ?? 1, hitTest] });
-    const point = result?.result as unknown;
+    const point = await this.runInPage(tabId, injectedRefPoint, [pageRef, this.documentGenerations.get(tabId) ?? 1, hitTest]);
     if (!point) throw connectorError("stale_page_ref", `Page Reference is stale: ${pageRef}`);
     if (isRecord(point) && point.blocked === "hidden") throw connectorError("element_not_visible", `${pageRef} has no visible box`);
     if (isRecord(point) && point.blocked === "disabled") throw connectorError("element_disabled", `${pageRef} is disabled`);
@@ -956,8 +1030,7 @@ export class BrowserController {
   }
 
   private async focusRef(tabId: number, pageRef: string): Promise<void> {
-    const [result] = await chrome.scripting.executeScript({ target: { tabId }, func: injectedFocusRef, args: [pageRef, this.documentGenerations.get(tabId) ?? 1] });
-    if (!result?.result) throw connectorError("stale_page_ref", `Page Reference is stale: ${pageRef}`);
+    if (!await this.runInPage(tabId, injectedFocusRef, [pageRef, this.documentGenerations.get(tabId) ?? 1])) throw connectorError("stale_page_ref", `Page Reference is stale: ${pageRef}`);
   }
 
   private onDebuggerEvent(tabId: number | undefined, method: string, params?: object): void {
@@ -1011,22 +1084,10 @@ export class BrowserController {
 }
 
 function injectedReadPage(generation: number, maxBytes: number, offset: number, scopeRef: string | null, filter: "interactive" | "all" = "all", viewportOnly = false): unknown {
-  const global = globalThis as typeof globalThis & {
-    __browserConnectorPageRefState?: { document: Document; generation: number; refs: WeakMap<Element, string>; next: number };
-  };
-  let state = global.__browserConnectorPageRefState;
-  if (!state || state.document !== document || state.generation !== generation) {
-    state = { document, generation, refs: new WeakMap<Element, string>(), next: state?.next ?? 0 };
-    global.__browserConnectorPageRefState = state;
-  }
-  const refFor = (element: HTMLElement): string => {
-    const existing = state!.refs.get(element);
-    if (existing) { element.dataset.browserConnectorRef = existing; return existing; }
-    const ref = `p${generation}-${state!.next++}`;
-    state!.refs.set(element, ref);
-    element.dataset.browserConnectorRef = ref;
-    return ref;
-  };
+  const rt = (globalThis as RuntimeGlobal).__browserConnectorRuntime;
+  if (!rt) throw new Error("browser-connector-runtime-missing");
+  const state = rt.ensureState(generation);
+  const scan = rt.scan();
   /* "interactive" (the default) keeps controls, headings and widget roles and drops prose, so a read
      costs a fraction of the tokens; get_page_text reads the prose. Wrapper roles carry nothing to act on. */
   const selector = filter === "interactive"
@@ -1034,13 +1095,15 @@ function injectedReadPage(generation: number, maxBytes: number, offset: number, 
     : "a,button,input,select,textarea,[role],[contenteditable=true],summary,[tabindex],h1,h2,h3,h4,h5,h6,p,li";
   const wrapperRoles = new Set(["presentation", "none", "generic"]);
   const controlTags = new Set(["a", "button", "input", "select", "textarea", "summary"]);
-  const elements = [...document.querySelectorAll<HTMLElement>(selector)].filter(element => filter !== "interactive" || !wrapperRoles.has(element.getAttribute("role") ?? ""));
+  const matched = scan.query(selector).filter(element => filter !== "interactive" || !wrapperRoles.has(element.getAttribute("role") ?? ""));
+  /* Frames and shadow hosts whose inside cannot be read still appear, as a node that says so. */
+  const listed = new Set<Element>(matched);
+  const elements = [...matched, ...[...scan.opaque.keys()].filter(element => !listed.has(element))] as HTMLElement[];
   /* Cursor positions still use the global traversal, even for scoped reads. Stable
      references come from the shared WeakMap so a find ref resolves in this traversal. */
   let scope: HTMLElement | null = null;
   if (scopeRef !== null) {
-    const scopeCandidates = [...elements, ...document.querySelectorAll<HTMLElement>("*")];
-    scope = scopeCandidates.find(element => state!.refs.get(element) === scopeRef) ?? null;
+    scope = scan.all().find(element => state.refs.get(element) === scopeRef) ?? null;
     if (!scope?.isConnected) {
       return {
         title: document.title,
@@ -1063,17 +1126,20 @@ function injectedReadPage(generation: number, maxBytes: number, offset: number, 
   for (let index = offset; index < elements.length && nodes.length < 500; index += 1) {
     nextIndex = index + 1;
     const element = elements[index]!;
-    if (scope && element !== scope && !scope.contains(element)) continue;
+    if (scope && element !== scope && !rt.within(scope, element)) continue;
     const rect = element.getBoundingClientRect();
     if (rect.width === 0 && rect.height === 0) continue;
-    if (viewportOnly && (rect.bottom < 0 || rect.right < 0 || rect.top > innerHeight || rect.left > innerWidth)) continue;
-    const ref = refFor(element);
-    const input = element instanceof HTMLInputElement ? element : undefined;
+    if (viewportOnly) {
+      /* An element in an iframe is measured in the frame's own viewport; the top one is what is on screen. */
+      const origin = rt.frameOffset(element);
+      if (rect.bottom + origin.y < 0 || rect.right + origin.x < 0 || rect.top + origin.y > innerHeight || rect.left + origin.x > innerWidth) continue;
+    }
+    const ref = rt.refFor(state, element);
+    const input = rt.is(element, "HTMLInputElement") ? element as HTMLInputElement : undefined;
     const tag = element.tagName.toLowerCase();
     /* A control is named by its label; a container is named briefly, or its text repeats every child's. */
     const control = controlTags.has(tag) || /^(button|link|tab|menuitem|option|checkbox|radio|switch|combobox|textbox|searchbox|slider|treeitem)$/.test(element.getAttribute("role") ?? "");
-    const label = (element as HTMLInputElement).labels?.[0]?.innerText;
-    const name = (element.getAttribute("aria-label") || label || element.getAttribute("title") || input?.placeholder || element.innerText || "").trim().replace(/\s+/g, " ").slice(0, control ? 200 : 120);
+    const name = rt.nameOf(element, control ? 200 : 120);
     const node: Record<string, unknown> = {
       ref,
       role: element.getAttribute("role") || tag,
@@ -1083,25 +1149,27 @@ function injectedReadPage(generation: number, maxBytes: number, offset: number, 
     };
     /* State an agent needs to tell whether its last action worked: which tab is selected, what is open. */
     for (const [attribute, key] of [["aria-selected", "selected"], ["aria-expanded", "expanded"], ["aria-pressed", "pressed"], ["aria-checked", "checked"]] as const) {
-      const state = element.getAttribute(attribute);
-      if (state === "true" || state === "false") node[key] = state === "true";
+      const attributeState = element.getAttribute(attribute);
+      if (attributeState === "true" || attributeState === "false") node[key] = attributeState === "true";
     }
     const current = element.getAttribute("aria-current");
     if (current && current !== "false") node.current = current;
     /* validity, not checkValidity(): the latter fires "invalid" events. An empty required field is not yet an error. */
     if (element.getAttribute("aria-invalid") === "true" || (input && input.validity && !input.validity.valid && input.value !== "")) node.invalid = true;
-    if (document.activeElement === element) node.focused = true;
+    if (rt.activeIn(element) === element) node.focused = true;
     if (/^h[1-6]$/.test(tag)) node.level = Number(tag[1]);
     const href = tag === "a" ? (element as HTMLAnchorElement).href : undefined;
     if (href) {
       try { const url = new URL(href); node.href = url.origin === location.origin ? url.pathname : url.origin + url.pathname; } catch { /* not a URL */ }
     }
     for (const key of Object.keys(node)) if (node[key] === undefined) delete node[key];
-    /* Self-contained: this runs in the page, so it cannot import a shared helper. */
-    const sensitive = input && (input.type === "password"
-      || /^(cc-|current-password|new-password|one-time-code)/.test(input.autocomplete)
-      || /pass|secret|token|otp|cvv|cvc|card.?num|api.?key|pin$/i.test(`${input.name} ${input.id}`));
-    if (input) node.value = sensitive ? "[redacted]" : input.value.slice(0, 500);
+    if (input) node.value = rt.sensitive(input) ? "[redacted]" : input.value.slice(0, 500);
+    const opaqueReason = scan.opaque.get(element);
+    if (opaqueReason) {
+      const title = element.getAttribute("title") || element.getAttribute("aria-label");
+      node.opaque = true;
+      node.name = `${tag}${title ? ` "${title.slice(0, 60)}"` : ""} (${opaqueReason})`;
+    }
     const size = new TextEncoder().encode(JSON.stringify(node)).length;
     if (bytes + size > maxBytes) { truncated = true; nextIndex = index; break; }
     nodes.push(node);
@@ -1123,12 +1191,10 @@ function injectedReadPage(generation: number, maxBytes: number, offset: number, 
 
 function injectedGetPageText(scopeRef: string | null, generation: number): { text: string; scopeRef?: string; staleScopeRef?: true } {
   if (scopeRef !== null) {
-    const global = globalThis as typeof globalThis & {
-      __browserConnectorPageRefState?: { document: Document; generation: number; refs: WeakMap<Element, string>; next: number };
-    };
-    const state = global.__browserConnectorPageRefState;
-    if (!state || state.document !== document || state.generation !== generation) return { text: "", scopeRef, staleScopeRef: true };
-    const root = [...document.querySelectorAll<HTMLElement>("*")].find(element => state.refs.get(element) === scopeRef && element.isConnected);
+    const rt = (globalThis as RuntimeGlobal).__browserConnectorRuntime;
+    if (!rt) throw new Error("browser-connector-runtime-missing");
+    const state = rt.currentState(generation);
+    const root = state ? rt.scan().resolve(scopeRef, state) : null;
     if (!root?.isConnected) return { text: "", scopeRef, staleScopeRef: true };
     return { text: root.innerText ?? root.textContent ?? "", scopeRef };
   }
@@ -1138,24 +1204,12 @@ function injectedGetPageText(scopeRef: string | null, generation: number): { tex
 }
 
 function injectedFind(generation: number, query: string, limit: number, offset: number): unknown {
-  const global = globalThis as typeof globalThis & {
-    __browserConnectorPageRefState?: { document: Document; generation: number; refs: WeakMap<Element, string>; next: number };
-  };
-  let state = global.__browserConnectorPageRefState;
-  if (!state || state.document !== document || state.generation !== generation) {
-    state = { document, generation, refs: new WeakMap<Element, string>(), next: state?.next ?? 0 };
-    global.__browserConnectorPageRefState = state;
-  }
-  const refFor = (element: HTMLElement): string => {
-    const existing = state!.refs.get(element);
-    if (existing) { element.dataset.browserConnectorRef = existing; return existing; }
-    const ref = `p${generation}-${state!.next++}`;
-    state!.refs.set(element, ref);
-    element.dataset.browserConnectorRef = ref;
-    return ref;
-  };
+  const rt = (globalThis as RuntimeGlobal).__browserConnectorRuntime;
+  if (!rt) throw new Error("browser-connector-runtime-missing");
+  const state = rt.ensureState(generation);
   const needle = query.toLowerCase();
-  const elements = [...document.querySelectorAll<HTMLElement>("body *")];
+  /* "body *" in the document and in each iframe, "*" inside shadow roots, which have no body. */
+  const elements = rt.scan().query("body *", "*");
   /* Label, title, name, placeholder and text often repeat each other; each distinct one counts once. */
   const ownText = (element: HTMLElement) => [...new Set([element.getAttribute("aria-label"), (element as HTMLInputElement).labels?.[0]?.innerText, element.getAttribute("title"), element.getAttribute("name"), element.getAttribute("placeholder"), element.innerText]
     .map(part => part?.trim()).filter((part): part is string => !!part))].join(" ");
@@ -1168,12 +1222,16 @@ function injectedFind(generation: number, query: string, limit: number, offset: 
     if (hits.length >= 2_000) break;
   }
   /* Every ancestor of a match also contains its text; only the innermost matches name the thing
-     asked for. Controls come first, since they are what an agent acts on. */
+     asked for. Controls come first, since they are what an agent acts on. A host contains what is
+     in its shadow root or its iframe even though contains() does not say so. */
+  const hosts = new Map<HTMLElement, Element[]>();
+  for (const element of hits) { const chain = rt.hostChain(element); if (chain.length) hosts.set(element, chain); }
+  const encloses = (outer: HTMLElement, inner: HTMLElement) => outer.contains(inner) || !!hosts.get(inner)?.some(host => host === outer || outer.contains(host));
   const interactive = (element: HTMLElement) => /^(a|button|input|select|textarea|summary|label)$/i.test(element.tagName) || !!element.getAttribute("role") || element.hasAttribute?.("tabindex");
   /* A button's text sits in a span inside it; the control is what an agent acts on, so a match is
      lifted to its nearest interactive ancestor, and duplicates collapse. */
   const lift = (element: HTMLElement) => (element.closest?.("a,button,input,select,textarea,summary,label,[role],[tabindex]") as HTMLElement | null) ?? element;
-  const innermost = [...new Set(hits.filter(element => !hits.some(other => other !== element && element.contains(other))).map(lift))];
+  const innermost = [...new Set(hits.filter(element => !hits.some(other => other !== element && encloses(element, other))).map(lift))];
   /* Exact names first, then names that start with the query, then any that contain it; within each,
      controls before other elements. "Keluar" should find the menu item, not "Laporan barang keluar". */
   const closeness = (element: HTMLElement) => {
@@ -1185,7 +1243,7 @@ function injectedFind(generation: number, query: string, limit: number, offset: 
     .sort((left, right) => left.rank - right.rank || left.index - right.index).map(entry => entry.element);
   const page = ranked.slice(offset, offset + limit);
   const matches = page.map(element => ({
-    ref: refFor(element),
+    ref: rt.refFor(state, element),
     role: element.getAttribute("role") || element.tagName.toLowerCase(),
     name: ownText(element).trim().replace(/\s+/g, " ").slice(0, 200)
   }));
@@ -1194,12 +1252,11 @@ function injectedFind(generation: number, query: string, limit: number, offset: 
 }
 
 function injectedDescribeRef(pageRef: string, generation: number): { description: string; destinationOrigin?: string } {
-  const global = globalThis as typeof globalThis & {
-    __browserConnectorPageRefState?: { document: Document; generation: number; refs: WeakMap<Element, string>; next: number };
-  };
-  const state = global.__browserConnectorPageRefState;
-  if (!state || state.document !== document || state.generation !== generation) return { description: "" };
-  const element = [...document.querySelectorAll<HTMLElement>("*")].find(candidate => state.refs.get(candidate) === pageRef && candidate.isConnected);
+  const rt = (globalThis as RuntimeGlobal).__browserConnectorRuntime;
+  if (!rt) throw new Error("browser-connector-runtime-missing");
+  const state = rt.currentState(generation);
+  if (!state) return { description: "" };
+  const element = rt.scan().resolve(pageRef, state);
   if (!element) return { description: "" };
   const description = [element.getAttribute("aria-label"), element.getAttribute("title"), element.getAttribute("name"), element.innerText]
     .filter(Boolean)
@@ -1223,64 +1280,86 @@ function injectedDescribeRef(pageRef: string, generation: number): { description
   }
 }
 
+/* The point is in top-level viewport coordinates, which is what the debugger's mouse events take,
+   even when the element sits inside an iframe. */
 async function injectedRefPoint(pageRef: string, generation: number, hitTest = false): Promise<{ x: number; y: number } | { blocked: "hidden" | "disabled" } | { blockedBy: string } | null> {
-  const global = globalThis as typeof globalThis & {
-    __browserConnectorPageRefState?: { document: Document; generation: number; refs: WeakMap<Element, string>; next: number };
-  };
-  const state = global.__browserConnectorPageRefState;
-  if (!state || state.document !== document || state.generation !== generation) return null;
-  const element = [...document.querySelectorAll<HTMLElement>("*")].find(candidate => state.refs.get(candidate) === pageRef && candidate.isConnected);
+  const rt = (globalThis as RuntimeGlobal).__browserConnectorRuntime;
+  if (!rt) throw new Error("browser-connector-runtime-missing");
+  const state = rt.currentState(generation);
+  if (!state) return null;
+  const element = rt.scan().resolve(pageRef, state);
   if (!element) return null;
   /* Instant, then two frames: a smooth scroll or a layout shift would otherwise move the target
      after its centre was measured, and the click would land on whatever slid into that spot. */
   element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" as ScrollBehavior });
   if (typeof requestAnimationFrame === "function") await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
   const rect = element.getBoundingClientRect();
+  const origin = rt.frameOffset(element);
+  const toTop = (point: { x: number; y: number }) => ({ x: point.x + origin.x, y: point.y + origin.y });
   const centre = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
-  if (!hitTest) return centre;
-  if ((rect.width === 0 || rect.height === 0 || getComputedStyle(element).visibility === "hidden") && !(element as HTMLInputElement).labels?.length) return { blocked: "hidden" };
+  if (!hitTest) return toTop(centre);
+  const view = element.ownerDocument?.defaultView ?? globalThis;
+  if ((rect.width === 0 || rect.height === 0 || view.getComputedStyle(element).visibility === "hidden") && !(element as HTMLInputElement).labels?.length) return { blocked: "hidden" };
   if ((element as HTMLButtonElement).disabled === true || element.matches?.(":disabled") || element.getAttribute("aria-disabled") === "true") return { blocked: "disabled" };
   /* A visually hidden checkbox or switch is clicked through its label. */
   const labels = [...((element as HTMLInputElement).labels ?? [])];
-  if (typeof document.elementFromPoint !== "function") return centre;
+  const ownerDocument = element.ownerDocument ?? document;
+  if (typeof ownerDocument.elementFromPoint !== "function") return toTop(centre);
+  /* Inside a shadow root the document reports the host, so the element is asked of its own root
+     as well; inside an iframe, something in the top page can still cover the whole frame. */
+  const rootNode = element.getRootNode?.() as (Partial<Document> & { nodeType?: number }) | undefined;
+  const ownRoot = rootNode?.nodeType === 11 && typeof rootNode.elementFromPoint === "function" ? rootNode : undefined;
+  const hosts = rt.hostChain(element);
+  const frames = hosts.filter(host => /^i?frame$/i.test(String(host.tagName)));
   /* The centre first; a wide wrapper's centre can be a gap, so a few inner points next. */
   const insetX = Math.min(12, rect.width / 4); const insetY = Math.min(8, rect.height / 4);
   const points = [centre, { x: rect.left + insetX, y: centre.y }, { x: rect.right - insetX, y: centre.y }, { x: centre.x, y: rect.top + insetY }, { x: centre.x, y: rect.bottom - insetY }];
   let blocker: Element | null = null;
   for (const point of points) {
-    const hit = document.elementFromPoint(point.x, point.y);
-    if (hit && (hit === element || element.contains(hit) || labels.some(label => label === hit || label.contains(hit)))) return point;
+    let hit = ownRoot ? ownRoot.elementFromPoint!(point.x, point.y) : ownerDocument.elementFromPoint(point.x, point.y);
+    if (ownRoot && !hit) {
+      /* The shadow root only reports its own tree; whatever else is on top is a cover unless it is the host. */
+      const onTop = ownerDocument.elementFromPoint(point.x, point.y);
+      if (onTop && !hosts.includes(onTop)) hit = onTop;
+    }
+    const reachesElement = hit && (hit === element || element.contains(hit) || labels.some(label => label === hit || label.contains(hit)));
+    if (reachesElement) {
+      const top = toTop(point);
+      const outer = frames.length ? document.elementFromPoint(top.x, top.y) : null;
+      if (!frames.length || !outer || hosts.includes(outer) || frames[frames.length - 1]!.contains(outer)) return top;
+      blocker ??= outer;
+      continue;
+    }
     blocker ??= hit;
   }
-  if (!blocker) return centre;
+  if (!blocker) return toTop(centre);
   const describe = (node: Element) => `${node.getAttribute("role") || node.tagName.toLowerCase()} "${((node as HTMLElement).innerText || node.getAttribute("aria-label") || "").trim().replace(/\s+/g, " ").slice(0, 60)}"`;
   const covering = blocker.closest("[role=dialog],[role=alertdialog],[role=alert],[role=status],dialog,header,nav") ?? blocker;
   return { blockedBy: describe(covering) };
 }
 
 function injectedFocusRef(pageRef: string, generation: number): boolean {
-  const global = globalThis as typeof globalThis & {
-    __browserConnectorPageRefState?: { document: Document; generation: number; refs: WeakMap<Element, string>; next: number };
-  };
-  const state = global.__browserConnectorPageRefState;
-  if (!state || state.document !== document || state.generation !== generation) return false;
-  const element = [...document.querySelectorAll<HTMLElement>("*")].find(candidate => state.refs.get(candidate) === pageRef && candidate.isConnected);
+  const rt = (globalThis as RuntimeGlobal).__browserConnectorRuntime;
+  if (!rt) throw new Error("browser-connector-runtime-missing");
+  const state = rt.currentState(generation);
+  const element = state ? rt.scan().resolve(pageRef, state) : null;
   if (!element) return false;
   element.focus();
-  return document.activeElement === element;
+  return rt.activeIn(element) === element;
 }
 
 function injectedFormInput(pageRef: string, value: unknown, generation: number): false | { unsupported: true } | { refused: string } | { missingOption: true; options: string } | { matched: boolean; actual: unknown; unverified?: string } {
-  const global = globalThis as typeof globalThis & {
-    __browserConnectorPageRefState?: { document: Document; generation: number; refs: WeakMap<Element, string>; next: number };
-  };
-  const state = global.__browserConnectorPageRefState;
-  if (!state || state.document !== document || state.generation !== generation) return false;
-  const element = [...document.querySelectorAll<HTMLElement>("*")].find(candidate => state.refs.get(candidate) === pageRef && candidate.isConnected);
+  const rt = (globalThis as RuntimeGlobal).__browserConnectorRuntime;
+  if (!rt) throw new Error("browser-connector-runtime-missing");
+  const state = rt.currentState(generation);
+  const element = state ? rt.scan().resolve(pageRef, state) : null;
   if (!element) return false;
+  /* An element in an iframe is dispatched events built by its own window, and tested against its own classes. */
+  const view = (element.ownerDocument?.defaultView ?? globalThis) as typeof globalThis;
   const fire = () => {
-    element.dispatchEvent(new Event("input", { bubbles: true }));
-    element.dispatchEvent(new Event("change", { bubbles: true }));
+    const EventClass = view.Event ?? Event;
+    element.dispatchEvent(new EventClass("input", { bubbles: true }));
+    element.dispatchEvent(new EventClass("change", { bubbles: true }));
   };
   /* Frameworks such as React keep their own copy of a field's value and ignore an assignment to
      element.value; the prototype's setter is what a person's typing goes through. */
@@ -1290,42 +1369,43 @@ function injectedFormInput(pageRef: string, value: unknown, generation: number):
     while (prototype && !setter) { setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set; prototype = Object.getPrototypeOf(prototype); }
     if (setter) setter.call(target, next); else target.value = next;
   };
-  const sensitive = (target: HTMLInputElement) => target.type === "password"
-    || /^(cc-|current-password|new-password|one-time-code)/.test(target.autocomplete ?? "")
-    || /pass|secret|token|otp|cvv|cvc|card.?num|api.?key|pin$/i.test(`${target.name} ${target.id}`);
   if ((element as HTMLInputElement).disabled || element.matches?.(":disabled")) return { refused: "disabled" };
   if ((element as HTMLInputElement).readOnly) return { refused: "read-only" };
-  if (element instanceof HTMLInputElement && element.type === "file") return { unsupported: true };
+  const isInput = rt.is(element, "HTMLInputElement");
+  if (isInput && (element as HTMLInputElement).type === "file") return { unsupported: true };
   /* Focus first and blur after, as typing would: some forms validate on blur. */
   element.focus?.();
-  if (element instanceof HTMLInputElement && (element.type === "checkbox" || element.type === "radio")) {
+  if (isInput && ((element as HTMLInputElement).type === "checkbox" || (element as HTMLInputElement).type === "radio")) {
+    const checkbox = element as HTMLInputElement;
     const wanted = Boolean(value);
     /* A click, not an assignment: it is the event a framework listens to, and it toggles exactly once. */
-    if (element.checked !== wanted) element.click();
-    return { matched: element.checked === wanted, actual: element.checked };
+    if (checkbox.checked !== wanted) checkbox.click();
+    return { matched: checkbox.checked === wanted, actual: checkbox.checked };
   }
-  if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
+  if (isInput || rt.is(element, "HTMLTextAreaElement")) {
+    const field = element as HTMLInputElement | HTMLTextAreaElement;
     const next = String(value ?? "");
-    setNative(element, next);
+    setNative(field, next);
     fire();
-    element.blur?.();
-    const hidden = element instanceof HTMLInputElement && sensitive(element);
-    return { matched: element.value === next, actual: hidden ? "[redacted]" : element.value.slice(0, 500) };
+    field.blur?.();
+    const hidden = isInput && rt.sensitive(field as HTMLInputElement);
+    return { matched: field.value === next, actual: hidden ? "[redacted]" : field.value.slice(0, 500) };
   }
-  if (element instanceof HTMLSelectElement) {
+  if (rt.is(element, "HTMLSelectElement")) {
+    const select = element as HTMLSelectElement;
     const wanted = (Array.isArray(value) ? value : [value]).map(item => String(item ?? "").trim().toLowerCase());
-    const options = [...element.options];
+    const options = [...select.options];
     const picks = wanted.map(item => options.find(option => option.value.toLowerCase() === item) ?? options.find(option => option.text.trim().toLowerCase() === item));
     if (picks.some(pick => !pick)) return { missingOption: true, options: options.slice(0, 30).map(option => option.text.trim()).join(" | ") };
     for (const option of options) option.selected = picks.includes(option);
-    if (!element.multiple && picks[0]) element.value = picks[0].value;
+    if (!select.multiple && picks[0]) select.value = picks[0].value;
     fire();
-    const actual = [...element.selectedOptions].map(option => option.text.trim());
-    return { matched: picks.every(pick => pick!.selected), actual: element.multiple ? actual : actual[0] };
+    const actual = [...select.selectedOptions].map(option => option.text.trim());
+    return { matched: picks.every(pick => pick!.selected), actual: select.multiple ? actual : actual[0] };
   }
   if (element.isContentEditable) {
     element.textContent = String(value ?? "");
-    element.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    element.dispatchEvent(new (view.InputEvent ?? InputEvent)("input", { bubbles: true }));
     /* Rich editors (Slate, Lexical, Draft) keep their own model and may ignore this; say so. */
     return { matched: element.textContent === String(value ?? ""), actual: (element.textContent ?? "").slice(0, 500), unverified: "A rich-text editor may ignore a direct write; check the page or use computer type." };
   }
@@ -1386,12 +1466,10 @@ function injectedWaitCheck(text: string | null, textGone: string | null, selecto
 }
 
 function injectedUpload(pageRef: string, name: string, mimeType: string, dataBase64: string, generation: number): boolean {
-  const global = globalThis as typeof globalThis & {
-    __browserConnectorPageRefState?: { document: Document; generation: number; refs: WeakMap<Element, string>; next: number };
-  };
-  const state = global.__browserConnectorPageRefState;
-  if (!state || state.document !== document || state.generation !== generation) return false;
-  const input = [...document.querySelectorAll<HTMLInputElement>("*")].find(candidate => state.refs.get(candidate) === pageRef && candidate.isConnected);
+  const rt = (globalThis as RuntimeGlobal).__browserConnectorRuntime;
+  if (!rt) throw new Error("browser-connector-runtime-missing");
+  const state = rt.currentState(generation);
+  const input = (state ? rt.scan().resolve(pageRef, state) : null) as HTMLInputElement | null;
   if (!input || input.type !== "file") return false;
   const binary = atob(dataBase64);
   const bytes = new Uint8Array(binary.length);
@@ -1709,6 +1787,76 @@ function isPageRefContext(value: unknown): value is PageRefContext {
 
 export function connectorError(code: string, message: string, outcomeUnknown = false): Error & { code: string; outcomeUnknown: boolean } {
   return Object.assign(new Error(message), { code, outcomeUnknown });
+}
+
+export type ParsedExpectation =
+  | (PageExpectation & { kind: "text_present" | "text_absent" | "element" | "count" })
+  | { index: number; kind: "url_matches" | "title_matches"; pattern: string };
+
+const EXPECTATION_KINDS = new Set(["text_present", "text_absent", "url_matches", "title_matches", "element", "count"]);
+const ELEMENT_STATES = new Set(["visible", "hidden", "enabled", "disabled", "checked", "unchecked"]);
+
+/* Validates the whole list up front, so a typo in the tenth expectation does not waste the first nine. */
+export function parseExpectations(value: unknown): ParsedExpectation[] {
+  if (!Array.isArray(value) || !value.length || value.length > ASSERT_MAX_EXPECTATIONS) {
+    throw connectorError("invalid_arguments", `assert needs 1 to ${ASSERT_MAX_EXPECTATIONS} expectations in expect`);
+  }
+  return value.map((entry, index): ParsedExpectation => {
+    const fail = (message: string): never => { throw connectorError("invalid_arguments", `expect[${index}]: ${message}`); };
+    if (!isRecord(entry) || typeof entry.kind !== "string" || !EXPECTATION_KINDS.has(entry.kind)) {
+      return fail(`kind must be one of ${[...EXPECTATION_KINDS].join(", ")}`);
+    }
+    const text = (field: string): string | undefined => {
+      const item = entry[field];
+      if (item === undefined || item === null) return undefined;
+      return typeof item === "string" ? item : fail(`${field} must be a string`);
+    };
+    const count = (field: string): number | undefined => {
+      const item = entry[field];
+      if (item === undefined || item === null) return undefined;
+      return typeof item === "number" && Number.isInteger(item) && item >= 0 ? item : fail(`${field} must be a non-negative integer`);
+    };
+    const kind = entry.kind as ParsedExpectation["kind"];
+    if (kind === "text_present" || kind === "text_absent") {
+      const wanted = text("text");
+      return wanted ? { index, kind, text: wanted } : fail("text is required");
+    }
+    if (kind === "url_matches" || kind === "title_matches") {
+      const pattern = text("pattern");
+      if (!pattern) return fail("pattern is required");
+      if (pattern.length > MAX_PATTERN_LENGTH) return fail(`pattern is longer than ${MAX_PATTERN_LENGTH} characters`);
+      try { matchesPattern("", pattern); } catch { return fail("pattern is not a valid /regex/"); }
+      return { index, kind, pattern };
+    }
+    const selector = text("selector"); const pageRef = text("pageRef"); const name = text("name"); const role = text("role");
+    const state = text("state"); const wantedValue = text("value");
+    if (state !== undefined && !ELEMENT_STATES.has(state)) return fail(`state must be one of ${[...ELEMENT_STATES].join(", ")}`);
+    const base = { index, ...(selector ? { selector } : {}), ...(pageRef ? { pageRef } : {}), ...(name ? { name } : {}), ...(role ? { role } : {}) };
+    if (kind === "count") {
+      if (!selector) return fail("count needs a selector");
+      const equals = count("equals"); const atLeast = count("atLeast"); const atMost = count("atMost");
+      if (equals === undefined && atLeast === undefined && atMost === undefined) return fail("count needs equals, atLeast or atMost");
+      return { ...base, kind, ...(equals !== undefined ? { equals } : {}), ...(atLeast !== undefined ? { atLeast } : {}), ...(atMost !== undefined ? { atMost } : {}), ...(entry.visible === true ? { visible: true } : {}) };
+    }
+    if (!selector && !pageRef && !name && !role) return fail("element needs a selector, a pageRef, or a name or role");
+    return { ...base, kind, ...(state ? { state: state as PageExpectation["state"] } : {}), ...(wantedValue !== undefined ? { value: wantedValue } : {}) };
+  });
+}
+
+const MAX_PATTERN_LENGTH = 200;
+const MAX_PATTERN_SUBJECT = 2_048;
+
+/* A plain string is a case-insensitive substring; /body/flags is a regular expression. The subject
+   is capped so a hostile pattern has little to chew on. */
+export function matchesPattern(subject: string, pattern: string): boolean {
+  const text = subject.slice(0, MAX_PATTERN_SUBJECT);
+  const regex = /^\/(.+)\/([a-z]*)$/s.exec(pattern);
+  if (regex) return new RegExp(regex[1]!, regex[2]).test(text);
+  return text.toLowerCase().includes(pattern.toLowerCase());
+}
+
+function clipObserved(value: string): string {
+  return value.length > 120 ? `${value.slice(0, 120)}...` : value;
 }
 
 /* What an agent should do next for each failure, so an error ends a guess instead of starting one. */

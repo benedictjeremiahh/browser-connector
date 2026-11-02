@@ -7,6 +7,12 @@ describe("connector policy", () => {
     expect(classifyRequest("read_network_requests", { includeResponseBody: true }).risk).toBe("protected");
   });
 
+  it("treats wait_for and assert as read-only, including inside a batch", () => {
+    expect(classifyRequest("wait_for", {}).risk).toBe("read_only");
+    expect(classifyRequest("assert", { expect: [] }).risk).toBe("read_only");
+    expect(classifyRequest("browser_batch", { actions: [{ tool: "assert", arguments: {} }] }).risk).toBe("read_only");
+  });
+
   it("never treats arbitrary JavaScript as routine", () => {
     expect(classifyRequest("javascript_tool", { source: "1 + 1" }).risk).toBe("protected");
   });

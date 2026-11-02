@@ -6,7 +6,8 @@ const READ_ONLY = new Set([
   "find",
   "read_console_messages",
   "read_network_requests",
-  "wait_for"
+  "wait_for",
+  "assert"
 ]);
 
 const PROTECTED = new Set(["javascript_tool", "upload_file", "download_file"]);

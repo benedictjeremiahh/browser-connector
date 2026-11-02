@@ -1,0 +1,11 @@
+# Verify pages with expectations and snapshot diffs
+
+Agents leaned on screenshots to learn whether an action worked, and on a second full `read_page` to see what changed. Both are expensive and neither answers a yes or no question directly. Three additions let an agent verify a page in fewer, smaller calls:
+
+- `assert` checks up to 50 expectations in one call (text shown or gone, URL, title, an element by selector, Page Reference or name and role with an optional state or value, and counts) and returns a pass or fail with a short observation for each. A failed expectation is a normal result, not an error. `timeoutMs` re-checks until everything passes. URL and title are matched against the redacted values the agent already sees, so an expectation cannot be used to guess a redacted part. A sensitive field's value is never compared or echoed, because comparing would confirm a guess one value at a time.
+- `read_page` returns a `snapshotId`. With `diffFrom` it returns only the nodes added, removed or changed since that snapshot. The extension keeps the last four snapshots per tab in memory, drops them when the tab closes or the session ends, and falls back to the full tree, saying so, when the snapshot is unknown, belongs to an earlier document, was read with a different filter, scope or cursor, or when either read was truncated.
+- Page reads and Page References see into open shadow roots and same-origin iframes, to a bounded depth. A cross-origin frame or a closed shadow root is reported as a node marked `opaque`. Clicks inside a frame are translated to top-level viewport coordinates.
+
+## Consequences
+
+The injected page functions share one runtime installed per document, instead of each carrying its own copy of the reference bookkeeping, so a page function can no longer be tested without installing it. A Page Reference is still unique per document generation, whichever tree its element lives in. Closed shadow roots are detected only where the browser lets a content script see that one exists, and are never read. Frame coordinates assume an iframe that is not scaled by a CSS transform. Snapshots do not survive a service worker restart, which is why an unknown id is a normal outcome.

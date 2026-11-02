@@ -77,8 +77,9 @@ session.
 | `tabs_close` | Close a controlled tab. |
 | `label_session` | Name this session's tab group. |
 | `navigate` | Go to a URL, back, forward, or reload. |
-| `read_page` / `get_page_text` | Accessibility snapshot with refs / bounded visible text. Both can scope to one element's subtree. |
+| `read_page` / `get_page_text` | Accessibility snapshot with refs / bounded visible text. Both can scope to one element's subtree. `read_page` returns a `snapshotId`; pass it back as `diffFrom` to get only what was added, removed or changed. |
 | `find` | Elements by visible text or semantics, as refs. |
+| `assert` | Check several expectations in one call (text shown or gone, URL, title, an element's state or value, a count) and get pass or fail for each, without a screenshot. |
 | `form_input` | Set a form control's value. Password fields are never read back. |
 | `javascript_tool` | Run JavaScript in the page. The extension auto-approves calls in this build and records them in its audit log; an Agent Host may apply its own policy gate. |
 | `read_console_messages` / `read_network_requests` | Bounded, filterable console and network records. |
@@ -88,6 +89,17 @@ session.
 | `resize_window` | Resize the window holding a controlled tab. |
 
 A few behaviours worth knowing:
+
+- **Open shadow roots and same-origin iframes are part of the page.** `read_page`, `find`,
+  `assert`, and Page References for `computer` and `form_input` see into them, to a bounded
+  depth, and clicks inside a frame are translated to the top-level viewport. A cross-origin
+  frame or a closed shadow root appears as a node marked `opaque` that says it was not
+  inspected; it is never an error.
+- **Verify with `assert` or `diffFrom`, not a screenshot.** One `assert` call checks several
+  expectations and says which failed and what was observed; values of password and other
+  sensitive fields are never compared or echoed. After an action, `read_page` with the
+  previous `snapshotId` as `diffFrom` returns just the change. Snapshots live in the
+  extension's memory only (the last few per tab) and an unknown one returns the full tree.
 
 - **Screenshots come back as images.** `computer` with `action: "screenshot"` returns an
   MCP image content block, so a client renders the pixels rather than a link to them.
