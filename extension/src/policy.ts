@@ -108,10 +108,27 @@ export function hostPermissionPattern(origin: string): string {
   return `${origin}/*`;
 }
 
+/* Path segments that name a capability rather than a place: a link-borne token after a
+   reset/verify/invite style segment, a JWT, or a long random string. UUIDs and slugs stay,
+   because they are how an agent tells pages apart. */
+const TOKEN_PATH_PARENT = /^(reset|reset-password|verify|verification|confirm|invite|invitation|magic|magic-link|token|activate|unsubscribe|share|s)$/i;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function secretPathSegment(segment: string, previous: string | undefined): boolean {
+  if (!segment || UUID.test(segment)) return false;
+  if (/^eyJ[\w-]+\.[\w-]+/.test(segment)) return true;
+  if (previous && TOKEN_PATH_PARENT.test(previous) && segment.length >= 16) return true;
+  return segment.length >= 32 && /^[\w-]+$/.test(segment) && /\d/.test(segment) && /[a-z]/i.test(segment);
+}
+
 export function redactUrl(value: string): string {
   try {
     const url = new URL(value);
+    url.username = "";
+    url.password = "";
     for (const key of [...url.searchParams.keys()]) url.searchParams.set(key, "[redacted]");
+    const segments = url.pathname.split("/");
+    url.pathname = segments.map((segment, index) => secretPathSegment(segment, segments[index - 1]) ? "[redacted]" : segment).join("/");
     url.hash = "";
     return url.toString();
   } catch {

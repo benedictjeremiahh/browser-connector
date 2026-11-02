@@ -18,13 +18,31 @@ use tokio::{
     time::timeout,
 };
 
-use crate::config::broker_socket_path;
+use crate::config::{ConnectorConfig, broker_socket_path};
 
 const MAX_NATIVE_MESSAGE: usize = 16 * 1024 * 1024;
 const CLIENT_QUEUE_SIZE: usize = 32;
 const BROWSER_QUEUE_SIZE: usize = 128;
 
 type PendingMap = Arc<Mutex<HashMap<u64, PendingResponse>>>;
+/// Live session id -> the client connection that currently owns it.
+type SessionMap = Arc<Mutex<HashMap<String, LiveSession>>>;
+/// Looks up the pairing secret registered for a host id, from the file only this user can read.
+type SecretLookup = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
+struct LiveSession {
+    client_id: u64,
+    host_id: String,
+}
+
+#[derive(Clone)]
+struct Broker {
+    browser_tx: mpsc::Sender<Vec<u8>>,
+    pending: PendingMap,
+    sessions: SessionMap,
+    secrets: SecretLookup,
+    next_broker_id: Arc<AtomicU64>,
+}
 
 struct PendingResponse {
     client_id: u64,
@@ -51,7 +69,13 @@ pub async fn run() -> Result<()> {
     let socket_path = broker_socket_path()?;
     let listener = bind_broker_socket(&socket_path).await?;
     let _cleanup = SocketCleanup(socket_path);
-    serve_native_io(listener, tokio::io::stdin(), tokio::io::stdout()).await
+    let secrets: SecretLookup = Arc::new(|host_id: &str| {
+        ConnectorConfig::load(host_id)
+            .ok()
+            .flatten()
+            .map(|config| config.pairing_secret)
+    });
+    serve_native_io(listener, tokio::io::stdin(), tokio::io::stdout(), secrets).await
 }
 
 async fn bind_broker_socket(path: &Path) -> Result<UnixListener> {
@@ -89,23 +113,24 @@ async fn serve_native_io<R, W>(
     listener: UnixListener,
     mut browser_read: R,
     mut browser_write: W,
+    secrets: SecretLookup,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let pending = Arc::new(Mutex::new(HashMap::new()));
-    let next_broker_id = Arc::new(AtomicU64::new(1));
+    let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
     let next_client_id = Arc::new(AtomicU64::new(1));
     let (browser_tx, mut browser_rx) = mpsc::channel::<Vec<u8>>(BROWSER_QUEUE_SIZE);
-
-    let accept = accept_clients(
-        listener,
+    let broker = Broker {
         browser_tx,
-        pending.clone(),
-        next_broker_id,
-        next_client_id,
-    );
+        pending: pending.clone(),
+        sessions: Arc::new(Mutex::new(HashMap::new())),
+        secrets,
+        next_broker_id: Arc::new(AtomicU64::new(1)),
+    };
+
+    let accept = accept_clients(listener, broker, next_client_id);
     let from_browser = async {
         loop {
             let message = read_native_message(&mut browser_read).await?;
@@ -130,67 +155,90 @@ where
 
 async fn accept_clients(
     listener: UnixListener,
-    browser_tx: mpsc::Sender<Vec<u8>>,
-    pending: PendingMap,
-    next_broker_id: Arc<AtomicU64>,
+    broker: Broker,
     next_client_id: Arc<AtomicU64>,
 ) -> Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
-        let browser_tx = browser_tx.clone();
-        let pending = pending.clone();
-        let next_broker_id = next_broker_id.clone();
+        let broker = broker.clone();
         let client_id = next_client_id.fetch_add(1, Ordering::Relaxed);
         tokio::spawn(async move {
-            if let Err(error) =
-                serve_client(client_id, stream, browser_tx, pending, next_broker_id).await
-            {
+            if let Err(error) = serve_client(client_id, stream, broker).await {
                 tracing::debug!(client_id, %error, "native broker client disconnected");
             }
         });
     }
 }
 
-async fn serve_client(
-    client_id: u64,
-    stream: UnixStream,
-    browser_tx: mpsc::Sender<Vec<u8>>,
-    pending: PendingMap,
-    next_broker_id: Arc<AtomicU64>,
-) -> Result<()> {
+async fn serve_client(client_id: u64, stream: UnixStream, broker: Broker) -> Result<()> {
     let mut connected: Option<ClientHandshake> = None;
-    let result = serve_client_inner(
-        client_id,
-        stream,
-        browser_tx.clone(),
-        pending.clone(),
-        next_broker_id,
-        &mut connected,
-    )
-    .await;
-    pending
+    let result = serve_client_inner(client_id, stream, &broker, &mut connected).await;
+    broker
+        .pending
         .lock()
         .await
         .retain(|_, response| response.client_id != client_id);
     // The extension cannot see an MCP client go away; without this its session stays "live"
-    // forever and the next session with the same label cannot take back its tabs.
+    // forever and the next session with the same label cannot take back its tabs. A relay that
+    // reconnected already owns the session again, so the connection it left must not end it.
     if let Some(handshake) = connected {
-        let ended = serde_json::json!({
-            "kind": "session_ended",
-            "sessionId": handshake.session_id,
-            "hostId": handshake.host_id,
-        });
-        let _ = browser_tx.send(serde_json::to_vec(&ended)?).await;
+        let mut sessions = broker.sessions.lock().await;
+        let still_owner = sessions
+            .get(&handshake.session_id)
+            .is_some_and(|live| live.client_id == client_id);
+        if still_owner {
+            sessions.remove(&handshake.session_id);
+            drop(sessions);
+            let ended = serde_json::json!({
+                "kind": "session_ended",
+                "sessionId": handshake.session_id,
+                "hostId": handshake.host_id,
+            });
+            let _ = broker.browser_tx.send(serde_json::to_vec(&ended)?).await;
+        }
     }
     result
+}
+
+/* Equal-length comparison that does not stop at the first differing byte. */
+fn same_secret(expected: &str, offered: &str) -> bool {
+    let (expected, offered) = (expected.as_bytes(), offered.as_bytes());
+    expected.len() == offered.len()
+        && expected
+            .iter()
+            .zip(offered)
+            .fold(0_u8, |difference, (a, b)| difference | (a ^ b))
+            == 0
+}
+
+/* Why a request is refused before it reaches Chrome, or None when it may pass. The extension
+trusts hostId and sessionId, so they must be the ones this connection proved, not whatever a
+client writes into each request. */
+fn refusal(
+    object: &serde_json::Map<String, Value>,
+    handshake: &ClientHandshake,
+    secret: &str,
+) -> Option<&'static str> {
+    if object.get("hostId").and_then(Value::as_str) != Some(handshake.host_id.as_str()) {
+        return Some("request hostId does not match the connected Agent Host");
+    }
+    if object.get("sessionId").and_then(Value::as_str) != Some(handshake.session_id.as_str()) {
+        return Some("request sessionId does not match the connected session");
+    }
+    let offered = object
+        .get("pairingProof")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !same_secret(secret, offered) {
+        return Some("pairing proof does not match this Agent Host's registered secret");
+    }
+    None
 }
 
 async fn serve_client_inner(
     client_id: u64,
     stream: UnixStream,
-    browser_tx: mpsc::Sender<Vec<u8>>,
-    pending: PendingMap,
-    next_broker_id: Arc<AtomicU64>,
+    broker: &Broker,
     connected: &mut Option<ClientHandshake>,
 ) -> Result<()> {
     let mut stream = BufStream::new(stream);
@@ -208,9 +256,34 @@ async fn serve_client_inner(
     {
         bail!("invalid MCP broker handshake");
     }
+    let Some(secret) = (broker.secrets)(&handshake.host_id) else {
+        bail!(
+            "Agent Host {} is not installed on this machine",
+            handshake.host_id
+        );
+    };
+    {
+        let mut sessions = broker.sessions.lock().await;
+        if let Some(live) = sessions.get(&handshake.session_id)
+            && live.host_id != handshake.host_id
+        {
+            bail!(
+                "session {} belongs to another Agent Host",
+                handshake.session_id
+            );
+        }
+        // Same host, same session: the relay reconnected, and the newest connection owns it.
+        sessions.insert(
+            handshake.session_id.clone(),
+            LiveSession {
+                client_id,
+                host_id: handshake.host_id.clone(),
+            },
+        );
+    }
     stream.write_all(b"{\"kind\":\"mcp_connected\"}\n").await?;
     stream.flush().await?;
-    *connected = Some(handshake);
+    let handshake = connected.insert(handshake);
 
     let (responses, mut response_rx) = mpsc::channel::<Value>(CLIENT_QUEUE_SIZE);
     loop {
@@ -229,9 +302,20 @@ async fn serve_client_inner(
                     .get("id")
                     .and_then(Value::as_u64)
                     .context("browser request is missing a numeric id")?;
-                let broker_id = next_broker_id.fetch_add(1, Ordering::Relaxed);
+                if let Some(reason) = refusal(object, handshake, &secret) {
+                    let refused = serde_json::json!({
+                        "kind": "response",
+                        "id": original_id,
+                        "error": {"code": "unauthorized_client", "message": reason},
+                    });
+                    stream.write_all(serde_json::to_string(&refused)?.as_bytes()).await?;
+                    stream.write_all(b"\n").await?;
+                    stream.flush().await?;
+                    continue;
+                }
+                let broker_id = broker.next_broker_id.fetch_add(1, Ordering::Relaxed);
                 object.insert("id".to_owned(), Value::from(broker_id));
-                pending.lock().await.insert(
+                broker.pending.lock().await.insert(
                     broker_id,
                     PendingResponse {
                         client_id,
@@ -239,8 +323,8 @@ async fn serve_client_inner(
                         responses: responses.clone(),
                     },
                 );
-                if browser_tx.send(serde_json::to_vec(&request)?).await.is_err() {
-                    pending.lock().await.remove(&broker_id);
+                if broker.browser_tx.send(serde_json::to_vec(&request)?).await.is_err() {
+                    broker.pending.lock().await.remove(&broker_id);
                     bail!("Chrome native channel closed");
                 }
             }
@@ -308,6 +392,124 @@ mod tests {
     use serde_json::json;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufStream};
 
+    fn test_secrets() -> SecretLookup {
+        Arc::new(|host_id: &str| (host_id != "unknown").then(|| format!("{host_id}-secret")))
+    }
+
+    async fn connect(
+        socket_path: &Path,
+        session_id: &str,
+        host_id: &str,
+    ) -> (BufStream<UnixStream>, Value) {
+        let stream = UnixStream::connect(socket_path).await.unwrap();
+        let mut stream = BufStream::new(stream);
+        let handshake =
+            json!({"kind": "mcp_connect", "session_id": session_id, "host_id": host_id});
+        stream
+            .write_all(format!("{handshake}\n").as_bytes())
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+        let mut ack = String::new();
+        stream.read_line(&mut ack).await.unwrap();
+        let ack = if ack.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_str(&ack).unwrap()
+        };
+        (stream, ack)
+    }
+
+    async fn request(stream: &mut BufStream<UnixStream>, body: Value) -> Value {
+        stream
+            .write_all(format!("{body}\n").as_bytes())
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+        let mut line = String::new();
+        stream.read_line(&mut line).await.unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    fn start_broker(
+        socket_path: &Path,
+    ) -> (
+        tokio::task::JoinHandle<Result<()>>,
+        tokio::io::DuplexStream,
+        tokio::io::DuplexStream,
+    ) {
+        let listener = UnixListener::bind(socket_path).unwrap();
+        let (extension_to_host, host_input) = tokio::io::duplex(64 * 1024);
+        let (host_output, host_to_extension) = tokio::io::duplex(64 * 1024);
+        let broker = tokio::spawn(async move {
+            serve_native_io(listener, host_input, host_output, test_secrets()).await
+        });
+        (broker, extension_to_host, host_to_extension)
+    }
+
+    #[tokio::test]
+    async fn refuses_requests_that_do_not_carry_the_connected_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket_path = temp.path().join("native.sock");
+        let (broker, _extension_to_host, _host_to_extension) = start_broker(&socket_path);
+        let (mut stream, ack) = connect(&socket_path, "mine", "codex").await;
+        assert_eq!(ack["kind"], "mcp_connected");
+
+        let base = json!({"kind": "request", "id": 7, "method": "tabs_context", "params": {},
+            "hostId": "codex", "sessionId": "mine", "pairingProof": "codex-secret"});
+        for (field, value) in [
+            ("pairingProof", "guessed"),
+            ("sessionId", "someone-else"),
+            ("hostId", "opencode"),
+        ] {
+            let mut forged = base.clone();
+            forged[field] = json!(value);
+            let response = request(&mut stream, forged).await;
+            assert_eq!(response["id"], 7, "{field}");
+            assert_eq!(response["error"]["code"], "unauthorized_client", "{field}");
+        }
+        broker.abort();
+    }
+
+    #[tokio::test]
+    async fn an_unknown_host_or_another_hosts_session_cannot_connect() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket_path = temp.path().join("native.sock");
+        let (broker, _extension_to_host, _host_to_extension) = start_broker(&socket_path);
+        let (_unknown, ack) = connect(&socket_path, "s1", "unknown").await;
+        assert_eq!(
+            ack,
+            Value::Null,
+            "a host that was never installed has no secret to prove"
+        );
+        let (_owner, ack) = connect(&socket_path, "taken", "codex").await;
+        assert_eq!(ack["kind"], "mcp_connected");
+        let (_thief, ack) = connect(&socket_path, "taken", "opencode").await;
+        assert_eq!(ack, Value::Null, "another host cannot claim a live session");
+        broker.abort();
+    }
+
+    #[tokio::test]
+    async fn a_reconnected_session_is_not_ended_by_the_connection_it_replaced() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket_path = temp.path().join("native.sock");
+        let (broker, _extension_to_host, mut host_to_extension) = start_broker(&socket_path);
+        let (old, _) = connect(&socket_path, "kept", "codex").await;
+        let (_new, ack) = connect(&socket_path, "kept", "codex").await;
+        assert_eq!(ack["kind"], "mcp_connected");
+        drop(old);
+        let ended = timeout(
+            Duration::from_millis(300),
+            read_native_message(&mut host_to_extension),
+        )
+        .await;
+        assert!(
+            ended.is_err(),
+            "the replaced connection must not end the live session"
+        );
+        broker.abort();
+    }
+
     #[tokio::test]
     async fn native_message_round_trip() {
         let mut bytes = Vec::new();
@@ -323,11 +525,7 @@ mod tests {
     async fn tells_the_extension_when_an_mcp_session_disconnects() {
         let temp = tempfile::tempdir().unwrap();
         let socket_path = temp.path().join("native.sock");
-        let listener = UnixListener::bind(&socket_path).unwrap();
-        let (_extension_to_host, host_input) = tokio::io::duplex(64 * 1024);
-        let (host_output, mut host_to_extension) = tokio::io::duplex(64 * 1024);
-        let broker =
-            tokio::spawn(async move { serve_native_io(listener, host_input, host_output).await });
+        let (broker, _extension_to_host, mut host_to_extension) = start_broker(&socket_path);
 
         {
             let stream = UnixStream::connect(&socket_path).await.unwrap();
@@ -360,11 +558,7 @@ mod tests {
     async fn multiplexes_mcp_sessions_with_colliding_request_ids() {
         let temp = tempfile::tempdir().unwrap();
         let socket_path = temp.path().join("native.sock");
-        let listener = UnixListener::bind(&socket_path).unwrap();
-        let (mut extension_to_host, host_input) = tokio::io::duplex(64 * 1024);
-        let (host_output, mut host_to_extension) = tokio::io::duplex(64 * 1024);
-        let broker =
-            tokio::spawn(async move { serve_native_io(listener, host_input, host_output).await });
+        let (broker, mut extension_to_host, mut host_to_extension) = start_broker(&socket_path);
 
         let browser = tokio::spawn(async move {
             let mut requests = Vec::new();
@@ -413,6 +607,9 @@ mod tests {
                 "id": 1,
                 "method": "tabs_context",
                 "params": {"marker": marker},
+                "hostId": "codex",
+                "sessionId": marker,
+                "pairingProof": "codex-secret",
             });
             stream
                 .write_all(serde_json::to_string(&request).unwrap().as_bytes())

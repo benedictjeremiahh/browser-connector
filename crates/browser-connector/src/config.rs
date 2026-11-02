@@ -21,6 +21,20 @@ pub struct ConnectorConfig {
 }
 
 impl ConnectorConfig {
+    /// The registered config, or None when this host id was never installed. Never creates one,
+    /// so a client cannot mint a pairing secret by naming a new host.
+    pub fn load(host_id: &str) -> Result<Option<Self>> {
+        validate_host_id(host_id)?;
+        let path = config_path(host_id)?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .context("parse connector config")
+    }
+
     pub fn load_or_create(host_id: &str) -> Result<Self> {
         validate_host_id(host_id)?;
         let path = config_path(host_id)?;
@@ -73,8 +87,8 @@ pub fn install(extension_id: &str, host_id: &str, executable: &Path) -> Result<I
         .to_str()
         .context("browser-connector executable path is not UTF-8")?;
     /* Registration adds an id and never drops one. The unpacked install and a Web Store
-       install have different ids and are both legitimately the same user's, so replacing
-       the list when the second is registered would silently cut the first one off. */
+    install have different ids and are both legitimately the same user's, so replacing
+    the list when the second is registered would silently cut the first one off. */
     let path = chrome_native_manifest_path()?;
     let allowed_origins = merged_origins(existing_origins(&path), extension_id);
     let manifest = NativeMessagingManifest {
@@ -92,8 +106,8 @@ pub fn install(extension_id: &str, host_id: &str, executable: &Path) -> Result<I
 }
 
 /* What the manifest already allows. Nothing to preserve when the file is absent, and a
-   manifest that cannot be parsed is one this call is about to replace with a well-formed
-   one anyway, so neither case is an error. */
+manifest that cannot be parsed is one this call is about to replace with a well-formed
+one anyway, so neither case is an error. */
 fn existing_origins(path: &Path) -> Vec<String> {
     let Ok(bytes) = fs::read(path) else {
         return Vec::new();
@@ -114,7 +128,7 @@ fn existing_origins(path: &Path) -> Vec<String> {
 }
 
 /* Existing ids keep their order; the id being registered moves to the end. Registering
-   the same id twice leaves one entry. */
+the same id twice leaves one entry. */
 fn merged_origins(existing: Vec<String>, extension_id: &str) -> Vec<String> {
     let origin = format!("chrome-extension://{extension_id}/");
     let mut origins: Vec<String> = existing
@@ -261,7 +275,7 @@ mod tests {
     }
 
     /* The unpacked install and a Web Store install have different ids. Registering the
-       second one used to replace the list and silently cut the first one off. */
+    second one used to replace the list and silently cut the first one off. */
     #[test]
     fn registering_an_extension_id_keeps_the_ones_already_registered() {
         let existing = vec!["chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/".to_owned()];

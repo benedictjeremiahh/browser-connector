@@ -841,8 +841,11 @@ function injectedReadPage(generation: number, maxBytes: number, offset: number, 
       disabled: "disabled" in element ? Boolean((element as HTMLButtonElement).disabled) : undefined,
       checked: "checked" in element ? Boolean((element as HTMLInputElement).checked) : undefined
     };
-    if (input && input.type !== "password") node.value = input.value.slice(0, 500);
-    if (input?.type === "password") node.value = "[redacted]";
+    /* Self-contained: this runs in the page, so it cannot import a shared helper. */
+    const sensitive = input && (input.type === "password"
+      || /^(cc-|current-password|new-password|one-time-code)/.test(input.autocomplete)
+      || /pass|secret|token|otp|cvv|cvc|card.?num|api.?key|pin$/i.test(`${input.name} ${input.id}`));
+    if (input) node.value = sensitive ? "[redacted]" : input.value.slice(0, 500);
     const size = new TextEncoder().encode(JSON.stringify(node)).length;
     if (bytes + size > maxBytes) { truncated = true; nextIndex = index; break; }
     nodes.push(node);
