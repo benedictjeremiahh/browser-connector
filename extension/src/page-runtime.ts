@@ -245,6 +245,9 @@ export function injectedAssert(expectations: PageExpectation[], generation: numb
   const lower = raw.toLowerCase();
   const plural = (count: number) => `${count} match${count === 1 ? "" : "es"}`;
   const disabledOf = (element: Element) => (element as HTMLButtonElement).disabled === true || !!element.matches?.(":disabled") || element.getAttribute("aria-disabled") === "true";
+  const isField = (element: Element) => ["INPUT", "SELECT", "TEXTAREA"].includes(element.tagName)
+    || element.getAttribute("contenteditable") === "true"
+    || ["textbox", "combobox", "searchbox", "spinbutton"].includes(element.getAttribute("role") ?? "");
   const checkedOf = (element: Element) => (element as HTMLInputElement).checked === true || element.getAttribute("aria-checked") === "true";
 
   const targets = (expectation: PageExpectation): { list: HTMLElement[]; stale?: true } => {
@@ -282,7 +285,10 @@ export function injectedAssert(expectations: PageExpectation[], generation: numb
     const parts = [plural(list.length)];
     if (!list.length) return { passed: expectation.state === "hidden", observed: parts[0]! };
     const anyVisible = list.some(element => rt.visible(element));
-    const primary = list.find(element => rt.visible(element)) ?? list[0]!;
+    /* A name usually matches both a field and its label; a value belongs to the field. */
+    const fields = expectation.value === undefined ? [] : list.filter(isField);
+    const pool = fields.length ? fields : list;
+    const primary = pool.find(element => rt.visible(element)) ?? pool[0]!;
     parts.push(anyVisible ? "visible" : "none visible");
     let passed = true;
     if (expectation.state === "visible") passed = anyVisible;

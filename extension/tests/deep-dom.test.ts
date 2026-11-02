@@ -315,6 +315,19 @@ describe("assert", () => {
     expect(outcome.results[2]!.observed).toContain("[redacted]");
   });
 
+  it("checks a value against the field, not the label that shares its name", async () => {
+    const h = install(top => {
+      top.add(new El("Store name", "LABEL"));
+      top.add(new Input("", { "aria-label": "Store name" })).stored = "Toko";
+    });
+    const outcome = await assertOn(h.controller, [
+      { kind: "element", name: "Store name", value: "Toko" },
+      { kind: "element", name: "Store name", state: "visible" }
+    ]);
+    expect(outcome.results.map(result => result.passed)).toEqual([true, true]);
+    expect(outcome.results[0]!.observed).toBe('2 matches; visible; value "Toko"');
+  });
+
   it("matches the redacted URL, so an expectation cannot confirm a guess at a redacted part", async () => {
     const h = install(top => nestedPage(top));
     h.tab.url = "http://localhost:5180/reset?token=abc&tab=orders";
