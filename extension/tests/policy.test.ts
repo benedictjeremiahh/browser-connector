@@ -34,6 +34,10 @@ describe("connector policy", () => {
   it("redacts query values and bounds UTF-8 output", () => {
     expect(redactUrl("https://example.com/?token=secret#x")).toBe("https://example.com/?token=%5Bredacted%5D");
     expect(redactUrl("https://user:pw@example.com/a")).toBe("https://example.com/a");
+    expect(redactUrl("http://localhost:5180/inventory?tab=transfers&page=2")).toBe("http://localhost:5180/inventory?tab=transfers&page=2");
+    expect(redactUrl("https://example.com/cb?state=abc&code=xyz")).toBe("https://example.com/cb?state=%5Bredacted%5D&code=%5Bredacted%5D");
+    expect(redactUrl("https://example.com/s?q=" + "a".repeat(30))).toBe("https://example.com/s?q=%5Bredacted%5D");
+    expect(redactUrl("https://example.com/u?who=ana@example.com")).toBe("https://example.com/u?who=%5Bredacted%5D");
     expect(redactUrl("https://example.com/reset/abcdefghijklmnop1234")).toBe("https://example.com/reset/[redacted]");
     expect(redactUrl("https://example.com/x/eyJhbGciOi.eyJzdWIiOi.sig")).toBe("https://example.com/x/[redacted]");
     expect(redactUrl("https://example.com/orders/3f2b1c4d-1111-4222-8333-444455556666/edit")).toBe("https://example.com/orders/3f2b1c4d-1111-4222-8333-444455556666/edit");

@@ -24,6 +24,9 @@ interface NetworkRecord {
   status?: number;
   resourceType?: string;
   mimeType?: string;
+  /** Set when the response body finished or the request failed, so a request with neither is in flight. */
+  done?: boolean;
+  failed?: string;
 }
 
 export interface PageRefContext {
@@ -65,9 +68,23 @@ const MAX_RESPONSE_BODY_BYTES = 256 * 1024;
 /* Distance the pointer glides before the button goes down, so a person watching
    can follow the mark instead of seeing it appear already clicked. */
 const CLICK_DWELL_MS = 200;
+/* After an action the page is "settled" once nothing in the DOM has changed and no request has been
+   in flight for this long, or the cap is reached. The result then says what happened, so an agent does
+   not need a screenshot or a read just to learn whether its click did anything. */
+const SETTLE_QUIET_MS = 300;
+const SETTLE_MAX_MS = 3_000;
+const WAIT_DEFAULT_MS = 10_000;
+const WAIT_MAX_MS = 30_000;
+const SCREENSHOT_LONG_EDGE = 1_600;
+const VIEWPORT_PRESETS: Record<string, { width: number; height: number }> = {
+  mobile: { width: 390, height: 844 },
+  tablet: { width: 820, height: 1180 },
+  desktop: { width: 1440, height: 900 }
+};
 /* Intermediate mouseMoved events: HTML5 drag-and-drop and sortable lists ignore a
    press and release with nothing in between. */
 const DRAG_STEPS = 8;
+const SETTLING_ACTIONS = new Set(["click", "double_click", "right_click", "middle_click", "type", "key"]);
 
 /* The mark drawn where the agent is about to act. One string so the injected
    script stays a single Runtime.evaluate call.
@@ -145,20 +162,114 @@ export class BrowserController {
       case "tabs_create": return this.tabsCreate(controlledTabIds, asOptionalString(params.url), group);
       case "tabs_activate": return this.tabsActivate(asTabId(params.tabId), controlledTabIds);
       case "tabs_close": return this.tabsClose(controlledTabIds, asTabId(params.tabId));
-      case "navigate": return this.navigate(asTabId(params.tabId), asString(params.action), asOptionalString(params.url));
-      case "computer": return this.computer(params);
-      case "read_page": return this.readPage(asTabId(params.tabId), params.maxBytes, params.cursor, asOptionalString(params.scopeRef));
+      case "navigate": return this.settled(asTabId(params.tabId), params, () => this.navigate(asTabId(params.tabId), asString(params.action), asOptionalString(params.url)));
+      case "computer": return SETTLING_ACTIONS.has(String(params.action)) ? this.settled(asTabId(params.tabId), params, () => this.computer(params)) : this.computer(params);
+      case "read_page": return this.readPage(asTabId(params.tabId), params.maxBytes, params.cursor, asOptionalString(params.scopeRef), params.filter === "all" ? "all" : "interactive", params.viewportOnly === true);
       case "get_page_text": return this.getPageText(asTabId(params.tabId), params.maxBytes, params.cursor, asOptionalString(params.scopeRef));
       case "find": return this.find(asTabId(params.tabId), asString(params.query), params.limit, params.cursor);
-      case "form_input": return this.formInput(asTabId(params.tabId), asString(params.pageRef), params.value);
+      case "form_input": return this.settled(asTabId(params.tabId), params, () => this.formInput(asTabId(params.tabId), asString(params.pageRef), params.value));
+      case "fill_form": return this.settled(asTabId(params.tabId), params, () => this.fillForm(asTabId(params.tabId), params.fields));
+      case "wait_for": return this.waitFor(asTabId(params.tabId), params);
       case "javascript_tool": return this.javascriptTool(asTabId(params.tabId), asString(params.source));
       case "read_console_messages": return this.readConsole(asTabId(params.tabId), params);
       case "read_network_requests": return this.readNetwork(asTabId(params.tabId), params);
-      case "resize_window": return this.emulateViewport(asNumber(params.windowId), asNumber(params.width), asNumber(params.height), controlledTabIds);
+      case "resize_window": return this.emulateViewport(params, controlledTabIds);
       case "upload_file": return this.uploadFile(params);
       case "download_file": return this.downloadFile(asTabId(params.tabId), asString(params.url));
       case "browser_batch": return this.browserBatch(params, controlledTabIds);
       default: throw connectorError("unknown_tool", `Unknown browser tool: ${method}`);
+    }
+  }
+
+  /* Runs an action and reports what it did once the page settles: where the tab is, whether the URL
+     changed, notices the page announced (alerts, toasts, dialogs), new console errors and failed
+     requests. Pass settle: false to skip the wait. */
+  private async settled(tabId: number, params: Record<string, unknown>, act: () => Promise<unknown>): Promise<unknown> {
+    if (params.settle === false) return act();
+    /* Network and console records exist only once the debugger is attached; settling never attaches
+       it by itself, so an action that did not need the debugger still does not touch it. */
+    const currentTab = async () => { try { return await chrome.tabs.get(tabId); } catch { return undefined; } };
+    const before = { url: (await currentTab())?.url, console: (this.consoleRecords.get(tabId) ?? []).length, network: (this.networkRecords.get(tabId) ?? []).length };
+    const noticesBefore = new Set((await this.mutationState(tabId)).notices);
+    const result = await act();
+    const started = Date.now();
+    let lastCount = -1;
+    let lastChange = Date.now();
+    let settled = false;
+    let notices: string[] = [];
+    while (Date.now() - started < SETTLE_MAX_MS) {
+      const state = await this.mutationState(tabId);
+      if (state.count !== lastCount) { lastCount = state.count; lastChange = Date.now(); }
+      notices = state.notices.filter(notice => !noticesBefore.has(notice));
+      const pending = (this.networkRecords.get(tabId) ?? []).slice(before.network).filter((record) => !record.done && record.status === undefined).length;
+      if (pending === 0 && Date.now() - lastChange >= SETTLE_QUIET_MS) { settled = true; break; }
+      await sleep(100);
+    }
+    const tab = await currentTab();
+    /* React and component libraries log deprecation warnings through console.error; they are not failures. */
+    const errors = (this.consoleRecords.get(tabId) ?? []).slice(before.console).filter((record) => record.level === "error" && !/^Warning: /.test(record.text)).slice(-3).map((record) => record.text.slice(0, 300));
+    const failed = (this.networkRecords.get(tabId) ?? []).slice(before.network).filter((record) => record.failed || (record.status ?? 0) >= 400).slice(-5)
+      .map((record) => ({ method: record.method, url: record.url, ...(record.status ? { status: record.status } : {}), ...(record.failed ? { error: record.failed } : {}) }));
+    return {
+      ...(isRecord(result) ? result : { result }),
+      after: {
+        url: tab?.url ? redactUrl(tab.url) : undefined,
+        title: tab?.title,
+        urlChanged: tab?.url !== before.url,
+        settled,
+        waitedMs: Date.now() - started,
+        ...(notices.length ? { notices } : {}),
+        ...(errors.length ? { consoleErrors: errors } : {}),
+        ...(failed.length ? { failedRequests: failed } : {}),
+        untrusted: true
+      }
+    };
+  }
+
+  /* The page's own change counter, installed on first use; a new document starts a new counter. */
+  private async mutationState(tabId: number): Promise<{ count: number; notices: string[] }> {
+    try {
+      const [result] = await chrome.scripting.executeScript({ target: { tabId }, func: injectedMutationState });
+      const value = result?.result;
+      return isRecord(value) && typeof value.count === "number" && Array.isArray(value.notices) ? { count: value.count, notices: value.notices.map(String) } : { count: 0, notices: [] };
+    } catch { return { count: -2, notices: [] }; }
+  }
+
+  /* Waits until every given condition holds: text shown, text gone, a selector visible, the URL
+     containing a string, or the network idle. On timeout the error says what still did not hold. */
+  private async waitFor(tabId: number, params: Record<string, unknown>): Promise<unknown> {
+    const text = asOptionalString(params.text);
+    const textGone = asOptionalString(params.textGone);
+    const selector = asOptionalString(params.selector);
+    const urlContains = asOptionalString(params.urlContains);
+    const networkIdle = params.networkIdle === true;
+    if (!text && !textGone && !selector && !urlContains && !networkIdle) throw connectorError("invalid_arguments", "wait_for needs at least one of text, textGone, selector, urlContains or networkIdle");
+    const timeout = clampLimit(params.timeoutMs, WAIT_DEFAULT_MS, WAIT_MAX_MS);
+    if (networkIdle) await this.ensureDebugger(tabId);
+    const started = Date.now();
+    let idleSince = Date.now();
+    let missing: string[] = [];
+    while (true) {
+      missing = [];
+      const tab = await chrome.tabs.get(tabId);
+      if (urlContains && !(tab.url ?? "").includes(urlContains)) missing.push(`urlContains ${JSON.stringify(urlContains)}`);
+      if (text || textGone || selector) {
+        const [result] = await chrome.scripting.executeScript({ target: { tabId }, func: injectedWaitCheck, args: [text ?? null, textGone ?? null, selector ?? null] }).catch(() => [undefined]);
+        const check = isRecord(result?.result) ? result!.result as { text?: boolean; textGone?: boolean; selector?: boolean } : {};
+        if (text && check.text !== true) missing.push(`text ${JSON.stringify(text)}`);
+        if (textGone && check.textGone !== true) missing.push(`textGone ${JSON.stringify(textGone)}`);
+        if (selector && check.selector !== true) missing.push(`selector ${JSON.stringify(selector)}`);
+      }
+      if (networkIdle) {
+        const pending = (this.networkRecords.get(tabId) ?? []).filter((record) => !record.done && record.status === undefined && Date.now() - record.timestamp < WAIT_MAX_MS).length;
+        if (pending > 0) idleSince = Date.now();
+        if (Date.now() - idleSince < 500) missing.push("networkIdle");
+      }
+      if (!missing.length) return { met: true, waitedMs: Date.now() - started, url: tab.url ? redactUrl(tab.url) : undefined, title: tab.title };
+      if (Date.now() - started >= timeout) {
+        throw connectorError("wait_timeout", `After ${timeout} ms still waiting for: ${missing.join(", ")}. The tab is at ${tab.url ? redactUrl(tab.url) : "an unknown URL"} (${tab.title ?? "untitled"}).`);
+      }
+      await sleep(200);
     }
   }
 
@@ -343,14 +454,14 @@ export class BrowserController {
     return { tabId, url: tab.url ? redactUrl(tab.url) : undefined, title: tab.title };
   }
 
-  private async readPage(tabId: number, requestedMax: unknown, cursor: unknown, scopeRef?: string): Promise<unknown> {
+  private async readPage(tabId: number, requestedMax: unknown, cursor: unknown, scopeRef: string | undefined, filter: "interactive" | "all", viewportOnly: boolean): Promise<unknown> {
     const maxBytes = clampLimit(requestedMax, 65_536, 65_536);
     const offset = cursorOffset(cursor);
     const generation = this.documentGenerations.get(tabId) ?? 1;
     const [result] = await chrome.scripting.executeScript({
       target: { tabId },
       func: injectedReadPage,
-      args: [generation, maxBytes, offset, scopeRef ?? null]
+      args: [generation, maxBytes, offset, scopeRef ?? null, filter, viewportOnly]
     });
     return result?.result ?? { nodes: [], truncated: false, originalBytes: 0 };
   }
@@ -385,14 +496,30 @@ export class BrowserController {
     return { ...(result?.result as object ?? { matches: [], nextCursor: null }), untrusted: true };
   }
 
-  private async formInput(tabId: number, pageRef: string, value: unknown): Promise<unknown> {
+  /* Writes through the element's native value setter, so frameworks that track the value (React)
+     see the change, then reads it back: a value the page rejected is reported, not assumed. */
+  private async formInput(tabId: number, pageRef: string, value: unknown): Promise<{ pageRef: string; changed: boolean; matched: boolean; actual?: unknown }> {
     const [result] = await chrome.scripting.executeScript({
       target: { tabId },
       func: injectedFormInput,
       args: [pageRef, value, this.documentGenerations.get(tabId) ?? 1]
     });
-    if (!result?.result) throw connectorError("stale_page_ref", `Page Reference is stale: ${pageRef}`);
-    return { changed: true, pageRef };
+    const outcome = result?.result as unknown;
+    if (outcome === false || outcome === null || outcome === undefined) throw connectorError("stale_page_ref", `Page Reference is stale: ${pageRef}`);
+    if (isRecord(outcome) && outcome.unsupported === true) throw connectorError("invalid_arguments", `${pageRef} is not an input, textarea, select or editable element`);
+    if (isRecord(outcome) && outcome.missingOption === true) throw connectorError("invalid_arguments", `No option of ${pageRef} matches ${JSON.stringify(value)} by value or label. Options: ${String(outcome.options ?? "")}`);
+    const matched = isRecord(outcome) ? outcome.matched !== false : true;
+    return { pageRef, changed: true, matched, ...(isRecord(outcome) && "actual" in outcome ? { actual: outcome.actual } : {}), ...(matched ? {} : { hint: ERROR_HINTS.value_not_applied }) };
+  }
+
+  private async fillForm(tabId: number, fields: unknown): Promise<unknown> {
+    if (!Array.isArray(fields) || !fields.length || fields.length > 50) throw connectorError("invalid_arguments", "fill_form needs 1 to 50 fields of { pageRef, value }");
+    const results = [];
+    for (const field of fields) {
+      if (!isRecord(field) || typeof field.pageRef !== "string") throw connectorError("invalid_arguments", "Every field needs a pageRef");
+      results.push(await this.formInput(tabId, field.pageRef, field.value));
+    }
+    return { fields: results, allMatched: results.every((result) => result.matched) };
   }
 
   /* A raw CDP mouse event is invisible, so anyone watching the tab sees nothing
@@ -431,32 +558,54 @@ export class BrowserController {
     }
     await this.ensureDebugger(tabId);
     if (action === "screenshot") {
+      /* JPEG and a bounded long edge by default: a full-resolution PNG was the most expensive thing
+         an agent read. Coordinates stay CSS pixels; imageScale says how the image relates to them. */
+      const format = params.format === "png" ? "png" : "jpeg";
+      const quality = format === "jpeg" ? clampLimit(params.quality, 70, 100) : undefined;
+      const longEdge = clampLimit(params.maxLongEdge, SCREENSHOT_LONG_EDGE, 4_096);
+      const metrics = await this.cdp(tabId, "Page.getLayoutMetrics").catch(() => ({})) as { cssVisualViewport?: { pageX?: number; pageY?: number; clientWidth?: number; clientHeight?: number } };
+      const view = metrics.cssVisualViewport;
+      const width = view?.clientWidth; const height = view?.clientHeight;
+      const imageScale = params.fullPage !== true && width && height ? Math.min(1, longEdge / Math.max(width, height)) : 1;
       const result = await this.cdp(tabId, "Page.captureScreenshot", {
-        format: "png",
-        captureBeyondViewport: params.fullPage === true
+        format,
+        ...(quality !== undefined ? { quality } : {}),
+        captureBeyondViewport: params.fullPage === true,
+        ...(imageScale < 1 ? { clip: { x: view!.pageX ?? 0, y: view!.pageY ?? 0, width, height, scale: imageScale } } : {})
       }) as { data?: string };
-      return { mimeType: "image/png", dataBase64: result.data ?? "", artifact: true };
+      return { mimeType: `image/${format}`, dataBase64: result.data ?? "", artifact: true, imageScale, ...(width && height ? { cssViewport: { width, height } } : {}) };
     }
     if (action === "zoom") {
       const region = asRegion(params.region);
       if (!region) throw connectorError("invalid_arguments", "zoom requires a region");
       /* No mark is drawn here. A crop is an observation, and an arrow in it would
          claim the agent acted at the middle of the region when it did not. */
+      const format = params.format === "png" ? "png" : "jpeg";
       const result = await this.cdp(tabId, "Page.captureScreenshot", {
-        format: "png",
+        format,
+        ...(format === "jpeg" ? { quality: clampLimit(params.quality, 80, 100) } : {}),
         clip: { ...region, scale: 1 }
       }) as { data?: string };
-      return { mimeType: "image/png", dataBase64: result.data ?? "", artifact: true, region };
+      return { mimeType: `image/${format}`, dataBase64: result.data ?? "", artifact: true, region };
     }
     if (action === "scroll") {
+      /* A pageRef is scrolled into view. Otherwise a real wheel event at the point (or the middle of
+         the viewport) scrolls whatever is under it, including inner panels that window.scrollBy misses. */
+      if (typeof params.pageRef === "string") {
+        const point = await this.pointForRef(tabId, params.pageRef);
+        await this.showCursor(tabId, point, "scroll");
+        return { scrolledTo: params.pageRef, point };
+      }
       const x = asOptionalNumber(params.deltaX) ?? 0;
       const y = asOptionalNumber(params.deltaY) ?? 600;
-      const to = typeof params.x === "number" && typeof params.y === "number"
-        ? { x: asNumber(params.x), y: asNumber(params.y) }
-        : undefined;
-      await this.showCursor(tabId, to, "scroll");
-      await this.cdp(tabId, "Runtime.evaluate", { expression: `window.scrollBy(${JSON.stringify(x)}, ${JSON.stringify(y)})` });
-      return { scrolled: { x, y } };
+      let at = typeof params.x === "number" && typeof params.y === "number" ? { x: asNumber(params.x), y: asNumber(params.y) } : undefined;
+      if (!at) {
+        const metrics = await this.cdp(tabId, "Page.getLayoutMetrics").catch(() => ({})) as { cssVisualViewport?: { clientWidth?: number; clientHeight?: number } };
+        at = { x: (metrics.cssVisualViewport?.clientWidth ?? 800) / 2, y: (metrics.cssVisualViewport?.clientHeight ?? 600) / 2 };
+      }
+      await this.showCursor(tabId, at, "scroll");
+      await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseWheel", x: at.x, y: at.y, deltaX: x, deltaY: y });
+      return { scrolled: { x, y }, at };
     }
     if (action === "type") {
       if (typeof params.pageRef === "string") {
@@ -510,7 +659,7 @@ export class BrowserController {
       }
     }
 
-    const point = await this.pointFrom(params, "pageRef", "x", "y", tabId);
+    const point = await this.pointFrom(params, "pageRef", "x", "y", tabId, action !== "move" && action !== "hover");
     if (action === "move" || action === "hover") {
       await this.showCursor(tabId, point, "hover");
       await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", ...point });
@@ -569,9 +718,10 @@ export class BrowserController {
     refKey: string,
     xKey: string,
     yKey: string,
-    tabId: number
+    tabId: number,
+    hitTest = false
   ): Promise<{ x: number; y: number }> {
-    if (typeof params[refKey] === "string") return this.pointForRef(tabId, params[refKey] as string);
+    if (typeof params[refKey] === "string") return this.pointForRef(tabId, params[refKey] as string, hitTest);
     if (typeof params[xKey] === "number" && typeof params[yKey] === "number") {
       return { x: asNumber(params[xKey]), y: asNumber(params[yKey]) };
     }
@@ -587,7 +737,10 @@ export class BrowserController {
       returnByValue: true,
       userGesture: false
     }) as { result?: { value?: unknown; description?: string }; exceptionDetails?: unknown };
-    if (result.exceptionDetails) throw connectorError("javascript_error", JSON.stringify(result.exceptionDetails));
+    if (result.exceptionDetails) {
+      const details = result.exceptionDetails as { text?: string; exception?: { description?: string } };
+      throw connectorError("javascript_error", (details.exception?.description ?? details.text ?? "The script threw").slice(0, 1_000));
+    }
     const bounded = boundedText(JSON.stringify(result.result?.value ?? result.result?.description ?? null), 65_536);
     return { value: bounded.text, truncated: bounded.truncated, originalBytes: bounded.originalBytes, untrusted: true };
   }
@@ -636,17 +789,41 @@ export class BrowserController {
      that viewport inside this session's tabs in the window instead (ADR-0026). Screenshots, clicks
      and layout all follow the emulated size; the window is untouched. Narrow widths also emulate a
      touch device, which is what a phone-width check means. */
-  private async emulateViewport(windowId: number, width: number, height: number, controlledTabIds: Set<number>): Promise<unknown> {
-    if (width < 320 || height < 240 || width > 7680 || height > 4320) throw connectorError("invalid_dimensions", "Viewport dimensions are outside supported bounds");
-    const tabs = (await chrome.tabs.query({ windowId })).flatMap((tab) => tab.id !== undefined && controlledTabIds.has(tab.id) ? [tab.id] : []);
-    if (!tabs.length) throw connectorError("tab_not_controlled", "This window holds no Controlled Tab to size");
+  private async emulateViewport(params: Record<string, unknown>, controlledTabIds: Set<number>): Promise<unknown> {
+    const preset = asOptionalString(params.preset);
+    if (preset !== undefined && !VIEWPORT_PRESETS[preset]) throw connectorError("invalid_dimensions", `Unknown preset ${preset}; use mobile, tablet or desktop`);
+    const requested = preset ? VIEWPORT_PRESETS[preset]! : { width: asOptionalNumber(params.width), height: asOptionalNumber(params.height) };
+    if (requested.width === undefined || requested.height === undefined) throw connectorError("invalid_dimensions", "Give width and height, or a preset");
+    /* Out-of-range sizes are clamped and said so, rather than refused: the agent wanted a narrow or a large view. */
+    const width = Math.round(Math.min(7_680, Math.max(320, requested.width)));
+    const height = Math.round(Math.min(4_320, Math.max(240, requested.height)));
+    const clamped = width !== requested.width || height !== requested.height;
+    const windowId = asOptionalNumber(params.windowId);
+    const tabId = asOptionalNumber(params.tabId);
+    const scope = windowId !== undefined ? { windowId } : tabId !== undefined ? { windowId: (await chrome.tabs.get(tabId)).windowId } : undefined;
+    const tabs = scope
+      ? (await chrome.tabs.query(scope)).flatMap((tab) => tab.id !== undefined && controlledTabIds.has(tab.id) ? [tab.id] : [])
+      : [...controlledTabIds];
+    if (!tabs.length) throw connectorError("tab_not_controlled", windowId !== undefined ? `Window ${windowId} holds no tab this session controls` : "This session controls no tab to size");
     const viewport = { width, height, mobile: width <= 480 };
-    for (const tabId of tabs) {
-      this.viewports.set(tabId, viewport);
-      await this.ensureDebugger(tabId);
-      await this.applyViewport(tabId);
+    const applied: Array<{ tabId: number; previous?: { width: number; height: number; mobile: boolean } }> = [];
+    try {
+      for (const id of tabs) {
+        applied.push({ tabId: id, previous: this.viewports.get(id) });
+        this.viewports.set(id, viewport);
+        await this.ensureDebugger(id);
+        await this.applyViewport(id);
+      }
+    } catch (error) {
+      /* All or nothing: tabs sized before the failure go back to what they were. */
+      for (const entry of applied) {
+        if (entry.previous) this.viewports.set(entry.tabId, entry.previous); else this.viewports.delete(entry.tabId);
+        await this.cdp(entry.tabId, entry.previous ? "Emulation.setDeviceMetricsOverride" : "Emulation.clearDeviceMetricsOverride",
+          entry.previous ? { width: entry.previous.width, height: entry.previous.height, deviceScaleFactor: 0, mobile: entry.previous.mobile } : undefined).catch(() => undefined);
+      }
+      throw error;
     }
-    return { windowId, width, height, emulated: true, tabIds: tabs };
+    return { ...(windowId !== undefined ? { windowId } : {}), width, height, emulated: true, tabIds: tabs, ...(clamped ? { clamped: true, requested } : {}) };
   }
 
   private async applyViewport(tabId: number): Promise<void> {
@@ -727,10 +904,16 @@ export class BrowserController {
     return (await chrome.debugger.sendCommand({ tabId }, method, params)) ?? {};
   }
 
-  private async pointForRef(tabId: number, pageRef: string): Promise<{ x: number; y: number }> {
-    const [result] = await chrome.scripting.executeScript({ target: { tabId }, func: injectedRefPoint, args: [pageRef, this.documentGenerations.get(tabId) ?? 1] });
-    if (!result?.result) throw connectorError("stale_page_ref", `Page Reference is stale: ${pageRef}`);
-    return result.result as { x: number; y: number };
+  /* With hitTest, the point is one where the element itself would receive the click: a point covered
+     by an overlay, a hidden element or a disabled control is an error that names the cause. */
+  private async pointForRef(tabId: number, pageRef: string, hitTest = false): Promise<{ x: number; y: number }> {
+    const [result] = await chrome.scripting.executeScript({ target: { tabId }, func: injectedRefPoint, args: [pageRef, this.documentGenerations.get(tabId) ?? 1, hitTest] });
+    const point = result?.result as unknown;
+    if (!point) throw connectorError("stale_page_ref", `Page Reference is stale: ${pageRef}`);
+    if (isRecord(point) && point.blocked === "hidden") throw connectorError("element_not_visible", `${pageRef} has no visible box`);
+    if (isRecord(point) && point.blocked === "disabled") throw connectorError("element_disabled", `${pageRef} is disabled`);
+    if (isRecord(point) && typeof point.blockedBy === "string") throw connectorError("click_intercepted", `${pageRef} is covered by ${point.blockedBy}`);
+    return point as { x: number; y: number };
   }
 
   private async focusRef(tabId: number, pageRef: string): Promise<void> {
@@ -762,6 +945,13 @@ export class BrowserController {
         url: redactUrl(event.request.url),
         resourceType: event.type
       });
+    } else if (method === "Network.loadingFinished" || method === "Network.loadingFailed") {
+      const event = params as { requestId?: string; errorText?: string; canceled?: boolean };
+      const record = [...(this.networkRecords.get(tabId) ?? [])].reverse().find((entry) => entry.requestId === event.requestId);
+      if (record) {
+        record.done = true;
+        if (method === "Network.loadingFailed" && !event.canceled) record.failed = event.errorText ?? "failed";
+      }
     } else if (method === "Network.responseReceived") {
       const event = params as { requestId?: string; type?: string; response?: { status?: number; mimeType?: string } };
       const record = [...(this.networkRecords.get(tabId) ?? [])].reverse().find((entry) => entry.requestId === event.requestId);
@@ -781,7 +971,7 @@ export class BrowserController {
   }
 }
 
-function injectedReadPage(generation: number, maxBytes: number, offset: number, scopeRef: string | null): unknown {
+function injectedReadPage(generation: number, maxBytes: number, offset: number, scopeRef: string | null, filter: "interactive" | "all" = "all", viewportOnly = false): unknown {
   const global = globalThis as typeof globalThis & {
     __browserConnectorPageRefState?: { document: Document; generation: number; refs: WeakMap<Element, string>; next: number };
   };
@@ -798,8 +988,14 @@ function injectedReadPage(generation: number, maxBytes: number, offset: number, 
     element.dataset.browserConnectorRef = ref;
     return ref;
   };
-  const selector = "a,button,input,select,textarea,[role],[contenteditable=true],summary,[tabindex],h1,h2,h3,h4,h5,h6,p,li";
-  const elements = [...document.querySelectorAll<HTMLElement>(selector)];
+  /* "interactive" (the default) keeps controls, headings and widget roles and drops prose, so a read
+     costs a fraction of the tokens; get_page_text reads the prose. Wrapper roles carry nothing to act on. */
+  const selector = filter === "interactive"
+    ? "a,button,input,select,textarea,[role],[contenteditable=true],summary,[tabindex],h1,h2,h3,h4,h5,h6,label"
+    : "a,button,input,select,textarea,[role],[contenteditable=true],summary,[tabindex],h1,h2,h3,h4,h5,h6,p,li";
+  const wrapperRoles = new Set(["presentation", "none", "generic"]);
+  const controlTags = new Set(["a", "button", "input", "select", "textarea", "summary"]);
+  const elements = [...document.querySelectorAll<HTMLElement>(selector)].filter(element => filter !== "interactive" || !wrapperRoles.has(element.getAttribute("role") ?? ""));
   /* Cursor positions still use the global traversal, even for scoped reads. Stable
      references come from the shared WeakMap so a find ref resolves in this traversal. */
   let scope: HTMLElement | null = null;
@@ -831,16 +1027,36 @@ function injectedReadPage(generation: number, maxBytes: number, offset: number, 
     if (scope && element !== scope && !scope.contains(element)) continue;
     const rect = element.getBoundingClientRect();
     if (rect.width === 0 && rect.height === 0) continue;
+    if (viewportOnly && (rect.bottom < 0 || rect.right < 0 || rect.top > innerHeight || rect.left > innerWidth)) continue;
     const ref = refFor(element);
     const input = element instanceof HTMLInputElement ? element : undefined;
-    const name = (element.getAttribute("aria-label") || element.getAttribute("title") || input?.placeholder || element.innerText || "").trim().replace(/\s+/g, " ").slice(0, 500);
+    const tag = element.tagName.toLowerCase();
+    /* A control is named by its label; a container is named briefly, or its text repeats every child's. */
+    const control = controlTags.has(tag) || /^(button|link|tab|menuitem|option|checkbox|radio|switch|combobox|textbox|searchbox|slider|treeitem)$/.test(element.getAttribute("role") ?? "");
+    const label = (element as HTMLInputElement).labels?.[0]?.innerText;
+    const name = (element.getAttribute("aria-label") || label || element.getAttribute("title") || input?.placeholder || element.innerText || "").trim().replace(/\s+/g, " ").slice(0, control ? 200 : 120);
     const node: Record<string, unknown> = {
       ref,
-      role: element.getAttribute("role") || element.tagName.toLowerCase(),
+      role: element.getAttribute("role") || tag,
       name,
       disabled: "disabled" in element ? Boolean((element as HTMLButtonElement).disabled) : undefined,
       checked: "checked" in element ? Boolean((element as HTMLInputElement).checked) : undefined
     };
+    /* State an agent needs to tell whether its last action worked: which tab is selected, what is open. */
+    for (const [attribute, key] of [["aria-selected", "selected"], ["aria-expanded", "expanded"], ["aria-pressed", "pressed"], ["aria-checked", "checked"]] as const) {
+      const state = element.getAttribute(attribute);
+      if (state === "true" || state === "false") node[key] = state === "true";
+    }
+    const current = element.getAttribute("aria-current");
+    if (current && current !== "false") node.current = current;
+    if (element.getAttribute("aria-invalid") === "true" || (input && !input.checkValidity?.())) node.invalid = true;
+    if (document.activeElement === element) node.focused = true;
+    if (/^h[1-6]$/.test(tag)) node.level = Number(tag[1]);
+    const href = tag === "a" ? (element as HTMLAnchorElement).href : undefined;
+    if (href) {
+      try { const url = new URL(href); node.href = url.origin === location.origin ? url.pathname : url.origin + url.pathname; } catch { /* not a URL */ }
+    }
+    for (const key of Object.keys(node)) if (node[key] === undefined) delete node[key];
     /* Self-contained: this runs in the page, so it cannot import a shared helper. */
     const sensitive = input && (input.type === "password"
       || /^(cc-|current-password|new-password|one-time-code)/.test(input.autocomplete)
@@ -899,20 +1115,29 @@ function injectedFind(generation: number, query: string, limit: number, offset: 
   };
   const needle = query.toLowerCase();
   const elements = [...document.querySelectorAll<HTMLElement>("body *")];
-  const matches: unknown[] = [];
-  let skipped = 0;
-  let hasMore = false;
-  for (let index = 0; index < elements.length; index += 1) {
-    const element = elements[index]!;
-    const haystack = [element.innerText, element.getAttribute("aria-label"), element.getAttribute("title"), element.getAttribute("name"), element.getAttribute("placeholder")].filter(Boolean).join(" ").toLowerCase();
-    if (!haystack.includes(needle)) continue;
+  /* Label, title, name, placeholder and text often repeat each other; each distinct one counts once. */
+  const ownText = (element: HTMLElement) => [...new Set([element.getAttribute("aria-label"), (element as HTMLInputElement).labels?.[0]?.innerText, element.getAttribute("title"), element.getAttribute("name"), element.getAttribute("placeholder"), element.innerText]
+    .map(part => part?.trim()).filter((part): part is string => !!part))].join(" ");
+  const hits: HTMLElement[] = [];
+  for (const element of elements) {
+    if (!ownText(element).toLowerCase().includes(needle)) continue;
     const rect = element.getBoundingClientRect();
     if (rect.width === 0 && rect.height === 0) continue;
-    if (skipped < offset) { skipped += 1; continue; }
-    if (matches.length >= limit) { hasMore = true; break; }
-    const ref = refFor(element);
-    matches.push({ ref, role: element.getAttribute("role") || element.tagName.toLowerCase(), name: haystack.slice(0, 500) });
+    hits.push(element);
+    if (hits.length >= 2_000) break;
   }
+  /* Every ancestor of a match also contains its text; only the innermost matches name the thing
+     asked for. Controls come first, since they are what an agent acts on. */
+  const innermost = hits.filter(element => !hits.some(other => other !== element && element.contains(other)));
+  const interactive = (element: HTMLElement) => /^(a|button|input|select|textarea|summary|label)$/i.test(element.tagName) || !!element.getAttribute("role") || element.hasAttribute?.("tabindex");
+  const ranked = [...innermost.filter(interactive), ...innermost.filter(element => !interactive(element))];
+  const page = ranked.slice(offset, offset + limit);
+  const matches = page.map(element => ({
+    ref: refFor(element),
+    role: element.getAttribute("role") || element.tagName.toLowerCase(),
+    name: ownText(element).trim().replace(/\s+/g, " ").slice(0, 200)
+  }));
+  const hasMore = offset + page.length < ranked.length;
   return { matches, nextCursor: hasMore ? String(offset + matches.length) : null, truncated: hasMore };
 }
 
@@ -946,7 +1171,7 @@ function injectedDescribeRef(pageRef: string, generation: number): { description
   }
 }
 
-function injectedRefPoint(pageRef: string, generation: number): { x: number; y: number } | null {
+async function injectedRefPoint(pageRef: string, generation: number, hitTest = false): Promise<{ x: number; y: number } | { blocked: "hidden" | "disabled" } | { blockedBy: string } | null> {
   const global = globalThis as typeof globalThis & {
     __browserConnectorPageRefState?: { document: Document; generation: number; refs: WeakMap<Element, string>; next: number };
   };
@@ -954,9 +1179,29 @@ function injectedRefPoint(pageRef: string, generation: number): { x: number; y: 
   if (!state || state.document !== document || state.generation !== generation) return null;
   const element = [...document.querySelectorAll<HTMLElement>("*")].find(candidate => state.refs.get(candidate) === pageRef && candidate.isConnected);
   if (!element) return null;
-  element.scrollIntoView({ block: "center", inline: "center" });
+  /* Instant, then two frames: a smooth scroll or a layout shift would otherwise move the target
+     after its centre was measured, and the click would land on whatever slid into that spot. */
+  element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" as ScrollBehavior });
+  if (typeof requestAnimationFrame === "function") await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
   const rect = element.getBoundingClientRect();
-  return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+  const centre = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+  if (!hitTest) return centre;
+  if (rect.width === 0 || rect.height === 0 || getComputedStyle(element).visibility === "hidden") return { blocked: "hidden" };
+  if ((element as HTMLButtonElement).disabled === true || element.getAttribute("aria-disabled") === "true") return { blocked: "disabled" };
+  if (typeof document.elementFromPoint !== "function") return centre;
+  /* The centre first; a wide wrapper's centre can be a gap, so a few inner points next. */
+  const insetX = Math.min(12, rect.width / 4); const insetY = Math.min(8, rect.height / 4);
+  const points = [centre, { x: rect.left + insetX, y: centre.y }, { x: rect.right - insetX, y: centre.y }, { x: centre.x, y: rect.top + insetY }, { x: centre.x, y: rect.bottom - insetY }];
+  let blocker: Element | null = null;
+  for (const point of points) {
+    const hit = document.elementFromPoint(point.x, point.y);
+    if (hit && (hit === element || element.contains(hit))) return point;
+    blocker ??= hit;
+  }
+  if (!blocker) return centre;
+  const describe = (node: Element) => `${node.getAttribute("role") || node.tagName.toLowerCase()} "${((node as HTMLElement).innerText || node.getAttribute("aria-label") || "").trim().replace(/\s+/g, " ").slice(0, 60)}"`;
+  const covering = blocker.closest("[role=dialog],[role=alertdialog],[role=alert],[role=status],dialog,header,nav") ?? blocker;
+  return { blockedBy: describe(covering) };
 }
 
 function injectedFocusRef(pageRef: string, generation: number): boolean {
@@ -971,7 +1216,7 @@ function injectedFocusRef(pageRef: string, generation: number): boolean {
   return document.activeElement === element;
 }
 
-function injectedFormInput(pageRef: string, value: unknown, generation: number): boolean {
+function injectedFormInput(pageRef: string, value: unknown, generation: number): false | { unsupported: true } | { missingOption: true; options: string } | { matched: boolean; actual: unknown } {
   const global = globalThis as typeof globalThis & {
     __browserConnectorPageRefState?: { document: Document; generation: number; refs: WeakMap<Element, string>; next: number };
   };
@@ -979,15 +1224,90 @@ function injectedFormInput(pageRef: string, value: unknown, generation: number):
   if (!state || state.document !== document || state.generation !== generation) return false;
   const element = [...document.querySelectorAll<HTMLElement>("*")].find(candidate => state.refs.get(candidate) === pageRef && candidate.isConnected);
   if (!element) return false;
-  if (element instanceof HTMLInputElement) {
-    if (element.type === "checkbox" || element.type === "radio") element.checked = Boolean(value);
-    else element.value = String(value ?? "");
-  } else if (element instanceof HTMLTextAreaElement || element instanceof HTMLSelectElement) element.value = String(value ?? "");
-  else if (element.isContentEditable) element.textContent = String(value ?? "");
-  else return false;
-  element.dispatchEvent(new Event("input", { bubbles: true }));
-  element.dispatchEvent(new Event("change", { bubbles: true }));
-  return true;
+  const fire = () => {
+    element.dispatchEvent(new Event("input", { bubbles: true }));
+    element.dispatchEvent(new Event("change", { bubbles: true }));
+  };
+  /* Frameworks such as React keep their own copy of a field's value and ignore an assignment to
+     element.value; the prototype's setter is what a person's typing goes through. */
+  const setNative = (target: HTMLInputElement | HTMLTextAreaElement, next: string) => {
+    let prototype: object | null = Object.getPrototypeOf(target);
+    let setter: ((this: unknown, value: string) => void) | undefined;
+    while (prototype && !setter) { setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set; prototype = Object.getPrototypeOf(prototype); }
+    if (setter) setter.call(target, next); else target.value = next;
+  };
+  const sensitive = (target: HTMLInputElement) => target.type === "password"
+    || /^(cc-|current-password|new-password|one-time-code)/.test(target.autocomplete ?? "")
+    || /pass|secret|token|otp|cvv|cvc|card.?num|api.?key|pin$/i.test(`${target.name} ${target.id}`);
+  if (element instanceof HTMLInputElement && (element.type === "checkbox" || element.type === "radio")) {
+    const wanted = Boolean(value);
+    /* A click, not an assignment: it is the event a framework listens to, and it toggles exactly once. */
+    if (element.checked !== wanted) element.click();
+    return { matched: element.checked === wanted, actual: element.checked };
+  }
+  if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
+    const next = String(value ?? "");
+    setNative(element, next);
+    fire();
+    const hidden = element instanceof HTMLInputElement && sensitive(element);
+    return { matched: element.value === next, actual: hidden ? "[redacted]" : element.value.slice(0, 500) };
+  }
+  if (element instanceof HTMLSelectElement) {
+    const wanted = (Array.isArray(value) ? value : [value]).map(item => String(item ?? "").trim().toLowerCase());
+    const options = [...element.options];
+    const picks = wanted.map(item => options.find(option => option.value.toLowerCase() === item) ?? options.find(option => option.text.trim().toLowerCase() === item));
+    if (picks.some(pick => !pick)) return { missingOption: true, options: options.slice(0, 30).map(option => option.text.trim()).join(" | ") };
+    for (const option of options) option.selected = picks.includes(option);
+    if (!element.multiple && picks[0]) element.value = picks[0].value;
+    fire();
+    const actual = [...element.selectedOptions].map(option => option.text.trim());
+    return { matched: picks.every(pick => pick!.selected), actual: element.multiple ? actual : actual[0] };
+  }
+  if (element.isContentEditable) {
+    element.textContent = String(value ?? "");
+    element.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    return { matched: element.textContent === String(value ?? ""), actual: (element.textContent ?? "").slice(0, 500) };
+  }
+  return { unsupported: true };
+}
+
+/* A change counter for the page, installed once per document: settle and wait_for poll it. It also
+   keeps the text of notices the page announces (alerts, status toasts, dialogs), which is usually
+   how an app says whether an action worked. */
+function injectedMutationState(): { count: number; notices: string[] } {
+  const global = globalThis as typeof globalThis & { __browserConnectorMutations?: { count: number; notices: string[] } };
+  if (!global.__browserConnectorMutations) {
+    const state = { count: 0, notices: [] as string[] };
+    global.__browserConnectorMutations = state;
+    /* Polite live regions are often whole tables or panels; only alert-like roles carry a toast. */
+    const noticeSelector = "[role=alert],[role=status],[role=dialog],[role=alertdialog],[aria-live=assertive]";
+    new MutationObserver(records => {
+      state.count += records.length;
+      for (const record of records) for (const node of record.addedNodes) {
+        if (!(node instanceof HTMLElement)) continue;
+        const notice = node.matches(noticeSelector) ? node : node.closest(noticeSelector) ?? node.querySelector(noticeSelector);
+        const text = (notice as HTMLElement | null)?.innerText?.trim().replace(/\s+/g, " ").slice(0, 200);
+        if (text && text.length < 200 && !state.notices.includes(text)) state.notices = [...state.notices, text].slice(-5);
+      }
+    }).observe(document.documentElement, { subtree: true, childList: true, attributes: true, characterData: true });
+  }
+  return { count: global.__browserConnectorMutations.count, notices: global.__browserConnectorMutations.notices };
+}
+
+function injectedWaitCheck(text: string | null, textGone: string | null, selector: string | null): { text?: boolean; textGone?: boolean; selector?: boolean } {
+  const body = document.body?.innerText ?? "";
+  const visible = (element: Element | null) => {
+    if (!element) return false;
+    const rect = element.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0 && getComputedStyle(element).visibility !== "hidden";
+  };
+  let selectorOk: boolean | undefined;
+  if (selector !== null) { try { selectorOk = [...document.querySelectorAll(selector)].some(visible); } catch { selectorOk = false; } }
+  return {
+    ...(text !== null ? { text: body.includes(text) } : {}),
+    ...(textGone !== null ? { textGone: !body.includes(textGone) } : {}),
+    ...(selectorOk !== undefined ? { selector: selectorOk } : {})
+  };
 }
 
 function injectedUpload(pageRef: string, name: string, mimeType: string, dataBase64: string, generation: number): boolean {
@@ -1316,10 +1636,28 @@ export function connectorError(code: string, message: string, outcomeUnknown = f
   return Object.assign(new Error(message), { code, outcomeUnknown });
 }
 
-export function normalizeError(error: unknown): { code: string; message: string; outcomeUnknown: boolean } {
+/* What an agent should do next for each failure, so an error ends a guess instead of starting one. */
+export const ERROR_HINTS: Record<string, string> = {
+  stale_page_ref: "The page changed since that reference was read (navigation or re-render). Call find or read_page again and use the new reference.",
+  tab_not_controlled: "Use a tab id from tabs_context for this session, or open one with tabs_create.",
+  debugger_conflict: "DevTools or another debugger is attached to this tab. Ask the person to close DevTools there, or use another tab.",
+  navigation_timeout: "The page may still be loading. Call wait_for (text, urlContains or networkIdle) or read_page to see where it is before retrying; do not repeat the navigation blindly.",
+  click_intercepted: "Another element covers the target, often a dialog, overlay, toast or sticky header. Close or wait out the covering element (wait_for textGone), then click again.",
+  element_not_visible: "The element has no visible box. Open its container (tab, accordion, menu) or scroll to it first, then read the page again.",
+  element_disabled: "The control is disabled. Fill the required fields or finish the previous step first; read_page shows invalid fields.",
+  wait_timeout: "The condition did not hold in time. read_page or get_page_text shows what the page shows instead; increase timeoutMs only if the app is known to be slow.",
+  javascript_error: "Fix the script, or use find, form_input, wait_for or get_page_text when they can do the job.",
+  invalid_dimensions: "Use a preset (mobile, tablet, desktop) or a width between 320 and 7680 and a height between 240 and 4320.",
+  restricted_url: "Only http and https pages can be opened.",
+  invalid_arguments: "Check the tool's argument schema.",
+  value_not_applied: "The field did not keep the value, which usually means a script controls it. Try computer type with the same pageRef after clearing it (key cmd+a then Backspace)."
+};
+
+export function normalizeError(error: unknown): { code: string; message: string; outcomeUnknown: boolean; hint?: string } {
   if (error instanceof Error) {
     const typed = error as Error & { code?: string; outcomeUnknown?: boolean };
-    return { code: typed.code ?? "browser_error", message: error.message, outcomeUnknown: typed.outcomeUnknown ?? false };
+    const code = typed.code ?? "browser_error";
+    return { code, message: error.message, outcomeUnknown: typed.outcomeUnknown ?? false, ...(ERROR_HINTS[code] ? { hint: ERROR_HINTS[code] } : {}) };
   }
   return { code: "browser_error", message: String(error), outcomeUnknown: false };
 }

@@ -5,7 +5,8 @@ const READ_ONLY = new Set([
   "get_page_text",
   "find",
   "read_console_messages",
-  "read_network_requests"
+  "read_network_requests",
+  "wait_for"
 ]);
 
 const PROTECTED = new Set(["javascript_tool", "upload_file", "download_file"]);
@@ -112,6 +113,7 @@ export function hostPermissionPattern(origin: string): string {
    reset/verify/invite style segment, a JWT, or a long random string. UUIDs and slugs stay,
    because they are how an agent tells pages apart. */
 const TOKEN_PATH_PARENT = /^(reset|reset-password|verify|verification|confirm|invite|invitation|magic|magic-link|token|activate|unsubscribe|share|s)$/i;
+const SENSITIVE_QUERY_KEY = /token|secret|key|code|sig|auth|session|pass|pwd|otp|jwt|state|nonce|credential|email|phone|ticket|hash/i;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function secretPathSegment(segment: string, previous: string | undefined): boolean {
@@ -126,7 +128,11 @@ export function redactUrl(value: string): string {
     const url = new URL(value);
     url.username = "";
     url.password = "";
-    for (const key of [...url.searchParams.keys()]) url.searchParams.set(key, "[redacted]");
+    /* A value is kept only when neither its name nor its shape suggests a secret or personal data:
+       ?tab=transfers tells an agent where it is, ?token=… or a long opaque value does not. */
+    for (const [key, value] of [...url.searchParams.entries()]) {
+      if (SENSITIVE_QUERY_KEY.test(key) || value.length >= 24 || value.includes("@") || /^eyJ/.test(value)) url.searchParams.set(key, "[redacted]");
+    }
     const segments = url.pathname.split("/");
     url.pathname = segments.map((segment, index) => secretPathSegment(segment, segments[index - 1]) ? "[redacted]" : segment).join("/");
     url.hash = "";

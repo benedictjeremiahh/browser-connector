@@ -87,8 +87,9 @@ function harness(initialElements: MockElement[]) {
     webNavigation: { onCommitted: { addListener: (handler: (details: { tabId: number; frameId: number }) => void) => navigationListeners.push(handler) } },
     debugger: { onEvent: listener, onDetach: listener, attach: async () => {}, sendCommand: async () => ({}) },
     scripting: {
+      /* Chrome resolves an async injected function before returning its result. */
       executeScript: async (input: { func: (...args: unknown[]) => unknown; args: unknown[] }) => [
-        { result: input.func(...input.args) }
+        { result: await input.func(...(input.args ?? [])) }
       ]
     }
   });
