@@ -46,3 +46,11 @@ describe("connector policy", () => {
     expect(bounded).toMatchObject({ text: "abcd", truncated: true, originalBytes: 8 });
   });
 });
+
+describe("query redaction", () => {
+  it("matches key parts, so ordinary filters stay readable and short opaque tokens do not", () => {
+    expect(redactUrl("https://example.com/s?keyword=kaca&country_code=id&author=ana")).toContain("keyword=kaca");
+    expect(redactUrl("https://example.com/s?api_key=x1&sid=abc&invite=zz")).toBe("https://example.com/s?api_key=%5Bredacted%5D&sid=%5Bredacted%5D&invite=%5Bredacted%5D");
+    expect(redactUrl("https://example.com/l?r=ab12cd34ef56gh78")).toBe("https://example.com/l?r=%5Bredacted%5D");
+  });
+});

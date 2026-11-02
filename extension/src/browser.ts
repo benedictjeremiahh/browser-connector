@@ -11,6 +11,8 @@ import type { GroupColor } from "./naming";
 
 interface ConsoleRecord {
   timestamp: number;
+  /** When the extension received it, in Date.now() time; CDP timestamps use other clocks. */
+  seenAt?: number;
   level: string;
   text: string;
   url?: string;
@@ -26,6 +28,8 @@ interface NetworkRecord {
   mimeType?: string;
   /** Set when the response body finished or the request failed, so a request with neither is in flight. */
   done?: boolean;
+  /** When the extension received it, in Date.now() time; CDP timestamps are monotonic seconds. */
+  seenAt?: number;
   failed?: string;
 }
 
@@ -72,7 +76,7 @@ const CLICK_DWELL_MS = 200;
    in flight for this long, or the cap is reached. The result then says what happened, so an agent does
    not need a screenshot or a read just to learn whether its click did anything. */
 const SETTLE_QUIET_MS = 300;
-const SETTLE_MAX_MS = 3_000;
+const SETTLE_MAX_MS = 2_000;
 const WAIT_DEFAULT_MS = 10_000;
 const WAIT_MAX_MS = 30_000;
 const SCREENSHOT_LONG_EDGE = 1_600;
@@ -159,7 +163,7 @@ export class BrowserController {
   private async dispatchMethod(method: string, params: Record<string, unknown>, controlledTabIds: Set<number>, group: GroupDescriptor): Promise<unknown> {
     switch (method) {
       case "tabs_context": return this.tabsContext(controlledTabIds, params.createIfEmpty === true, group);
-      case "tabs_create": return this.tabsCreate(controlledTabIds, asOptionalString(params.url), group);
+      case "tabs_create": return this.tabsCreateSettled(controlledTabIds, params, group);
       case "tabs_activate": return this.tabsActivate(asTabId(params.tabId), controlledTabIds);
       case "tabs_close": return this.tabsClose(controlledTabIds, asTabId(params.tabId));
       case "navigate": return this.settled(asTabId(params.tabId), params, () => this.navigate(asTabId(params.tabId), asString(params.action), asOptionalString(params.url)));
@@ -185,12 +189,19 @@ export class BrowserController {
      changed, notices the page announced (alerts, toasts, dialogs), new console errors and failed
      requests. Pass settle: false to skip the wait. */
   private async settled(tabId: number, params: Record<string, unknown>, act: () => Promise<unknown>): Promise<unknown> {
+    // Results quote the page, so they carry the same untrusted mark as a page read.
     if (params.settle === false) return act();
     /* Network and console records exist only once the debugger is attached; settling never attaches
        it by itself, so an action that did not need the debugger still does not touch it. */
     const currentTab = async () => { try { return await chrome.tabs.get(tabId); } catch { return undefined; } };
-    const before = { url: (await currentTab())?.url, console: (this.consoleRecords.get(tabId) ?? []).length, network: (this.networkRecords.get(tabId) ?? []).length };
-    const noticesBefore = new Set((await this.mutationState(tabId)).notices);
+    /* By arrival time, not list position: the record lists are capped and drop their oldest entries. */
+    const before = { url: (await currentTab())?.url, at: Date.now() };
+    const since = <T extends { seenAt?: number }>(records: T[] | undefined) => (records ?? []).filter((record) => (record.seenAt ?? 0) >= before.at);
+    /* New means announced after the action and not already on screen before it: a banner the app
+       re-renders on every click is not news, while a toast shown again after the first one left is. */
+    const initial = await this.mutationState(tabId);
+    const noticesBefore = initial.sequence;
+    const shownBefore = new Set(initial.present);
     const result = await act();
     const started = Date.now();
     let lastCount = -1;
@@ -200,15 +211,15 @@ export class BrowserController {
     while (Date.now() - started < SETTLE_MAX_MS) {
       const state = await this.mutationState(tabId);
       if (state.count !== lastCount) { lastCount = state.count; lastChange = Date.now(); }
-      notices = state.notices.filter(notice => !noticesBefore.has(notice));
-      const pending = (this.networkRecords.get(tabId) ?? []).slice(before.network).filter((record) => !record.done && record.status === undefined).length;
+      notices = [...new Set(state.notices.filter(notice => notice.sequence > noticesBefore && !shownBefore.has(notice.text)).map(notice => notice.text))];
+      const pending = since(this.networkRecords.get(tabId)).filter((record) => !record.done && record.status === undefined).length;
       if (pending === 0 && Date.now() - lastChange >= SETTLE_QUIET_MS) { settled = true; break; }
       await sleep(100);
     }
     const tab = await currentTab();
     /* React and component libraries log deprecation warnings through console.error; they are not failures. */
-    const errors = (this.consoleRecords.get(tabId) ?? []).slice(before.console).filter((record) => record.level === "error" && !/^Warning: /.test(record.text)).slice(-3).map((record) => record.text.slice(0, 300));
-    const failed = (this.networkRecords.get(tabId) ?? []).slice(before.network).filter((record) => record.failed || (record.status ?? 0) >= 400).slice(-5)
+    const errors = since(this.consoleRecords.get(tabId)).filter((record) => record.level === "error" && !/^Warning: /.test(record.text)).slice(-3).map((record) => record.text.slice(0, 300));
+    const failed = since(this.networkRecords.get(tabId)).filter((record) => record.failed || (record.status ?? 0) >= 400).slice(-5)
       .map((record) => ({ method: record.method, url: record.url, ...(record.status ? { status: record.status } : {}), ...(record.failed ? { error: record.failed } : {}) }));
     return {
       ...(isRecord(result) ? result : { result }),
@@ -227,12 +238,17 @@ export class BrowserController {
   }
 
   /* The page's own change counter, installed on first use; a new document starts a new counter. */
-  private async mutationState(tabId: number): Promise<{ count: number; notices: string[] }> {
+  private async mutationState(tabId: number): Promise<{ count: number; sequence: number; notices: Array<{ sequence: number; text: string }>; present: string[] }> {
     try {
       const [result] = await chrome.scripting.executeScript({ target: { tabId }, func: injectedMutationState });
-      const value = result?.result;
-      return isRecord(value) && typeof value.count === "number" && Array.isArray(value.notices) ? { count: value.count, notices: value.notices.map(String) } : { count: 0, notices: [] };
-    } catch { return { count: -2, notices: [] }; }
+      const value = result?.result as unknown;
+      if (!isRecord(value) || typeof value.count !== "number" || !Array.isArray(value.notices)) return { count: 0, sequence: 0, notices: [], present: [] };
+      const notices = value.notices.filter(isRecord).map(notice => ({ sequence: Number(notice.sequence), text: String(notice.text) }));
+      return { count: value.count, sequence: Number(value.sequence ?? 0), notices, present: Array.isArray(value.present) ? value.present.map(String) : [] };
+    } catch {
+      /* Mid-navigation: count as a change, so the page is not called quiet while it loads. */
+      return { count: Date.now(), sequence: 0, notices: [], present: [] };
+    }
   }
 
   /* Waits until every given condition holds: text shown, text gone, a selector visible, the URL
@@ -261,16 +277,23 @@ export class BrowserController {
         if (selector && check.selector !== true) missing.push(`selector ${JSON.stringify(selector)}`);
       }
       if (networkIdle) {
-        const pending = (this.networkRecords.get(tabId) ?? []).filter((record) => !record.done && record.status === undefined && Date.now() - record.timestamp < WAIT_MAX_MS).length;
+        const pending = (this.networkRecords.get(tabId) ?? []).filter((record) => !record.done && record.status === undefined && Date.now() - (record.seenAt ?? 0) < WAIT_MAX_MS).length;
         if (pending > 0) idleSince = Date.now();
         if (Date.now() - idleSince < 500) missing.push("networkIdle");
       }
-      if (!missing.length) return { met: true, waitedMs: Date.now() - started, url: tab.url ? redactUrl(tab.url) : undefined, title: tab.title };
+      if (!missing.length) return { met: true, waitedMs: Date.now() - started, url: tab.url ? redactUrl(tab.url) : undefined, title: tab.title, untrusted: true };
       if (Date.now() - started >= timeout) {
         throw connectorError("wait_timeout", `After ${timeout} ms still waiting for: ${missing.join(", ")}. The tab is at ${tab.url ? redactUrl(tab.url) : "an unknown URL"} (${tab.title ?? "untitled"}).`);
       }
       await sleep(200);
     }
+  }
+
+  /* A new tab is a navigation too: a single-page app renders after load, so the tab is reported once it settles. */
+  private async tabsCreateSettled(controlledTabIds: Set<number>, params: Record<string, unknown>, group: GroupDescriptor): Promise<unknown> {
+    const created = await this.tabsCreate(controlledTabIds, asOptionalString(params.url), group);
+    if (params.settle === false || !isRecord(created) || typeof created.tabId !== "number" || !asOptionalString(params.url)) return created;
+    return this.settled(created.tabId, params, async () => created);
   }
 
   async describePageRef(tabId: number, pageRef: string): Promise<PageRefContext> {
@@ -463,7 +486,18 @@ export class BrowserController {
       func: injectedReadPage,
       args: [generation, maxBytes, offset, scopeRef ?? null, filter, viewportOnly]
     });
-    return result?.result ?? { nodes: [], truncated: false, originalBytes: 0 };
+    const page = result?.result as unknown;
+    if (!isRecord(page)) return { nodes: [], truncated: false, originalBytes: 0 };
+    /* Links can carry tokens in their path (/reset/<token>); they go through the same redaction as every URL. */
+    const origin = typeof page.url === "string" ? safeOrigin(page.url) : undefined;
+    if (typeof page.url === "string") page.url = redactUrl(page.url);
+    if (Array.isArray(page.nodes)) for (const node of page.nodes) {
+      if (!isRecord(node) || typeof node.href !== "string") continue;
+      const absolute = node.href.startsWith("/") && origin ? origin + node.href : node.href;
+      const redacted = redactUrl(absolute);
+      node.href = origin && redacted.startsWith(origin + "/") ? redacted.slice(origin.length) : redacted;
+    }
+    return page;
   }
 
   private async getPageText(tabId: number, requestedMax: unknown, cursor: unknown, scopeRef?: string): Promise<unknown> {
@@ -493,12 +527,15 @@ export class BrowserController {
       func: injectedFind,
       args: [generation, query, limit, offset]
     });
-    return { ...(result?.result as object ?? { matches: [], nextCursor: null }), untrusted: true };
+    const found = (result?.result as { matches?: unknown[] } | undefined) ?? { matches: [], nextCursor: null };
+    /* An empty result on a page that is still rendering looks the same as a real miss. */
+    const empty = !found.matches?.length;
+    return { ...found, untrusted: true, ...(empty ? { hint: "No match. If the page may still be rendering, wait_for a text you expect on it and search again; otherwise try another word from the label." } : {}) };
   }
 
   /* Writes through the element's native value setter, so frameworks that track the value (React)
      see the change, then reads it back: a value the page rejected is reported, not assumed. */
-  private async formInput(tabId: number, pageRef: string, value: unknown): Promise<{ pageRef: string; changed: boolean; matched: boolean; actual?: unknown }> {
+  private async formInput(tabId: number, pageRef: string, value: unknown): Promise<{ pageRef: string; changed: boolean; matched: boolean; actual?: unknown; untrusted?: boolean }> {
     const [result] = await chrome.scripting.executeScript({
       target: { tabId },
       func: injectedFormInput,
@@ -506,10 +543,11 @@ export class BrowserController {
     });
     const outcome = result?.result as unknown;
     if (outcome === false || outcome === null || outcome === undefined) throw connectorError("stale_page_ref", `Page Reference is stale: ${pageRef}`);
-    if (isRecord(outcome) && outcome.unsupported === true) throw connectorError("invalid_arguments", `${pageRef} is not an input, textarea, select or editable element`);
+    if (isRecord(outcome) && outcome.unsupported === true) throw connectorError("invalid_arguments", `${pageRef} is not a text input, textarea, select or editable element. A custom select (role combobox) is used by clicking it, then clicking the option found with find; a file input uses upload_file.`);
+    if (isRecord(outcome) && typeof outcome.refused === "string") throw connectorError("element_disabled", `${pageRef} is ${outcome.refused}`);
     if (isRecord(outcome) && outcome.missingOption === true) throw connectorError("invalid_arguments", `No option of ${pageRef} matches ${JSON.stringify(value)} by value or label. Options: ${String(outcome.options ?? "")}`);
     const matched = isRecord(outcome) ? outcome.matched !== false : true;
-    return { pageRef, changed: true, matched, ...(isRecord(outcome) && "actual" in outcome ? { actual: outcome.actual } : {}), ...(matched ? {} : { hint: ERROR_HINTS.value_not_applied }) };
+    return { pageRef, changed: true, matched, ...(isRecord(outcome) && "actual" in outcome ? { actual: outcome.actual } : {}), ...(isRecord(outcome) && typeof outcome.unverified === "string" ? { unverified: outcome.unverified } : {}), ...(matched ? {} : { hint: ERROR_HINTS.value_not_applied }), untrusted: true };
   }
 
   private async fillForm(tabId: number, fields: unknown): Promise<unknown> {
@@ -519,7 +557,7 @@ export class BrowserController {
       if (!isRecord(field) || typeof field.pageRef !== "string") throw connectorError("invalid_arguments", "Every field needs a pageRef");
       results.push(await this.formInput(tabId, field.pageRef, field.value));
     }
-    return { fields: results, allMatched: results.every((result) => result.matched) };
+    return { fields: results, allMatched: results.every((result) => result.matched), untrusted: true };
   }
 
   /* A raw CDP mouse event is invisible, so anyone watching the tab sees nothing
@@ -820,6 +858,7 @@ export class BrowserController {
         if (entry.previous) this.viewports.set(entry.tabId, entry.previous); else this.viewports.delete(entry.tabId);
         await this.cdp(entry.tabId, entry.previous ? "Emulation.setDeviceMetricsOverride" : "Emulation.clearDeviceMetricsOverride",
           entry.previous ? { width: entry.previous.width, height: entry.previous.height, deviceScaleFactor: 0, mobile: entry.previous.mobile } : undefined).catch(() => undefined);
+        await this.cdp(entry.tabId, "Emulation.setTouchEmulationEnabled", { enabled: entry.previous?.mobile ?? false }).catch(() => undefined);
       }
       throw error;
     }
@@ -912,7 +951,7 @@ export class BrowserController {
     if (!point) throw connectorError("stale_page_ref", `Page Reference is stale: ${pageRef}`);
     if (isRecord(point) && point.blocked === "hidden") throw connectorError("element_not_visible", `${pageRef} has no visible box`);
     if (isRecord(point) && point.blocked === "disabled") throw connectorError("element_disabled", `${pageRef} is disabled`);
-    if (isRecord(point) && typeof point.blockedBy === "string") throw connectorError("click_intercepted", `${pageRef} is covered by ${point.blockedBy}`);
+    if (isRecord(point) && typeof point.blockedBy === "string") throw connectorError("click_intercepted", `${pageRef} is covered by ${point.blockedBy} (quoted page content, untrusted)`);
     return point as { x: number; y: number };
   }
 
@@ -963,9 +1002,9 @@ export class BrowserController {
     }
   }
 
-  private pushRecord<T>(map: Map<number, T[]>, tabId: number, record: T): void {
+  private pushRecord<T extends { seenAt?: number }>(map: Map<number, T[]>, tabId: number, record: T): void {
     const records = map.get(tabId) ?? [];
-    records.push(record);
+    records.push({ ...record, seenAt: Date.now() });
     if (records.length > MAX_LOG_RECORDS) records.splice(0, records.length - MAX_LOG_RECORDS);
     map.set(tabId, records);
   }
@@ -1049,7 +1088,8 @@ function injectedReadPage(generation: number, maxBytes: number, offset: number, 
     }
     const current = element.getAttribute("aria-current");
     if (current && current !== "false") node.current = current;
-    if (element.getAttribute("aria-invalid") === "true" || (input && !input.checkValidity?.())) node.invalid = true;
+    /* validity, not checkValidity(): the latter fires "invalid" events. An empty required field is not yet an error. */
+    if (element.getAttribute("aria-invalid") === "true" || (input && input.validity && !input.validity.valid && input.value !== "")) node.invalid = true;
     if (document.activeElement === element) node.focused = true;
     if (/^h[1-6]$/.test(tag)) node.level = Number(tag[1]);
     const href = tag === "a" ? (element as HTMLAnchorElement).href : undefined;
@@ -1092,7 +1132,8 @@ function injectedGetPageText(scopeRef: string | null, generation: number): { tex
     if (!root?.isConnected) return { text: "", scopeRef, staleScopeRef: true };
     return { text: root.innerText ?? root.textContent ?? "", scopeRef };
   }
-  const root = document.querySelector("main,article,[role=main]") ?? document.body;
+  /* main first: a dashboard of several article cards has no single article that is the page. */
+  const root = document.querySelector("main,[role=main]") ?? document.body;
   return { text: (root as HTMLElement).innerText ?? root.textContent ?? "" };
 }
 
@@ -1128,9 +1169,20 @@ function injectedFind(generation: number, query: string, limit: number, offset: 
   }
   /* Every ancestor of a match also contains its text; only the innermost matches name the thing
      asked for. Controls come first, since they are what an agent acts on. */
-  const innermost = hits.filter(element => !hits.some(other => other !== element && element.contains(other)));
   const interactive = (element: HTMLElement) => /^(a|button|input|select|textarea|summary|label)$/i.test(element.tagName) || !!element.getAttribute("role") || element.hasAttribute?.("tabindex");
-  const ranked = [...innermost.filter(interactive), ...innermost.filter(element => !interactive(element))];
+  /* A button's text sits in a span inside it; the control is what an agent acts on, so a match is
+     lifted to its nearest interactive ancestor, and duplicates collapse. */
+  const lift = (element: HTMLElement) => (element.closest?.("a,button,input,select,textarea,summary,label,[role],[tabindex]") as HTMLElement | null) ?? element;
+  const innermost = [...new Set(hits.filter(element => !hits.some(other => other !== element && element.contains(other))).map(lift))];
+  /* Exact names first, then names that start with the query, then any that contain it; within each,
+     controls before other elements. "Keluar" should find the menu item, not "Laporan barang keluar". */
+  const closeness = (element: HTMLElement) => {
+    const name = ownText(element).trim().replace(/\s+/g, " ").toLowerCase();
+    const label = (element.getAttribute("aria-label") ?? element.innerText ?? "").trim().toLowerCase();
+    return name === needle || label === needle ? 0 : name.startsWith(needle) || label.startsWith(needle) ? 1 : 2;
+  };
+  const ranked = innermost.map((element, index) => ({ element, index, rank: closeness(element) * 2 + (interactive(element) ? 0 : 1) }))
+    .sort((left, right) => left.rank - right.rank || left.index - right.index).map(entry => entry.element);
   const page = ranked.slice(offset, offset + limit);
   const matches = page.map(element => ({
     ref: refFor(element),
@@ -1186,8 +1238,10 @@ async function injectedRefPoint(pageRef: string, generation: number, hitTest = f
   const rect = element.getBoundingClientRect();
   const centre = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
   if (!hitTest) return centre;
-  if (rect.width === 0 || rect.height === 0 || getComputedStyle(element).visibility === "hidden") return { blocked: "hidden" };
-  if ((element as HTMLButtonElement).disabled === true || element.getAttribute("aria-disabled") === "true") return { blocked: "disabled" };
+  if ((rect.width === 0 || rect.height === 0 || getComputedStyle(element).visibility === "hidden") && !(element as HTMLInputElement).labels?.length) return { blocked: "hidden" };
+  if ((element as HTMLButtonElement).disabled === true || element.matches?.(":disabled") || element.getAttribute("aria-disabled") === "true") return { blocked: "disabled" };
+  /* A visually hidden checkbox or switch is clicked through its label. */
+  const labels = [...((element as HTMLInputElement).labels ?? [])];
   if (typeof document.elementFromPoint !== "function") return centre;
   /* The centre first; a wide wrapper's centre can be a gap, so a few inner points next. */
   const insetX = Math.min(12, rect.width / 4); const insetY = Math.min(8, rect.height / 4);
@@ -1195,7 +1249,7 @@ async function injectedRefPoint(pageRef: string, generation: number, hitTest = f
   let blocker: Element | null = null;
   for (const point of points) {
     const hit = document.elementFromPoint(point.x, point.y);
-    if (hit && (hit === element || element.contains(hit))) return point;
+    if (hit && (hit === element || element.contains(hit) || labels.some(label => label === hit || label.contains(hit)))) return point;
     blocker ??= hit;
   }
   if (!blocker) return centre;
@@ -1216,7 +1270,7 @@ function injectedFocusRef(pageRef: string, generation: number): boolean {
   return document.activeElement === element;
 }
 
-function injectedFormInput(pageRef: string, value: unknown, generation: number): false | { unsupported: true } | { missingOption: true; options: string } | { matched: boolean; actual: unknown } {
+function injectedFormInput(pageRef: string, value: unknown, generation: number): false | { unsupported: true } | { refused: string } | { missingOption: true; options: string } | { matched: boolean; actual: unknown; unverified?: string } {
   const global = globalThis as typeof globalThis & {
     __browserConnectorPageRefState?: { document: Document; generation: number; refs: WeakMap<Element, string>; next: number };
   };
@@ -1239,6 +1293,11 @@ function injectedFormInput(pageRef: string, value: unknown, generation: number):
   const sensitive = (target: HTMLInputElement) => target.type === "password"
     || /^(cc-|current-password|new-password|one-time-code)/.test(target.autocomplete ?? "")
     || /pass|secret|token|otp|cvv|cvc|card.?num|api.?key|pin$/i.test(`${target.name} ${target.id}`);
+  if ((element as HTMLInputElement).disabled || element.matches?.(":disabled")) return { refused: "disabled" };
+  if ((element as HTMLInputElement).readOnly) return { refused: "read-only" };
+  if (element instanceof HTMLInputElement && element.type === "file") return { unsupported: true };
+  /* Focus first and blur after, as typing would: some forms validate on blur. */
+  element.focus?.();
   if (element instanceof HTMLInputElement && (element.type === "checkbox" || element.type === "radio")) {
     const wanted = Boolean(value);
     /* A click, not an assignment: it is the event a framework listens to, and it toggles exactly once. */
@@ -1249,6 +1308,7 @@ function injectedFormInput(pageRef: string, value: unknown, generation: number):
     const next = String(value ?? "");
     setNative(element, next);
     fire();
+    element.blur?.();
     const hidden = element instanceof HTMLInputElement && sensitive(element);
     return { matched: element.value === next, actual: hidden ? "[redacted]" : element.value.slice(0, 500) };
   }
@@ -1266,7 +1326,8 @@ function injectedFormInput(pageRef: string, value: unknown, generation: number):
   if (element.isContentEditable) {
     element.textContent = String(value ?? "");
     element.dispatchEvent(new InputEvent("input", { bubbles: true }));
-    return { matched: element.textContent === String(value ?? ""), actual: (element.textContent ?? "").slice(0, 500) };
+    /* Rich editors (Slate, Lexical, Draft) keep their own model and may ignore this; say so. */
+    return { matched: element.textContent === String(value ?? ""), actual: (element.textContent ?? "").slice(0, 500), unverified: "A rich-text editor may ignore a direct write; check the page or use computer type." };
   }
   return { unsupported: true };
 }
@@ -1274,28 +1335,42 @@ function injectedFormInput(pageRef: string, value: unknown, generation: number):
 /* A change counter for the page, installed once per document: settle and wait_for poll it. It also
    keeps the text of notices the page announces (alerts, status toasts, dialogs), which is usually
    how an app says whether an action worked. */
-function injectedMutationState(): { count: number; notices: string[] } {
-  const global = globalThis as typeof globalThis & { __browserConnectorMutations?: { count: number; notices: string[] } };
+function injectedMutationState(): { count: number; sequence: number; notices: Array<{ sequence: number; text: string }>; present: string[] } {
+  type State = { count: number; sequence: number; notices: Array<{ sequence: number; text: string }> };
+  const global = globalThis as typeof globalThis & { __browserConnectorMutations?: State };
   if (!global.__browserConnectorMutations) {
-    const state = { count: 0, notices: [] as string[] };
+    const state: State = { count: 0, sequence: 0, notices: [] };
     global.__browserConnectorMutations = state;
     /* Polite live regions are often whole tables or panels; only alert-like roles carry a toast. */
     const noticeSelector = "[role=alert],[role=status],[role=dialog],[role=alertdialog],[aria-live=assertive]";
+    /* Each announcement gets a sequence number, so the same "Tersimpan" shown twice is reported twice. */
+    const note = (element: Element | null) => {
+      const text = (element as HTMLElement | null)?.innerText?.trim().replace(/\s+/g, " ").slice(0, 200);
+      if (!text || text.length >= 200) return;
+      state.sequence += 1;
+      state.notices = [...state.notices, { sequence: state.sequence, text }].slice(-10);
+    };
     new MutationObserver(records => {
       state.count += records.length;
-      for (const record of records) for (const node of record.addedNodes) {
-        if (!(node instanceof HTMLElement)) continue;
-        const notice = node.matches(noticeSelector) ? node : node.closest(noticeSelector) ?? node.querySelector(noticeSelector);
-        const text = (notice as HTMLElement | null)?.innerText?.trim().replace(/\s+/g, " ").slice(0, 200);
-        if (text && text.length < 200 && !state.notices.includes(text)) state.notices = [...state.notices, text].slice(-5);
+      for (const record of records) {
+        if (record.type === "characterData") { note(record.target.parentElement?.closest(noticeSelector) ?? null); continue; }
+        for (const node of record.addedNodes) {
+          if (node instanceof HTMLElement) note(node.matches(noticeSelector) ? node : node.closest(noticeSelector) ?? node.querySelector(noticeSelector));
+          else if (node.nodeType === 3) note(node.parentElement?.closest(noticeSelector) ?? null);
+        }
       }
-    }).observe(document.documentElement, { subtree: true, childList: true, attributes: true, characterData: true });
+    /* Only attributes that mean a state change: style churn from animations would keep the page "busy". */
+    }).observe(document.documentElement, { subtree: true, childList: true, characterData: true, attributes: true, attributeFilter: ["class", "hidden", "disabled", "open", "aria-selected", "aria-expanded", "aria-checked", "aria-hidden", "aria-busy"] });
   }
-  return { count: global.__browserConnectorMutations.count, notices: global.__browserConnectorMutations.notices };
+  const state = global.__browserConnectorMutations;
+  const present = [...document.querySelectorAll("[role=alert],[role=status],[role=dialog],[role=alertdialog],[aria-live=assertive]")]
+    .map(element => (element as HTMLElement).innerText?.trim().replace(/\s+/g, " ").slice(0, 200)).filter((text): text is string => !!text);
+  return { count: state.count, sequence: state.sequence, notices: state.notices, present };
 }
 
 function injectedWaitCheck(text: string | null, textGone: string | null, selector: string | null): { text?: boolean; textGone?: boolean; selector?: boolean } {
-  const body = document.body?.innerText ?? "";
+  /* Case-insensitive, over both rendered and raw text: CSS text-transform changes innerText. */
+  const body = `${document.body?.innerText ?? ""}\n${document.body?.textContent ?? ""}`.toLowerCase();
   const visible = (element: Element | null) => {
     if (!element) return false;
     const rect = element.getBoundingClientRect();
@@ -1304,8 +1379,8 @@ function injectedWaitCheck(text: string | null, textGone: string | null, selecto
   let selectorOk: boolean | undefined;
   if (selector !== null) { try { selectorOk = [...document.querySelectorAll(selector)].some(visible); } catch { selectorOk = false; } }
   return {
-    ...(text !== null ? { text: body.includes(text) } : {}),
-    ...(textGone !== null ? { textGone: !body.includes(textGone) } : {}),
+    ...(text !== null ? { text: body.includes(text.toLowerCase()) } : {}),
+    ...(textGone !== null ? { textGone: !body.includes(textGone.toLowerCase()) } : {}),
     ...(selectorOk !== undefined ? { selector: selectorOk } : {})
   };
 }
@@ -1660,4 +1735,8 @@ export function normalizeError(error: unknown): { code: string; message: string;
     return { code, message: error.message, outcomeUnknown: typed.outcomeUnknown ?? false, ...(ERROR_HINTS[code] ? { hint: ERROR_HINTS[code] } : {}) };
   }
   return { code: "browser_error", message: String(error), outcomeUnknown: false };
+}
+
+function safeOrigin(url: string): string | undefined {
+  try { return new URL(url).origin; } catch { return undefined; }
 }

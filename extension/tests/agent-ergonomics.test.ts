@@ -188,3 +188,41 @@ describe("find", () => {
     expect(found.matches[0]!.name).toBe("Masuk");
   });
 });
+
+describe("re-audit fixes", () => {
+  it("find lifts a match inside a button to the button itself", async () => {
+    const button = new FakeElement("Simpan", "BUTTON");
+    const span = new FakeElement("Simpan", "SPAN");
+    (span as unknown as { closest: () => FakeElement }).closest = () => button;
+    button.contains = (element: unknown) => element === button || element === span;
+    const h = harness([button, span]);
+    const found = await h.controller.dispatch("find", { tabId: 7, query: "simpan" }, new Set([7])) as { matches: Array<{ role: string }> };
+    expect(found.matches.map(match => match.role)).toEqual(["button"]);
+  });
+
+  it("read_page redacts tokens in link paths and the page URL", async () => {
+    const link = new FakeElement("Reset", "A");
+    (link as unknown as { href: string }).href = "http://localhost:5180/reset/abcdefghijklmnop1234";
+    const h = harness([link]);
+    const page = await h.controller.dispatch("read_page", { tabId: 7 }, new Set([7])) as { nodes: Array<{ href?: string }> };
+    expect(page.nodes[0]!.href).toBe("/reset/[redacted]");
+  });
+
+  it("form_input refuses a disabled or read-only field instead of writing it", async () => {
+    const field = new ControlledInput();
+    (field as unknown as { disabled: boolean }).disabled = true;
+    const h = harness([field]);
+    const [node] = (await h.controller.dispatch("read_page", { tabId: 7 }, new Set([7])) as { nodes: Array<{ ref: string }> }).nodes;
+    await expect(h.controller.dispatch("form_input", { tabId: 7, pageRef: node!.ref, value: "x", settle: false }, new Set([7]))).rejects.toMatchObject({ code: "element_disabled" });
+  });
+});
+
+describe("find ranking", () => {
+  it("puts an exact name before a longer one that only contains the query", async () => {
+    const report = new FakeElement("Laporan barang keluar", "A");
+    const logout = new FakeElement("Keluar", "DIV", { role: "menuitem" });
+    const h = harness([report, logout]);
+    const found = await h.controller.dispatch("find", { tabId: 7, query: "Keluar" }, new Set([7])) as { matches: Array<{ name: string }> };
+    expect(found.matches.map(match => match.name)).toEqual(["Keluar", "Laporan barang keluar"]);
+  });
+});
