@@ -1,8 +1,8 @@
-import { BrowserController, connectorError, normalizeError } from "./browser";
-import { adoptableTabs, type AgentTabRecords } from "./adoption";
+import { BrowserController, connectorError, normalizeError, type GroupDescriptor } from "./browser";
+import { RELEASED_TAB_TTL_MS, adoptableTabs, releasedTabsToClose, reusableReleasedTab, type AgentTabRecords } from "./adoption";
 import { groupColor, sessionGroupLabel } from "./naming";
 import { SessionEndings, isSessionEnded } from "./session-endings";
-import { classifyRequest, exactOrigin, hostPermissionPattern } from "./policy";
+import { classifyRequest, exactOrigin, hostPermissionPattern, redactUrl, sameNavigationTarget } from "./policy";
 import {
   DEFAULT_STATE,
   type ApprovalRequest,
@@ -30,6 +30,10 @@ chrome.runtime.onInstalled.addListener(() => {
 });
 
 chrome.runtime.onStartup.addListener(() => void connectNative());
+/* Released agent tabs are swept on a timer the browser keeps, since the worker itself may sleep. */
+const SWEEP_ALARM = "released-agent-tabs";
+void chrome.alarms?.create(SWEEP_ALARM, { periodInMinutes: 1 });
+chrome.alarms?.onAlarm.addListener((alarm) => { if (alarm.name === SWEEP_ALARM) void sweepReleasedTabs(); });
 chrome.tabs.onRemoved.addListener((tabId) => void removeControlledTab(tabId));
 chrome.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) => {
   void handlePanelMessage(message).then(sendResponse, (error) => sendResponse({ ok: false, error: String(error) }));
@@ -79,6 +83,7 @@ const sessionEndings = new SessionEndings(async (sessionId) => {
   /* An ordinary end is not a revoked lease, so unlike releaseSession it records no denial. */
   await chrome.storage.session.remove(SESSION_PREFIX + sessionId);
   await browser.detachTabs(session.controlledTabIds);
+  await markReleased(session.controlledTabIds);
   await broadcastState();
 });
 
@@ -100,7 +105,8 @@ async function handleNativeRequest(request: NativeRequest, port: chrome.runtime.
     };
     const result = request.method === "label_session"
       ? await labelSession(request, session, controlled)
-      : await browser.dispatch(request.method, request.params, controlled, group);
+      : (request.method === "tabs_create" && await takeReleasedTab(request, session, controlled, group))
+        || await browser.dispatch(request.method, request.params, controlled, group);
     if (request.method === "tabs_create") await recordAgentTab(result, session);
     await saveControlledTabs(request.sessionId, controlled);
     response = { kind: "response", id: request.id, result };
@@ -333,6 +339,7 @@ async function auditLease(hostId: string | undefined, message: string): Promise<
 async function releaseSession(session: SessionState, message: string): Promise<void> {
   if (session.sessionId) await chrome.storage.session.remove(SESSION_PREFIX + session.sessionId);
   await browser.detachTabs(session.controlledTabIds);
+  await markReleased(session.controlledTabIds);
   await auditLease(session.leaseHostId, message);
 }
 
@@ -419,7 +426,7 @@ async function labelSession(request: NativeRequest, session: SessionState, contr
   const liveControlled = new Set([...(await allSessions()).values()].flatMap((other) => other.sessionId === request.sessionId ? [] : other.controlledTabIds));
   const openTabs = new Set((await chrome.tabs.query({})).flatMap((tab) => tab.id === undefined ? [] : [tab.id]));
   const adopted = adoptableTabs(records, session, liveControlled, openTabs).filter((tabId) => !controlled.has(tabId));
-  for (const tabId of adopted) controlled.add(tabId);
+  for (const tabId of adopted) { controlled.add(tabId); delete records[tabId]!.releasedAt; }
   await chrome.storage.session.set({ [AGENT_TABS_KEY]: records });
   const group = { key: request.sessionId, label: sessionGroupLabel(session), color: groupColor(session.leaseHostId) };
   if (adopted.length) await browser.adoptGroup(group, adopted);
@@ -430,6 +437,54 @@ async function labelSession(request: NativeRequest, session: SessionState, contr
 }
 
 const AGENT_TABS_KEY = "agentTabs";
+
+async function markReleased(tabIds: number[]): Promise<void> {
+  const records = await agentTabRecords();
+  let changed = false;
+  for (const tabId of tabIds) if (records[tabId]) { records[tabId]!.releasedAt = Date.now(); changed = true; }
+  if (changed) await chrome.storage.session.set({ [AGENT_TABS_KEY]: records });
+}
+
+async function liveControlledTabs(exceptSessionId?: string): Promise<Set<number>> {
+  return new Set([...(await allSessions()).values()].flatMap((other) => other.sessionId === exceptSessionId ? [] : other.controlledTabIds));
+}
+
+/* tabs_create for a URL a released tab of the same Agent Host already shows takes that tab into this
+   session instead of opening another copy (ADR-0027). */
+async function takeReleasedTab(request: NativeRequest, session: SessionState, controlled: Set<number>, group: GroupDescriptor): Promise<unknown> {
+  const url = typeof request.params.url === "string" ? request.params.url : undefined;
+  if (!url) return undefined;
+  const records = await agentTabRecords();
+  const open = (await chrome.tabs.query({})).flatMap((tab) => tab.id === undefined ? [] : [{ id: tab.id, url: tab.url }]);
+  const tabId = reusableReleasedTab(records, session.leaseHostId, await liveControlledTabs(request.sessionId), open, (tabUrl) => sameNavigationTarget(tabUrl, url));
+  if (tabId === undefined) return undefined;
+  controlled.add(tabId);
+  delete records[tabId]!.releasedAt;
+  if (session.label) records[tabId]!.label = session.label;
+  await chrome.storage.session.set({ [AGENT_TABS_KEY]: records });
+  await browser.adoptGroup(group, [tabId]);
+  const tab = await chrome.tabs.get(tabId);
+  return { tabId, windowId: tab.windowId, url: tab.url ? redactUrl(tab.url) : undefined, reused: true, adopted: true };
+}
+
+async function sweepReleasedTabs(): Promise<void> {
+  const records = await agentTabRecords();
+  if (!Object.values(records).some((record) => record.releasedAt !== undefined && Date.now() - record.releasedAt >= RELEASED_TAB_TTL_MS)) return;
+  const focused = new Set((await chrome.windows.getAll()).filter((window) => window.focused).flatMap((window) => window.id === undefined ? [] : [window.id]));
+  const open = (await chrome.tabs.query({})).flatMap((tab) => tab.id === undefined ? [] : [{
+    id: tab.id,
+    grouped: tab.groupId !== undefined && tab.groupId !== -1,
+    inView: tab.active === true && focused.has(tab.windowId)
+  }]);
+  for (const tabId of releasedTabsToClose(records, Date.now(), await liveControlledTabs(), open)) {
+    await chrome.tabs.remove(tabId).catch(() => undefined);
+    delete records[tabId];
+  }
+  /* Records of tabs that are gone are dropped with them. */
+  const openIds = new Set(open.map((tab) => tab.id));
+  for (const key of Object.keys(records)) if (!openIds.has(Number(key))) delete records[key];
+  await chrome.storage.session.set({ [AGENT_TABS_KEY]: records });
+}
 
 async function agentTabRecords(): Promise<AgentTabRecords> {
   const stored = (await chrome.storage.session.get(AGENT_TABS_KEY))[AGENT_TABS_KEY];

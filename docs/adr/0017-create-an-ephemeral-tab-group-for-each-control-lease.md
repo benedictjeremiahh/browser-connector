@@ -5,3 +5,5 @@ At session startup the agent must fetch current tab context, then by default cre
 ## Consequences
 
 Agent-created tabs automatically join the lease group. Ending or losing the lease removes connector authority but does not close tabs, preserving user work and making disconnect recovery non-destructive.
+
+Revised by ADR-0027: tabs the agent itself opened are closed ten minutes after their session ends, unless taken again or kept by the person.
