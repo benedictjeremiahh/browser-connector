@@ -101,7 +101,7 @@ const VIEWPORT_PRESETS: Record<string, { width: number; height: number }> = {
 /* Intermediate mouseMoved events: HTML5 drag-and-drop and sortable lists ignore a
    press and release with nothing in between. */
 const DRAG_STEPS = 8;
-const SETTLING_ACTIONS = new Set(["click", "double_click", "right_click", "middle_click", "type", "key"]);
+const SETTLING_ACTIONS = new Set(["click", "double_click", "right_click", "middle_click", "type", "key", "drag"]);
 
 /* The mark drawn where the agent is about to act. One string so the injected
    script stays a single Runtime.evaluate call.
@@ -138,6 +138,8 @@ export class BrowserController {
   /* A requested viewport survives a debugger re-attach; it ends with the tab or its lease. */
   private viewports = new Map<number, { width: number; height: number; mobile: boolean }>();
   private documentGenerations = new Map<number, number>();
+  /* A blocking JavaScript dialog, reported by Page.javascriptDialogOpening. */
+  private dialogs = new Map<number, { type: string; message: string }>();
   private consoleRecords = new Map<number, ConsoleRecord[]>();
   private networkRecords = new Map<number, NetworkRecord[]>();
   /* Keyed by the session, not by the title: an agent may rename its session at any time, and
@@ -212,6 +214,7 @@ export class BrowserController {
     if (params.settle === false) return act();
     /* Network and console records exist only once the debugger is attached; settling never attaches
        it by itself, so an action that did not need the debugger still does not touch it. */
+    this.throwIfDialogOpen(tabId);
     const currentTab = async () => { try { return await chrome.tabs.get(tabId); } catch { return undefined; } };
     /* By arrival time, not list position: the record lists are capped and drop their oldest entries. */
     const before = { url: (await currentTab())?.url, at: Date.now() };
@@ -238,6 +241,8 @@ export class BrowserController {
     let settled = false;
     let notices: string[] = [];
     while (Date.now() - started < SETTLE_MAX_MS) {
+      /* A dialog stops the renderer, so the page will never look quiet again. */
+      if (this.dialogs.has(tabId)) break;
       const state = await this.mutationState(tabId);
       if (state.count !== lastCount) { lastCount = state.count; lastChange = Date.now(); }
       notices = [...new Set(state.notices.filter(notice => notice.sequence > noticesBefore && !shownBefore.has(notice.text)).map(notice => notice.text))];
@@ -265,6 +270,7 @@ export class BrowserController {
         settled,
         waitedMs: Date.now() - started,
         monitoring: { console: monitored, network: monitored },
+        ...(this.dialogs.has(tabId) ? { dialog: this.dialogs.get(tabId), hint: "A JavaScript dialog is blocking the page. The person must dismiss it; the connector does not click dialogs." } : {}),
         ...(changeCount !== undefined ? { changeCount } : {}),
         ...(isRecord(focus) ? { focus } : {}),
         ...(opened.length ? { openedTabs: opened.slice(0, 5), hint: "The page opened a new tab. Call tabs_create with its URL to control it; it stays outside this session until you do." } : {}),
@@ -293,6 +299,7 @@ export class BrowserController {
   /* Waits until every given condition holds: text shown, text gone, a selector visible, the URL
      containing a string, or the network idle. On timeout the error says what still did not hold. */
   private async waitFor(tabId: number, params: Record<string, unknown>): Promise<unknown> {
+    this.throwIfDialogOpen(tabId);
     const text = asOptionalString(params.text);
     const textGone = asOptionalString(params.textGone);
     const selector = asOptionalString(params.selector);
@@ -338,6 +345,7 @@ export class BrowserController {
      the page; the URL and the title are checked here against the redacted values the agent already
      sees, so an expectation cannot be used to guess a part of a URL that was redacted. */
   private async assertExpectations(tabId: number, params: Record<string, unknown>): Promise<unknown> {
+    this.throwIfDialogOpen(tabId);
     const expectations = parseExpectations(params.expect);
     const timeout = params.timeoutMs === undefined || params.timeoutMs === null ? 0 : Math.min(Math.max(0, Math.floor(asNumber(params.timeoutMs))), ASSERT_MAX_MS);
     const started = Date.now();
@@ -428,6 +436,7 @@ export class BrowserController {
       try { await chrome.debugger.detach({ tabId }); } catch { /* already detached */ }
       this.attachedTabs.delete(tabId);
       this.viewports.delete(tabId);
+      this.dialogs.delete(tabId);
     }));
   }
 
@@ -644,6 +653,7 @@ export class BrowserController {
   }
 
   private async navigate(tabId: number, action: string, url?: string): Promise<unknown> {
+    this.throwIfDialogOpen(tabId);
     if (action === "go_to") {
       if (!url || isRestrictedUrl(url)) throw connectorError("restricted_url", `Cannot navigate to ${url ?? "an empty URL"}`);
       await waitForNavigationComplete(tabId, () => chrome.tabs.update(tabId, { url }));
@@ -671,6 +681,7 @@ export class BrowserController {
   }
 
   private async readPage(tabId: number, requestedMax: unknown, cursor: unknown, scopeRef: string | undefined, filter: "interactive" | "all", viewportOnly: boolean, diffFrom?: string): Promise<unknown> {
+    this.throwIfDialogOpen(tabId);
     const maxBytes = clampLimit(requestedMax, 65_536, 65_536);
     const offset = cursorOffset(cursor);
     const generation = this.documentGenerations.get(tabId) ?? 1;
@@ -705,6 +716,7 @@ export class BrowserController {
   }
 
   private async getPageText(tabId: number, requestedMax: unknown, cursor: unknown, scopeRef?: string): Promise<unknown> {
+    this.throwIfDialogOpen(tabId);
     const maxBytes = clampLimit(requestedMax, 65_536, 65_536);
     const generation = this.documentGenerations.get(tabId) ?? 1;
     const payload = await this.runInPage(tabId, injectedGetPageText, [scopeRef ?? null, generation]);
@@ -722,6 +734,7 @@ export class BrowserController {
   }
 
   private async find(tabId: number, query: string, requestedLimit: unknown, cursor: unknown): Promise<unknown> {
+    this.throwIfDialogOpen(tabId);
     const limit = clampLimit(requestedLimit, 20, 50);
     const offset = cursorOffset(cursor);
     const generation = this.documentGenerations.get(tabId) ?? 1;
@@ -735,6 +748,7 @@ export class BrowserController {
   /* Writes through the element's native value setter, so frameworks that track the value (React)
      see the change, then reads it back: a value the page rejected is reported, not assumed. */
   private async formInput(tabId: number, pageRef: string, value: unknown): Promise<{ pageRef: string; changed: boolean; matched: boolean; actual?: unknown; before?: unknown; untrusted?: boolean }> {
+    this.throwIfDialogOpen(tabId);
     const outcome = await this.runInPage(tabId, injectedFormInput, [pageRef, value, this.documentGenerations.get(tabId) ?? 1]);
     if (outcome === false || outcome === null || outcome === undefined) throw await this.staleRefError(tabId, pageRef);
     if (isRecord(outcome) && outcome.unsupported === true) throw connectorError("invalid_arguments", `${pageRef} is not a text input, textarea, select or editable element. A custom select (role combobox) is used by clicking it, then clicking the option found with find; a file input uses upload_file.`);
@@ -793,6 +807,7 @@ export class BrowserController {
 
   private async computer(params: Record<string, unknown>): Promise<unknown> {
     const tabId = asTabId(params.tabId);
+    this.throwIfDialogOpen(tabId);
     const action = asString(params.action);
     if (action === "wait") {
       const waitMs = clampLimit(params.waitMs, 500, 10_000);
@@ -894,15 +909,22 @@ export class BrowserController {
       return { key, modifiers: modifierNames(modifiers), repeat };
     }
     if (action === "drag") {
-      const from = await this.pointFrom(params, "pageRef", "x", "y", tabId);
+      const modifiers = parseModifiers(params.modifiers);
+      /* Both ends are hit-tested, so a covered source or a missed drop target is named
+         before the pointer moves. */
+      const from = await this.pointFrom(params, "pageRef", "x", "y", tabId, true);
+      await this.runInPage(tabId, injectedDragProbe, [true]).catch(() => undefined);
       await this.showCursor(tabId, from, "drag");
-      await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", button: "none", buttons: 0, ...from });
+      await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", button: "none", buttons: 0, ...from, modifiers });
       let release = from;
+      let pressed = false;
+      let released = false;
       try {
-        await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", button: "left", buttons: 1, clickCount: 1, ...from });
+        await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", button: "left", buttons: 1, clickCount: 1, ...from, modifiers });
+        pressed = true;
         // Resolving a reference may scroll. Press at the source before making
         // the destination visible, so the source coordinate cannot go stale.
-        const to = await this.pointFrom(params, "toPageRef", "toX", "toY", tabId);
+        const to = await this.pointFrom(params, "toPageRef", "toX", "toY", tabId, true);
         release = to;
         for (let step = 1; step <= DRAG_STEPS; step += 1) {
           await this.cdp(tabId, "Input.dispatchMouseEvent", {
@@ -910,18 +932,24 @@ export class BrowserController {
             button: "left",
             buttons: 1,
             x: from.x + ((to.x - from.x) * step) / DRAG_STEPS,
-            y: from.y + ((to.y - from.y) * step) / DRAG_STEPS
+            y: from.y + ((to.y - from.y) * step) / DRAG_STEPS,
+            modifiers
           });
         }
         await this.showCursor(tabId, to, "drag");
-        return { dragged: { from, to } };
+        await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", button: "left", buttons: 0, clickCount: 1, ...release, modifiers });
+        released = true;
+        /* Whether the page received dragstart/dragover/drop distinguishes an ignored
+           gesture from a drop that landed somewhere unexpected. */
+        const events = await this.runInPage(tabId, injectedDragProbe, [false]).catch(() => undefined);
+        return { dragged: { from, to }, ...(isRecord(events) ? { events } : {}) };
       } catch (error) {
         const failure = normalizeError(error);
         throw connectorError(failure.code, failure.message, true);
       } finally {
-        try {
-          await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", button: "left", buttons: 0, clickCount: 1, ...release });
-        } catch { throw connectorError("drag_interrupted", "The pointer release could not be confirmed; inspect the tab before retrying.", true); }
+        if (pressed && !released) {
+          try { await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", button: "left", buttons: 0, clickCount: 1, ...release, modifiers }); } catch { /* the catch above already says outcomeUnknown */ }
+        }
       }
     }
 
@@ -1014,6 +1042,7 @@ export class BrowserController {
   }
 
   private async javascriptTool(tabId: number, source: string): Promise<unknown> {
+    this.throwIfDialogOpen(tabId);
     await this.ensureDebugger(tabId);
     const result = await this.cdp(tabId, "Runtime.evaluate", {
       expression: `(async () => { ${source}\n })()`,
@@ -1120,6 +1149,7 @@ export class BrowserController {
 
   private async uploadFile(params: Record<string, unknown>): Promise<unknown> {
     const tabId = asTabId(params.tabId);
+    this.throwIfDialogOpen(tabId);
     const pageRef = asString(params.pageRef);
     const dataBase64 = asString(params.dataBase64);
     if (Math.floor(dataBase64.length * 0.75) > MAX_UPLOAD_BYTES) throw connectorError("file_too_large", "Upload exceeds 10 MiB");
@@ -1129,6 +1159,7 @@ export class BrowserController {
   }
 
   private async downloadFile(tabId: number, url: string): Promise<unknown> {
+    this.throwIfDialogOpen(tabId);
     if (isRestrictedUrl(url)) throw connectorError("restricted_url", `Cannot download ${url}`);
     await this.ensureDebugger(tabId);
     const expression = `(async () => {
@@ -1185,6 +1216,16 @@ export class BrowserController {
     return (await chrome.debugger.sendCommand({ tabId }, method, params)) ?? {};
   }
 
+  /* A JavaScript dialog blocks the renderer; every later scripting call would hang or
+     fail with no diagnosis. ADR-0009 makes dismissing it a human step, so fail fast. */
+  private throwIfDialogOpen(tabId: number): void {
+    const dialog = this.dialogs.get(tabId);
+    if (!dialog) return;
+    const error = connectorError("javascript_dialog_open", `A ${dialog.type} dialog is blocking the page: ${JSON.stringify(dialog.message)}. The person must dismiss it; the connector does not accept or dismiss dialogs automatically.`) as Error & { code: string; outcomeUnknown: boolean; after?: unknown };
+    error.after = { dialog, untrusted: true };
+    throw error;
+  }
+
   /* A stale ref usually means the element was re-created; name it and, when exactly
      one current element has the same identity, give the caller its new ref. */
   private async staleRefError(tabId: number, pageRef: string): Promise<Error & { code: string; outcomeUnknown: boolean }> {
@@ -1217,6 +1258,12 @@ export class BrowserController {
 
   private onDebuggerEvent(tabId: number | undefined, method: string, params?: object): void {
     if (tabId === undefined || !params) return;
+    if (method === "Page.javascriptDialogOpening") {
+      const event = params as { type?: string; message?: string };
+      this.dialogs.set(tabId, { type: event.type ?? "alert", message: (event.message ?? "").slice(0, 300) });
+      return;
+    }
+    if (method === "Page.javascriptDialogClosed") { this.dialogs.delete(tabId); return; }
     if (method === "Runtime.consoleAPICalled") {
       const event = params as { timestamp?: number; type?: string; args?: Array<{ value?: unknown; description?: string }> };
       const text = (event.args ?? []).map((arg) => String(arg.value ?? arg.description ?? "")).join(" ");
@@ -1560,6 +1607,24 @@ async function injectedRefPoint(pageRef: string, generation: number, hitTest = f
   const describe = (node: Element) => `${node.getAttribute("role") || node.tagName.toLowerCase()} "${((node as HTMLElement).innerText || node.getAttribute("aria-label") || "").trim().replace(/\s+/g, " ").slice(0, 60)}"`;
   const covering = blocker.closest("[role=dialog],[role=alertdialog],[role=alert],[role=status],dialog,header,nav") ?? blocker;
   return { blockedBy: describe(covering) };
+}
+
+/* Counts the page's own drag events, so a gesture the page ignored is visible in the
+   result instead of looking the same as a drop that landed elsewhere. */
+function injectedDragProbe(reset: boolean): { dragstart: number; dragover: number; drop: number } {
+  const global = globalThis as typeof globalThis & { __browserConnectorDrag?: { dragstart: number; dragover: number; drop: number; installed?: boolean } };
+  if (!global.__browserConnectorDrag) global.__browserConnectorDrag = { dragstart: 0, dragover: 0, drop: 0 };
+  const state = global.__browserConnectorDrag;
+  if (reset) {
+    state.dragstart = 0; state.dragover = 0; state.drop = 0;
+    if (!state.installed) {
+      state.installed = true;
+      for (const type of ["dragstart", "dragover", "drop"] as const) {
+        document.addEventListener(type, () => { state[type] += 1; }, true);
+      }
+    }
+  }
+  return { dragstart: state.dragstart, dragover: state.dragover, drop: state.drop };
 }
 
 /* After the dwell, before the press: is the element still the one at its own centre,
@@ -2287,14 +2352,15 @@ export const ERROR_HINTS: Record<string, string> = {
   unknown_tool: "That tool does not exist. Use one from tools/list.",
   upload_failed: "The upload did not complete. Check the file input and try again.",
   critical_action_not_batchable: "This action must be called on its own, not inside a batch. Send it as a single tool call.",
+  javascript_dialog_open: "A JavaScript dialog (alert, confirm or prompt) is blocking the page. Ask the person to dismiss it; the connector does not click dialogs.",
   browser_error: "The browser reported an error without a more specific code. Read the message, inspect the tab, and retry only after the state is clear."
 };
 
-export function normalizeError(error: unknown): { code: string; message: string; outcomeUnknown: boolean; hint?: string } {
+export function normalizeError(error: unknown): { code: string; message: string; outcomeUnknown: boolean; hint?: string; after?: unknown } {
   if (error instanceof Error) {
-    const typed = error as Error & { code?: string; outcomeUnknown?: boolean };
+    const typed = error as Error & { code?: string; outcomeUnknown?: boolean; after?: unknown };
     const code = typed.code ?? "browser_error";
-    return { code, message: error.message, outcomeUnknown: typed.outcomeUnknown ?? false, ...(ERROR_HINTS[code] ? { hint: ERROR_HINTS[code] } : {}) };
+    return { code, message: error.message, outcomeUnknown: typed.outcomeUnknown ?? false, ...(ERROR_HINTS[code] ? { hint: ERROR_HINTS[code] } : {}), ...(typed.after !== undefined ? { after: typed.after } : {}) };
   }
   return { code: "browser_error", message: String(error), outcomeUnknown: false };
 }

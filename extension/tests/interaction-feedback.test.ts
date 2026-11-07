@@ -26,7 +26,7 @@ function harness(respond: (name: string, args: unknown[]) => unknown) {
   const debuggerApi = {
     attach: vi.fn(async () => {}),
     detach: vi.fn(async () => {}),
-    sendCommand: vi.fn(async (_target: unknown, method: string) => {
+    sendCommand: vi.fn(async (_target: unknown, method: string, _params?: Record<string, unknown>) => {
       if (method === "Page.getLayoutMetrics") return { cssVisualViewport: { clientWidth: 800, clientHeight: 600 } };
       return {};
     }),
@@ -214,5 +214,24 @@ describe("interaction feedback", () => {
     await h.controller.dispatch("read_page", { tabId: 7 }, new Set([7])).catch(() => undefined);
     const context = await h.controller.dispatch("tabs_context", {}, new Set([7])) as { tabs: Array<Record<string, unknown>> };
     expect(context.tabs[0]!.documentGeneration).toBe(5);
+  });
+
+  it("fails fast when a JavaScript dialog blocks the page", async () => {
+    const h = harness(() => null);
+    h.debuggerApi.onEvent.emit({ tabId: 7 }, "Page.javascriptDialogOpening", { type: "confirm", message: "Delete this?" });
+    await expect(h.controller.dispatch("read_page", { tabId: 7 }, new Set([7])))
+      .rejects.toMatchObject({ code: "javascript_dialog_open", after: { dialog: { type: "confirm", message: "Delete this?" } } });
+  });
+
+  it("reports the page's drag events and passes modifiers", async () => {
+    const h = harness((name) => {
+      if (name === "injectedRefPoint") return { x: 10, y: 20 };
+      if (name === "injectedDragProbe") return { dragstart: 1, dragover: 3, drop: 0 };
+      return null;
+    });
+    const result = await h.controller.dispatch("computer", { tabId: 7, action: "drag", pageRef: "p7-1", toPageRef: "p7-2", modifiers: "shift", settle: false }, new Set([7])) as { events: unknown };
+    expect(result.events).toEqual({ dragstart: 1, dragover: 3, drop: 0 });
+    const pressed = h.debuggerApi.sendCommand.mock.calls.find(([, method, params]) => method === "Input.dispatchMouseEvent" && (params as { type?: string })?.type === "mousePressed");
+    expect((pressed?.[2] as { modifiers?: number }).modifiers).toBe(8);
   });
 });

@@ -137,7 +137,7 @@ describe("native browser method completion", () => {
     const h = harness();
     await h.controller.dispatch("computer", { tabId: 7, action: "drag", pageRef: "p1-start", toPageRef: "p1-end" }, new Set([7]));
     expect(h.trace.indexOf("mousePressed")).toBeLessThan(h.trace.indexOf("resolve:p1-end"));
-    expect(h.trace.at(-1)).toBe("mouseReleased");
+    expect(h.trace.filter(entry => entry.startsWith("mouse")).at(-1)).toBe("mouseReleased");
   });
 
   it("releases the pointer and reports unknown effects when a drag target becomes stale", async () => {
@@ -145,6 +145,6 @@ describe("native browser method completion", () => {
     h.scripting.executeScript.mockImplementation(async args => [{ result: args.args?.[0] === "p1-start" ? { x: 20, y: 40 } : null }]);
     await expect(h.controller.dispatch("computer", { tabId: 7, action: "drag", pageRef: "p1-start", toPageRef: "p1-end" }, new Set([7])))
       .rejects.toMatchObject({ code: "stale_page_ref", outcomeUnknown: true });
-    expect(h.trace.at(-1)).toBe("mouseReleased");
+    expect(h.trace.filter(entry => entry.startsWith("mouse")).at(-1)).toBe("mouseReleased");
   });
 });
