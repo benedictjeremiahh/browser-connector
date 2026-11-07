@@ -280,6 +280,10 @@ pub struct ComputerArgs {
     pub modifiers: Option<String>,
     /// Repeat count for key. The connector hard limit is 100.
     pub repeat: Option<u16>,
+    /// For type: select the current value first, so the inserted text replaces it.
+    pub replace: Option<bool>,
+    /// For type: send keydown/keyup per character instead of insertText, for fields that listen to keydown.
+    pub key_events: Option<bool>,
     /// Mouse button for click: left, right, or middle.
     pub button: Option<String>,
     pub delta_x: Option<f64>,
@@ -350,8 +354,9 @@ fn any_value_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
 pub struct FormInputArgs {
     pub tab_id: u32,
     pub page_ref: String,
-    /// Text for inputs and textareas, true/false for checkboxes and radios, an option's value or
-    /// visible label for a select (an array for a multi-select).
+    /// Text for inputs and textareas. For checkboxes and radios this must be the JSON boolean
+    /// true or false, not a string. For a select, an option's value or visible label (an array
+    /// for a multi-select).
     #[schemars(schema_with = "any_value_schema")]
     pub value: Value,
     /// Wait until the page settles and report what changed (default true).
@@ -632,7 +637,7 @@ impl BrowserService {
     }
 
     #[tool(
-        description = "Mouse, keyboard, scroll, drag and screenshot actions in a controlled tab. Click by pageRef (from find or read_page), not coordinates: a pageRef click checks the element is visible, enabled and not covered, and fails with the covering element named. click, type and key wait for the page to settle and return `after` (URL, title, page notices, console errors, failed requests), so you rarely need a screenshot to learn whether an action worked. A notice that appears well after the page goes quiet (a delayed toast) is not in `after`; wait_for its text instead. scroll with a pageRef brings it into view; otherwise it wheels at x/y or the viewport centre, which also scrolls inner panels. Screenshots are JPEG, downscaled to 1600 px by default (imageScale maps image pixels to CSS pixels). Prefer wait_for over the wait action. On macOS Cmd+A/C/V/X/Z run as editor commands.",
+        description = "Mouse, keyboard, scroll, drag and screenshot actions in a controlled tab. Click by pageRef (from find or read_page), not coordinates: a pageRef click checks the element is visible, enabled and not covered, and fails with the covering element named. click, type and key wait for the page to settle and return `after` (URL, title, page notices, console errors, failed requests), so you rarely need a screenshot to learn whether an action worked. `type` reads back the focused field's value or text; replace:true selects the current value first, and keyEvents:true sends keydown/keyup per character for fields that ignore insertText. A notice that appears well after the page goes quiet (a delayed toast) is not in `after`; wait_for its text instead. scroll with a pageRef brings it into view; otherwise it wheels at x/y or the viewport centre, which also scrolls inner panels. scroll returns the before/after position and whether anything moved. Screenshots are JPEG, downscaled to 1600 px by default (imageScale maps image pixels to CSS pixels). Prefer wait_for over the wait action. On macOS Cmd+A/C/V/X/Z run as editor commands.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,

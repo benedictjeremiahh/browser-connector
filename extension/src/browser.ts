@@ -692,24 +692,35 @@ export class BrowserController {
 
   /* Writes through the element's native value setter, so frameworks that track the value (React)
      see the change, then reads it back: a value the page rejected is reported, not assumed. */
-  private async formInput(tabId: number, pageRef: string, value: unknown): Promise<{ pageRef: string; changed: boolean; matched: boolean; actual?: unknown; untrusted?: boolean }> {
+  private async formInput(tabId: number, pageRef: string, value: unknown): Promise<{ pageRef: string; changed: boolean; matched: boolean; actual?: unknown; before?: unknown; untrusted?: boolean }> {
     const outcome = await this.runInPage(tabId, injectedFormInput, [pageRef, value, this.documentGenerations.get(tabId) ?? 1]);
     if (outcome === false || outcome === null || outcome === undefined) throw connectorError("stale_page_ref", `Page Reference is stale: ${pageRef}`);
     if (isRecord(outcome) && outcome.unsupported === true) throw connectorError("invalid_arguments", `${pageRef} is not a text input, textarea, select or editable element. A custom select (role combobox) is used by clicking it, then clicking the option found with find; a file input uses upload_file.`);
     if (isRecord(outcome) && typeof outcome.refused === "string") throw connectorError("element_disabled", `${pageRef} is ${outcome.refused}`);
     if (isRecord(outcome) && outcome.missingOption === true) throw connectorError("invalid_arguments", `No option of ${pageRef} matches ${JSON.stringify(value)} by value or label. Options: ${String(outcome.options ?? "")}`);
+    if (isRecord(outcome) && outcome.invalidType === "boolean") throw connectorError("invalid_arguments", `${pageRef} is a checkbox or radio; value must be the boolean true or false, not ${typeof value}.`);
+    if (isRecord(outcome) && outcome.radioCannotUncheck === true) throw connectorError("radio_cannot_uncheck", `${pageRef} is a radio button; a checked radio cannot be unchecked by clicking it. Click the radio that should be selected instead.`);
     const matched = isRecord(outcome) ? outcome.matched !== false : true;
-    return { pageRef, changed: true, matched, ...(isRecord(outcome) && "actual" in outcome ? { actual: outcome.actual } : {}), ...(isRecord(outcome) && typeof outcome.unverified === "string" ? { unverified: outcome.unverified } : {}), ...(matched ? {} : { hint: ERROR_HINTS.value_not_applied }), untrusted: true };
+    return { pageRef, changed: matched, matched, ...(isRecord(outcome) && "before" in outcome ? { before: outcome.before } : {}), ...(isRecord(outcome) && "actual" in outcome ? { actual: outcome.actual } : {}), ...(isRecord(outcome) && typeof outcome.unverified === "string" ? { unverified: outcome.unverified } : {}), ...(matched ? {} : { hint: ERROR_HINTS.value_not_applied }), untrusted: true };
   }
 
   private async fillForm(tabId: number, fields: unknown): Promise<unknown> {
     if (!Array.isArray(fields) || !fields.length || fields.length > 50) throw connectorError("invalid_arguments", "fill_form needs 1 to 50 fields of { pageRef, value }");
-    const results = [];
-    for (const field of fields) {
+    const results: Array<Record<string, unknown>> = [];
+    let failedAt: number | undefined;
+    let failure: ReturnType<typeof normalizeError> | undefined;
+    for (const [index, field] of fields.entries()) {
       if (!isRecord(field) || typeof field.pageRef !== "string") throw connectorError("invalid_arguments", "Every field needs a pageRef");
-      results.push(await this.formInput(tabId, field.pageRef, field.value));
+      try {
+        results.push({ ...(await this.formInput(tabId, field.pageRef, field.value)), ok: true });
+      } catch (cause) {
+        failedAt = index;
+        failure = normalizeError(cause);
+        results.push({ pageRef: field.pageRef, ok: false, error: failure });
+        break;
+      }
     }
-    return { fields: results, allMatched: results.every((result) => result.matched), untrusted: true };
+    return { fields: results, allMatched: failedAt === undefined && results.every((result) => result.ok === true && result.matched === true), ...(failedAt !== undefined ? { failedAt, error: failure } : {}), untrusted: true };
   }
 
   /* A raw CDP mouse event is invisible, so anyone watching the tab sees nothing
@@ -779,23 +790,34 @@ export class BrowserController {
       return { mimeType: `image/${format}`, dataBase64: result.data ?? "", artifact: true, region };
     }
     if (action === "scroll") {
-      /* A pageRef is scrolled into view. Otherwise a real wheel event at the point (or the middle of
-         the viewport) scrolls whatever is under it, including inner panels that window.scrollBy misses. */
-      if (typeof params.pageRef === "string") {
-        const point = await this.pointForRef(tabId, params.pageRef);
-        await this.showCursor(tabId, point, "scroll");
-        return { scrolledTo: params.pageRef, point };
-      }
+      /* A pageRef is scrolled into view; supplied deltas then wheel at its centre. Otherwise a
+         real wheel event at the point (or the middle of the viewport) scrolls whatever is under
+         it, including inner panels that window.scrollBy misses. */
+      const ref = typeof params.pageRef === "string" ? params.pageRef : null;
+      const hasDelta = typeof params.deltaX === "number" || typeof params.deltaY === "number";
       const x = asOptionalNumber(params.deltaX) ?? 0;
-      const y = asOptionalNumber(params.deltaY) ?? 600;
-      let at = typeof params.x === "number" && typeof params.y === "number" ? { x: asNumber(params.x), y: asNumber(params.y) } : undefined;
-      if (!at) {
+      const y = asOptionalNumber(params.deltaY) ?? (hasDelta ? 0 : 600);
+      const generation = this.documentGenerations.get(tabId) ?? 1;
+      let at: { x: number; y: number };
+      if (ref) {
+        at = await this.pointForRef(tabId, ref);
+      } else if (typeof params.x === "number" && typeof params.y === "number") {
+        at = { x: asNumber(params.x), y: asNumber(params.y) };
+      } else {
         const metrics = await this.cdp(tabId, "Page.getLayoutMetrics").catch(() => ({})) as { cssVisualViewport?: { clientWidth?: number; clientHeight?: number } };
         at = { x: (metrics.cssVisualViewport?.clientWidth ?? 800) / 2, y: (metrics.cssVisualViewport?.clientHeight ?? 600) / 2 };
       }
       await this.showCursor(tabId, at, "scroll");
-      await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseWheel", x: at.x, y: at.y, deltaX: x, deltaY: y });
-      return { scrolled: { x, y }, at };
+      const before = await this.runInPage(tabId, injectedScrollState, [ref, generation]);
+      if (!ref || hasDelta) {
+        await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseWheel", x: at.x, y: at.y, deltaX: x, deltaY: y });
+      }
+      const after = await this.runInPage(tabId, injectedScrollState, [ref, generation]);
+      const moved = isRecord(before) && isRecord(after)
+        ? before.x !== after.x || before.y !== after.y
+          || JSON.stringify(before.container ?? null) !== JSON.stringify(after.container ?? null)
+        : undefined;
+      return { ...(ref ? { scrolledTo: ref, point: at } : { at }), ...(!ref || hasDelta ? { scrolled: { x, y } } : {}), before, after, ...(moved !== undefined ? { moved } : {}) };
     }
     if (action === "type") {
       if (typeof params.pageRef === "string") {
@@ -804,8 +826,20 @@ export class BrowserController {
       } else {
         await this.showCursor(tabId, undefined, "type");
       }
-      await this.cdp(tabId, "Input.insertText", { text: asString(params.text) });
-      return { typed: true };
+      const text = asString(params.text);
+      /* A field that listens to keydown ignores insertText; replace selects the current
+         value the way a person would, so the next insert overwrites it. */
+      if (params.replace === true) await this.dispatchKey(tabId, "a", 4);
+      if (params.keyEvents === true) {
+        for (const character of [...text]) await this.dispatchKey(tabId, character, 0);
+      } else {
+        await this.cdp(tabId, "Input.insertText", { text });
+      }
+      const focused = await this.runInPage(tabId, injectedActiveElement, []);
+      const actual = isRecord(focused) && typeof focused.value === "string"
+        ? focused.value
+        : isRecord(focused) && typeof focused.text === "string" ? focused.text : undefined;
+      return { typed: true, inserted: text, ...(focused ? { focused } : {}), ...(actual !== undefined ? { actual } : {}) };
     }
     if (action === "key") {
       const key = asString(params.key);
@@ -1421,7 +1455,59 @@ function injectedFocusRef(pageRef: string, generation: number): boolean {
   return rt.activeIn(element) === element;
 }
 
-function injectedFormInput(pageRef: string, value: unknown, generation: number): false | { unsupported: true } | { refused: string } | { missingOption: true; options: string } | { matched: boolean; actual: unknown; unverified?: string } {
+/* The element that will receive the next keystroke, across open shadow roots and
+   same-origin frames, so `type` reports the field the page actually kept. */
+function injectedActiveElement(): { tag: string; type?: string; role?: string; editable: boolean; value?: string; text?: string } | null {
+  let root: Document | ShadowRoot = document;
+  let element: Element | null = null;
+  for (let depth = 0; depth < 8; depth += 1) {
+    const active: Element | null = root.activeElement;
+    if (!active) break;
+    element = active;
+    const shadow: ShadowRoot | null = (active as HTMLElement).shadowRoot;
+    if (shadow) { root = shadow; continue; }
+    if (active.tagName === "IFRAME") {
+      try {
+        const frame: Document | null = (active as HTMLIFrameElement).contentDocument;
+        if (frame) { root = frame; continue; }
+      } catch { /* cross-origin frame: report the iframe itself */ }
+    }
+    break;
+  }
+  if (!element) return null;
+  const tag = element.tagName.toLowerCase();
+  const role = element.getAttribute("role") ?? undefined;
+  const field = element as unknown as { type?: string; value?: string; readOnly?: boolean; disabled?: boolean; isContentEditable?: boolean };
+  if (tag === "input") {
+    const type = field.type ?? "text";
+    return { tag, type, ...(role ? { role } : {}), editable: !field.readOnly && !field.disabled, value: type === "password" ? "[redacted]" : String(field.value ?? "").slice(0, 500) };
+  }
+  if (tag === "textarea") return { tag, ...(role ? { role } : {}), editable: !field.readOnly && !field.disabled, value: String(field.value ?? "").slice(0, 500) };
+  if (field.isContentEditable) return { tag, ...(role ? { role } : {}), editable: true, text: (element.textContent ?? "").slice(0, 500) };
+  if (tag === "select") return { tag, ...(role ? { role } : {}), editable: !field.disabled, value: String(field.value ?? "") };
+  return { tag, ...(role ? { role } : {}), editable: false, text: (element.textContent ?? "").slice(0, 200) };
+}
+
+/* Where the page and the element's nearest scrollable ancestor stand, so a scroll
+   reports what moved instead of only what was requested. */
+function injectedScrollState(pageRef: string | null, generation: number): { x: number; y: number; container?: { top: number; left: number } } {
+  const rt = (globalThis as RuntimeGlobal).__browserConnectorRuntime;
+  let container: HTMLElement | null = null;
+  if (pageRef && rt) {
+    const state = rt.currentState(generation);
+    let node = (state ? rt.scan().resolve(pageRef, state) : null) as HTMLElement | null;
+    while (node && node !== document.body && node !== document.documentElement) {
+      const style = getComputedStyle(node);
+      const scrollable = /(auto|scroll|overlay)/.test(`${style.overflowY} ${style.overflowX}`)
+        && (node.scrollHeight > node.clientHeight || node.scrollWidth > node.clientWidth);
+      if (scrollable) { container = node; break; }
+      node = node.parentElement;
+    }
+  }
+  return { x: window.scrollX, y: window.scrollY, ...(container ? { container: { top: container.scrollTop, left: container.scrollLeft } } : {}) };
+}
+
+function injectedFormInput(pageRef: string, value: unknown, generation: number): false | { unsupported: true } | { refused: string } | { missingOption: true; options: string } | { invalidType: "boolean" } | { radioCannotUncheck: true } | { matched: boolean; actual: unknown; before?: unknown; unverified?: string } {
   const rt = (globalThis as RuntimeGlobal).__browserConnectorRuntime;
   if (!rt) throw new Error("browser-connector-runtime-missing");
   const state = rt.currentState(generation);
@@ -1450,22 +1536,27 @@ function injectedFormInput(pageRef: string, value: unknown, generation: number):
   element.focus?.();
   if (isInput && ((element as HTMLInputElement).type === "checkbox" || (element as HTMLInputElement).type === "radio")) {
     const checkbox = element as HTMLInputElement;
-    const wanted = Boolean(value);
+    if (value !== true && value !== false) return { invalidType: "boolean" };
+    const wanted = value;
+    const before = checkbox.checked;
+    if (checkbox.type === "radio" && !wanted) return { radioCannotUncheck: true };
     /* A click, not an assignment: it is the event a framework listens to, and it toggles exactly once. */
     if (checkbox.checked !== wanted) checkbox.click();
-    return { matched: checkbox.checked === wanted, actual: checkbox.checked };
+    return { matched: checkbox.checked === wanted, actual: checkbox.checked, before };
   }
   if (isInput || rt.is(element, "HTMLTextAreaElement")) {
     const field = element as HTMLInputElement | HTMLTextAreaElement;
+    const hidden = isInput && rt.sensitive(field as HTMLInputElement);
+    const before = hidden ? "[redacted]" : field.value.slice(0, 500);
     const next = String(value ?? "");
     setNative(field, next);
     fire();
     field.blur?.();
-    const hidden = isInput && rt.sensitive(field as HTMLInputElement);
-    return { matched: field.value === next, actual: hidden ? "[redacted]" : field.value.slice(0, 500) };
+    return { matched: field.value === next, actual: hidden ? "[redacted]" : field.value.slice(0, 500), before };
   }
   if (rt.is(element, "HTMLSelectElement")) {
     const select = element as HTMLSelectElement;
+    const before = [...select.selectedOptions].map(option => option.text.trim());
     const wanted = (Array.isArray(value) ? value : [value]).map(item => String(item ?? "").trim().toLowerCase());
     const options = [...select.options];
     const picks = wanted.map(item => options.find(option => option.value.toLowerCase() === item) ?? options.find(option => option.text.trim().toLowerCase() === item));
@@ -1474,13 +1565,14 @@ function injectedFormInput(pageRef: string, value: unknown, generation: number):
     if (!select.multiple && picks[0]) select.value = picks[0].value;
     fire();
     const actual = [...select.selectedOptions].map(option => option.text.trim());
-    return { matched: picks.every(pick => pick!.selected), actual: select.multiple ? actual : actual[0] };
+    return { matched: picks.every(pick => pick!.selected), actual: select.multiple ? actual : actual[0], before: select.multiple ? before : before[0] };
   }
   if (element.isContentEditable) {
+    const before = (element.textContent ?? "").slice(0, 500);
     element.textContent = String(value ?? "");
     element.dispatchEvent(new (view.InputEvent ?? InputEvent)("input", { bubbles: true }));
     /* Rich editors (Slate, Lexical, Draft) keep their own model and may ignore this; say so. */
-    return { matched: element.textContent === String(value ?? ""), actual: (element.textContent ?? "").slice(0, 500), unverified: "A rich-text editor may ignore a direct write; check the page or use computer type." };
+    return { matched: element.textContent === String(value ?? ""), actual: (element.textContent ?? "").slice(0, 500), before, unverified: "A rich-text editor may ignore a direct write; check the page or use computer type." };
   }
   return { unsupported: true };
 }
@@ -1947,7 +2039,26 @@ export const ERROR_HINTS: Record<string, string> = {
   invalid_dimensions: "Use a preset (mobile, tablet, desktop) or a width between 320 and 7680 and a height between 240 and 4320.",
   restricted_url: "Only http and https pages can be opened.",
   invalid_arguments: "Check the tool's argument schema.",
-  value_not_applied: "The field did not keep the value, which usually means a script controls it. Try computer type with the same pageRef after clearing it (key cmd+a then Backspace)."
+  value_not_applied: "The field did not keep the value, which usually means a script controls it. Try computer type with the same pageRef and replace:true; if typing still does not stick, the editor needs keyEvents:true.",
+  radio_cannot_uncheck: "A checked radio cannot be unchecked by clicking it. Click the radio that should be selected instead, or use computer click on that radio.",
+  action_denied: "The person or the policy denied this action. Explain what you are trying to do and ask the person to allow it; do not retry the same call unchanged.",
+  approval_timeout: "Nobody answered the approval in time. Ask the person to approve the pending request in the Connector Panel, then retry.",
+  binary_body: "The response is binary, not text. Use download_file to save it, or read a textual resource instead.",
+  chrome_permission_missing: "Chrome has not granted the site permission. Open the Connector Panel and grant that origin, then retry.",
+  cross_origin_body: "The response body belongs to another origin. Read it in a controlled tab on that origin, or use download_file.",
+  download_failed: "The download did not complete. Check the URL and the tab, then retry; inspect the page for a blocked download.",
+  drag_interrupted: "The pointer release could not be confirmed. Inspect the tab before retrying; repeating a drag may apply it twice.",
+  file_too_large: "The file exceeds the connector's size limit. Use a smaller file or fetch only the needed bytes.",
+  invalid_batch: "The batch is malformed. Send a non-empty list of supported tool calls; javascript_tool is not allowed inside a batch.",
+  invalid_cursor: "The cursor is not recognized. Re-read the page and use the cursor it returned.",
+  pairing_denied: "This host is not paired with the extension. Open the Connector Panel and approve Host Pairing.",
+  request_not_found: "The request expired or was already answered. Re-read the page and send a new request.",
+  site_denied: "The site is not allowed for this session. Ask the person to grant the origin in the Connector Panel.",
+  tab_create_failed: "Chrome did not create a tab. Check that the URL is allowed and retry once; if it persists, inspect Chrome.",
+  unknown_tool: "That tool does not exist. Use one from tools/list.",
+  upload_failed: "The upload did not complete. Check the file input and try again.",
+  critical_action_not_batchable: "This action must be called on its own, not inside a batch. Send it as a single tool call.",
+  browser_error: "The browser reported an error without a more specific code. Read the message, inspect the tab, and retry only after the state is clear."
 };
 
 export function normalizeError(error: unknown): { code: string; message: string; outcomeUnknown: boolean; hint?: string } {
