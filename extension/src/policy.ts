@@ -25,7 +25,7 @@ export function classifyRequest(
   params: Record<string, unknown>,
   targetDescription = ""
 ): Classification {
-  if (method === "tabs_context" && !params.createIfEmpty) {
+  if (method === "tabs_context") {
     return { risk: "read_only", reason: "Reads controlled-tab metadata" };
   }
   if (method === "label_session") {
@@ -77,6 +77,8 @@ export function navigationTarget(value: string): string | undefined {
     const url = new URL(value);
     if (!["http:", "https:"].includes(url.protocol)) return undefined;
     url.hash = "";
+    /* The order query parameters were written in is not part of the page's identity. */
+    url.searchParams.sort();
     return url.toString();
   } catch {
     return undefined;
@@ -95,6 +97,19 @@ export function isRestrictedUrl(value: string): boolean {
   } catch {
     return true;
   }
+}
+
+/* The blank destinations Chrome starts a tab at. A blank tab is a placeholder the connector may
+   navigate; it is not a page with state to preserve. A pendingUrl covers a tab that has not
+   committed yet, and an about:blank fragment is still the blank document. */
+export function isBlankTabUrl(url: string | undefined, pendingUrl?: string): boolean {
+  /* The destination, not the committed document: a tab navigating away from about:blank has a
+     real pendingUrl and is no longer a placeholder. */
+  const destination = pendingUrl ?? url;
+  return destination === "about:blank"
+    || destination?.startsWith("about:blank#") === true
+    || destination === "chrome://newtab"
+    || destination === "chrome://newtab/";
 }
 
 export function exactOrigin(value: string): string | undefined {

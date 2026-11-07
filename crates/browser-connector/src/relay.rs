@@ -24,14 +24,41 @@ use crate::config::{ConnectorConfig, broker_socket_path};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
-/// A host that knows what the work is called (a task runner, for example) can name the session
-/// before the agent opens any tab, so the session joins that work's tab group instead of opening
-/// a new one when the agent forgets to call label_session first.
+/// Names the session before the agent opens any tab. `BROWSER_CONNECTOR_SESSION_LABEL` wins;
+/// otherwise the MCP server's working-directory basename names the workspace, and when neither
+/// yields a name the group falls back to the host id. The label is sent once before the session's
+/// first browser request, so a group is named even when the agent never calls `label_session`.
 pub const SESSION_LABEL_ENV: &str = "BROWSER_CONNECTOR_SESSION_LABEL";
 
 #[derive(Clone)]
 pub struct BrowserRelay {
     inner: Arc<RelayInner>,
+}
+
+/// The label a session wears before the agent names it. A task runner can name the work with
+/// SESSION_LABEL_ENV; otherwise the MCP process's working directory names the workspace. Only
+/// the basename is used: the tab strip is visible to anyone looking at the browser, so a full
+/// path (and the account name inside it) must not reach it.
+fn default_session_label(
+    env: Option<String>,
+    cwd: Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> Option<String> {
+    let supplied = env
+        .map(|label| label.trim().chars().take(60).collect::<String>())
+        .filter(|label| !label.is_empty());
+    if supplied.is_some() {
+        return supplied;
+    }
+    let cwd = cwd?;
+    if home.is_some_and(|home| home == cwd) {
+        return None;
+    }
+    let name = cwd.file_name()?.to_str()?.trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some(name.chars().take(60).collect())
 }
 
 struct RelayInner {
@@ -65,7 +92,11 @@ struct BrokerHandshake {
 
 impl BrowserRelay {
     pub async fn start(config: ConnectorConfig) -> Result<Self> {
-        let label = std::env::var(SESSION_LABEL_ENV).ok();
+        let label = default_session_label(
+            std::env::var(SESSION_LABEL_ENV).ok(),
+            std::env::current_dir().ok(),
+            std::env::var_os("HOME").map(PathBuf::from),
+        );
         Self::start_labelled(config, broker_socket_path()?, label).await
     }
 
@@ -244,6 +275,97 @@ mod tests {
             pairing_secret: "test-secret".to_owned(),
             extension_id: None,
         }
+    }
+
+    #[test]
+    fn a_supplied_label_wins_and_the_workspace_names_the_session_otherwise() {
+        assert_eq!(
+            default_session_label(
+                Some("  Delivery note  ".to_owned()),
+                Some(PathBuf::from("/work/ignored")),
+                Some(PathBuf::from("/Users/ana")),
+            )
+            .as_deref(),
+            Some("Delivery note")
+        );
+        assert_eq!(
+            default_session_label(
+                None,
+                Some(PathBuf::from("/Users/ana/Documents/shop")),
+                Some(PathBuf::from("/Users/ana")),
+            )
+            .as_deref(),
+            Some("shop")
+        );
+        assert_eq!(
+            default_session_label(
+                None,
+                Some(PathBuf::from("/Users/ana/Documents/shop/")),
+                Some(PathBuf::from("/Users/ana")),
+            )
+            .as_deref(),
+            Some("shop"),
+            "a trailing slash names the same workspace"
+        );
+        assert_eq!(
+            default_session_label(None, Some(PathBuf::from("/")), None).as_deref(),
+            None
+        );
+        assert_eq!(default_session_label(None, None, None), None);
+        assert_eq!(
+            default_session_label(
+                Some("   ".to_owned()),
+                Some(PathBuf::from("/Users/ana")),
+                Some(PathBuf::from("/Users/ana")),
+            )
+            .as_deref(),
+            None,
+            "an empty supplied label must not turn the home directory into a title"
+        );
+        assert_eq!(
+            default_session_label(
+                None,
+                Some(PathBuf::from("/Users/ana")),
+                Some(PathBuf::from("/Users/ana")),
+            ),
+            None,
+            "the home directory itself is not a workspace name"
+        );
+        assert_eq!(
+            default_session_label(None, Some(PathBuf::from("/Users/ana/   ")), None),
+            None,
+            "a whitespace-only basename is not a title"
+        );
+        let long = "x".repeat(70);
+        assert_eq!(
+            default_session_label(Some(long.clone()), None, None).unwrap().chars().count(),
+            60
+        );
+        assert_eq!(
+            default_session_label(None, Some(PathBuf::from(format!("/tmp/{long}"))), None)
+                .unwrap()
+                .chars()
+                .count(),
+            60
+        );
+        let accented = "é".repeat(70);
+        assert_eq!(
+            default_session_label(None, Some(PathBuf::from(format!("/tmp/{accented}"))), None)
+                .unwrap()
+                .chars()
+                .count(),
+            60,
+            "the cap is in code points, not bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_workspace_name_has_no_label() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let cwd = PathBuf::from(OsString::from_vec(b"/tmp/\xff".to_vec()));
+        assert_eq!(default_session_label(None, Some(cwd), None), None);
     }
 
     async fn serve_one(listener: &UnixListener, error_first: bool) {

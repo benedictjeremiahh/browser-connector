@@ -21,7 +21,7 @@ A user-selected, visible local browser context whose existing signed-in state ma
 _Avoid_: Headless browser, remote browser, credential store
 
 **Session Label**:
-The person-readable name an Agent Host gives its Browser Session, stating what that session is working on. It is how a person tells concurrent sessions apart in the tab strip, and a session works before it has one.
+The person-readable name a Browser Session shows in the tab strip, stating what that session is working on. It is how a person tells concurrent sessions apart. The Agent Host may set it with `BROWSER_CONNECTOR_SESSION_LABEL`; otherwise it defaults to the MCP server's working-directory basename, then the host id, and `label_session` can replace it.
 _Avoid_: default title, tab title, group index
 
 **Control Lease**:

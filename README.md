@@ -72,11 +72,11 @@ session.
 
 | Tool | What it does |
 | --- | --- |
-| `tabs_context` | Controlled tabs. Call this first. |
-| `tabs_create` | Open a tab in the Control Lease's group, reusing one already at that URL. |
+| `tabs_context` | Read-only list of this session's Controlled Tabs (id, window, title, URL, active). Call it first; it never opens a tab. |
+| `tabs_create` | Get a tab for a URL in this session's group: reuse a Controlled Tab at that URL, else a Controlled background blank tab, else a released tab this Agent Host opened earlier, else adopt an already-open tab at that URL (including one the person opened), else create a background tab. Call it once per URL. |
 | `tabs_activate` | Bring a controlled tab to the front. |
 | `tabs_close` | Close a controlled tab. |
-| `label_session` | Name this session's tab group. |
+| `label_session` | Replace this session's automatic tab-group label with a better description of the work. |
 | `navigate` | Go to a URL, back, forward, or reload. |
 | `read_page` / `get_page_text` | Accessibility snapshot with refs / bounded visible text. Both can scope to one element's subtree. `read_page` returns a `snapshotId`; pass it back as `diffFrom` to get only what was added, removed or changed. |
 | `find` | Elements by visible text or semantics, as refs. |
@@ -87,7 +87,7 @@ session.
 | `computer` | Visible mouse, keyboard, scroll, drag, wait, and **screenshot**, with a zoom crop. |
 | `upload_file` / `download_file` | Send host-provided bytes to a file input / fetch bounded response bytes through a tab. Each call waits for approval in the Connector Panel. |
 | `browser_batch` | Sequential, non-atomic, fail-fast batch of the above. JavaScript is excluded. |
-| `resize_window` | Resize the window holding a controlled tab. |
+| `resize_window` | Emulate a viewport size (mobile, tablet, desktop, or explicit width and height) in this session's tabs; the person's window is never resized. |
 
 A few behaviours worth knowing:
 
@@ -117,10 +117,22 @@ A few behaviours worth knowing:
   synthetic event never passes through, so the connector sends the corresponding editor
   command alongside the event.
 
-Tab groups carry no icon of their own, so the group title is `🔌` plus the session label
-once the agent names one, and `🔌 <host>` until then — never an opaque id. Each host
-gets its own group color, so sessions from different hosts are distinguishable before
-you read their titles.
+Chrome gives a tab group a title and a color, not an icon, so every group title starts with
+the same `🔌` mark. The rest is the session label: `BROWSER_CONNECTOR_SESSION_LABEL` when
+the Agent Host sets it, otherwise the MCP server's working-directory basename, otherwise
+the host id — never an opaque id. Each session gets its own color from Chrome's nine-color
+palette, so concurrent sessions are distinguishable before you read their titles; two
+sessions can still land on the same color, and the title remains the stronger identifier.
+
+- **`tabs_create` reuses before it opens.** For a URL it takes, in order: a Controlled Tab
+  already at that URL, a Controlled background blank tab, a released tab this Agent Host
+  opened earlier, an already-open tab at that URL (including one the person opened, which
+  moves into the session's group), and only then creates a background tab. Call it once per
+  URL and use the returned `tabId`; do not keep opening blank tabs between navigations. An
+  adopted tab from outside the session was not created by the agent, so it is not closed
+  unless the person asks. See
+  [ADR-0031](docs/adr/0031-adopt-an-open-tab-instead-of-opening-a-duplicate.md) and
+  [ADR-0032](docs/adr/0032-never-create-a-tab-from-a-read-and-sweep-orphan-blanks.md).
 
 ## Repository layout
 

@@ -1,6 +1,6 @@
 import { BrowserController, connectorError, normalizeError, type GroupDescriptor } from "./browser";
-import { RELEASED_TAB_TTL_MS, adoptableTabs, releasedTabsToClose, reusableReleasedTab, type AgentTabRecords } from "./adoption";
-import { groupColor, sessionGroupLabel } from "./naming";
+import { RELEASED_TAB_TTL_MS, adoptableOpenTab, adoptableTabs, orphanBlankTabsToClose, releasedTabsToClose, reusableReleasedTab, shouldRecordAgentTab, type AgentTabRecords } from "./adoption";
+import { GROUP_MARK, groupColor, sessionGroupLabel } from "./naming";
 import { SessionEndings, isSessionEnded } from "./session-endings";
 import { classifyRequest, exactOrigin, hostPermissionPattern, isLocalDevelopmentOrigin, methodsNeedingApproval, redactUrl, sameNavigationTarget } from "./policy";
 import {
@@ -16,8 +16,8 @@ import {
 } from "./types";
 
 const NATIVE_HOST = "io.browser_connector.native";
-/* Below the relay's 60 second request timeout, so an unanswered approval reaches the agent as a denial
-   rather than as an outcome it cannot know. */
+/* Below the relay's 60 second request timeout, so an unanswered approval fails with a definite
+   approval_timeout rather than an outcome the agent cannot know. */
 const APPROVAL_TIMEOUT_MS = 50_000;
 const AUDIT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const browser = new BrowserController();
@@ -27,10 +27,21 @@ let nativeConnected = false;
 let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 let leaseReleaseTimer: ReturnType<typeof setTimeout> | undefined;
 
+/* Adoption and tab creation both read which tabs no one else holds and then write this session's
+   controlled set. Two requests arriving together must not take the same tab, so that decision
+   runs one at a time; the approval wait before it is not serialized. */
+let tabDecision: Promise<unknown> = Promise.resolve();
+function serializeTabDecision<T>(work: () => Promise<T>): Promise<T> {
+  const next = tabDecision.then(work, work);
+  tabDecision = next.catch(() => undefined);
+  return next;
+}
+
 chrome.runtime.onInstalled.addListener(() => {
   void chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
   void pruneAudit();
   void dropAutoApprovedSiteGrants();
+  void serializeTabDecision(sweepLegacyBlanks);
 });
 
 /* The auto-approve build stored an "always" grant for every origin it touched, so those grants
@@ -50,11 +61,17 @@ async function dropAutoApprovedSiteGrants(): Promise<void> {
   await chrome.storage.local.set({ [SITE_GRANT_FLOOR_KEY]: 1 });
 }
 
-chrome.runtime.onStartup.addListener(() => void connectNative());
-/* Released agent tabs are swept on a timer the browser keeps, since the worker itself may sleep. */
+chrome.runtime.onStartup.addListener(() => { void connectNative(); void serializeTabDecision(sweepLegacyBlanks); });
+/* Released agent tabs and orphan blanks are swept on a timer the browser keeps, since the worker
+   itself may sleep. */
 const SWEEP_ALARM = "released-agent-tabs";
 void chrome.alarms?.create(SWEEP_ALARM, { periodInMinutes: 1 });
-chrome.alarms?.onAlarm.addListener((alarm) => { if (alarm.name === SWEEP_ALARM) void sweepReleasedTabs(); });
+chrome.alarms?.onAlarm.addListener((alarm) => {
+  if (alarm.name !== SWEEP_ALARM) return;
+  /* One turn with tab creation: a blank created and grouped but not yet saved must not look
+     orphaned to the sweep. */
+  void serializeTabDecision(async () => { await sweepReleasedTabs(); await sweepOrphanBlanks(); });
+});
 chrome.tabs.onRemoved.addListener((tabId) => void removeControlledTab(tabId));
 chrome.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) => {
   void handlePanelMessage(message).then(sendResponse, (error) => sendResponse({ ok: false, error: String(error) }));
@@ -70,6 +87,15 @@ async function connectNative(): Promise<void> {
     const port = chrome.runtime.connectNative(NATIVE_HOST);
     nativePort = port;
     nativeConnected = true;
+    /* A reconnect means the host is back; a pending disconnect release must not fire over it. */
+    if (leaseReleaseTimer) {
+      clearTimeout(leaseReleaseTimer);
+      leaseReleaseTimer = undefined;
+    }
+    /* The one-time migration also runs here, so reloading the extension clears blanks an older
+       build left behind even when Chrome does not fire onInstalled or onStartup. The floor key
+       makes it a no-op after the first run. */
+    void serializeTabDecision(sweepLegacyBlanks);
     port.onMessage.addListener((message: unknown) => {
       if (isNativeRequest(message)) void handleNativeRequest(message, port);
       else if (isSessionEnded(message)) sessionEndings.ended(message.sessionId);
@@ -117,21 +143,51 @@ async function handleNativeRequest(request: NativeRequest, port: chrome.runtime.
     const authorization = await authorize(request);
     risk = authorization.risk;
     origin = authorization.origin;
-    const controlled = await controlledTabs(request.sessionId);
     const session = await sessionState(request.sessionId);
     const group = {
       key: request.sessionId,
       label: sessionGroupLabel(session),
-      color: groupColor(session.leaseHostId)
+      color: groupColor(session.leaseHostId, session.sessionId)
     };
-    const result = request.method === "label_session"
-      ? await labelSession(request, session, controlled)
-      : (request.method === "tabs_create" && await takeReleasedTab(request, session, controlled, group))
-        || await browser.dispatch(request.method, request.params, controlled, group);
-    if (request.method === "tabs_create") await recordAgentTab(result, session);
-    await saveControlledTabs(request.sessionId, controlled);
+    let result: unknown;
+    if (request.method === "label_session" || request.method === "tabs_create") {
+      /* Read the controlled set inside the turn: an earlier request may have added a tab after this
+         one read it, and the write that follows must not drop that tab. */
+      result = await serializeTabDecision(async () => {
+        const controlled = await controlledTabs(request.sessionId);
+        let value: unknown;
+        if (request.method === "label_session") {
+          value = await labelSession(request, session, controlled);
+        } else {
+          const url = typeof request.params.url === "string" ? request.params.url : undefined;
+          /* The session's own Controlled Tab and Controlled blank win before anything outside the
+             boundary is considered (ADR-0023, ADR-0031, ADR-0032). */
+          value = await browser.canReuseControlled(controlled, url)
+            ? await browser.dispatch(request.method, request.params, controlled, group)
+            : (await takeReleasedTab(request, session, controlled, group))
+              ?? (await takeExistingTab(request, controlled, group))
+              ?? await browser.dispatch(request.method, request.params, controlled, group);
+          await recordAgentTab(value, session);
+        }
+        await saveControlledTabs(request.sessionId, controlled);
+        /* Adoption paths return before dispatch; mark the tab here, while the session still holds
+           it, so ADR-0024's badge appears on the request that adopted it. */
+        await browser.syncMarkers(controlled);
+        return value;
+      });
+    } else {
+      const controlled = await controlledTabs(request.sessionId);
+      result = await browser.dispatch(request.method, request.params, controlled, group);
+      if (request.method === "browser_batch" && isRecord(result) && Array.isArray(result.results)) {
+        for (const entry of result.results) await recordAgentTab(entry, session);
+      }
+      await saveControlledTabs(request.sessionId, controlled);
+    }
+    const adopted = isRecord(result) && result.adopted === true && typeof result.tabId === "number"
+      ? `adopted tab ${result.tabId}`
+      : undefined;
     response = { kind: "response", id: request.id, result };
-    await audit(request, risk, origin, "succeeded");
+    await audit(request, risk, origin, "succeeded", adopted);
   } catch (error) {
     const normalized = normalizeError(error);
     response = { kind: "response", id: request.id, error: normalized };
@@ -227,7 +283,7 @@ async function ensureSiteGrant(
     method: request.method,
     origin,
     title: `Allow access to ${origin}`,
-    detail: "The connector needs exact-origin access before it can read or act on this site.",
+    detail: "The connector needs exact-origin access before it can read or act on this site. If this page is already open in a tab, the agent may use that tab.",
     preview: origin,
     allowPersistentGrant: true,
     allowSessionGrant: true
@@ -299,12 +355,13 @@ async function requestOrigins(method: string, params: Record<string, unknown>): 
 
 /* Host Pairing still resolves without a person: a paired host can reach nothing until a Site Grant
    or a local development origin lets it. Site and action approvals wait for the Connector Panel,
-   and an unanswered one is denied (ADR-0029). */
+   and an unanswered one fails with approval_timeout (ADR-0029). */
 async function askApproval(input: Omit<ApprovalRequest, "id" | "createdAt">): Promise<GrantDecision> {
   if (input.kind === "pairing") return "always";
   const request: ApprovalRequest = { ...input, id: crypto.randomUUID(), createdAt: Date.now() };
+  let timedOut = false;
   const decision = await new Promise<GrantDecision>((resolve) => {
-    const timer = setTimeout(() => resolve("deny"), APPROVAL_TIMEOUT_MS);
+    const timer = setTimeout(() => { timedOut = true; resolve("deny"); }, APPROVAL_TIMEOUT_MS);
     approvals.set(request.id, { request, resolve: (value) => { clearTimeout(timer); resolve(value); } });
     void showPendingApprovals();
     void broadcastState();
@@ -312,6 +369,9 @@ async function askApproval(input: Omit<ApprovalRequest, "id" | "createdAt">): Pr
   approvals.delete(request.id);
   await showPendingApprovals();
   await broadcastState();
+  if (timedOut) {
+    throw connectorError("approval_timeout", `Nobody answered "${request.title}" in the Connector Panel within ${APPROVAL_TIMEOUT_MS / 1000} seconds`);
+  }
   return decision;
 }
 
@@ -434,7 +494,7 @@ async function pruneAudit(): Promise<void> {
 interface SessionState {
   leaseHostId?: string;
   sessionId?: string;
-  /* What this session is working on, as the agent named it. Absent until the agent says. */
+  /* What this session is working on. Set by the relay's default label before the first browser request, and replaced when the agent calls label_session. */
   label?: string;
   controlledTabIds: number[];
   sessionSiteGrants: string[];
@@ -471,10 +531,12 @@ async function labelSession(request: NativeRequest, session: SessionState, contr
   const adopted = adoptableTabs(records, session, liveControlled, openTabs).filter((tabId) => !controlled.has(tabId));
   for (const tabId of adopted) { controlled.add(tabId); delete records[tabId]!.releasedAt; }
   await chrome.storage.session.set({ [AGENT_TABS_KEY]: records });
-  const group = { key: request.sessionId, label: sessionGroupLabel(session), color: groupColor(session.leaseHostId) };
+  await saveControlledTabs(request.sessionId, controlled);
+  const group = { key: request.sessionId, label: sessionGroupLabel(session), color: groupColor(session.leaseHostId, session.sessionId) };
   if (adopted.length) await browser.adoptGroup(group, adopted);
-  /* The stored label is what the agent said; the title is that label wearing the
-     session's mark, which is why the title is recomputed here rather than reused. */
+  /* The stored label is the session's label — the relay's default or the agent's replacement; the
+     title is that label wearing the session's mark, which is why the title is recomputed here
+     rather than reused. */
   await browser.renameGroup(group);
   return adopted.length ? { labelled: label, adoptedTabIds: adopted } : { labelled: label };
 }
@@ -484,7 +546,19 @@ const AGENT_TABS_KEY = "agentTabs";
 async function markReleased(tabIds: number[]): Promise<void> {
   const records = await agentTabRecords();
   let changed = false;
-  for (const tabId of tabIds) if (records[tabId]) { records[tabId]!.releasedAt = Date.now(); changed = true; }
+  for (const tabId of tabIds) {
+    const record = records[tabId];
+    if (!record) continue;
+    const tab = await chrome.tabs.get(tabId).catch(() => undefined);
+    record.releasedAt = Date.now();
+    /* Where the tab lived when it was released: the sweep later closes it only while it is still
+       in that group, so a tab the person moved out is theirs. */
+    if (tab) {
+      record.groupId = tab.groupId;
+      record.windowId = tab.windowId;
+    }
+    changed = true;
+  }
   if (changed) await chrome.storage.session.set({ [AGENT_TABS_KEY]: records });
 }
 
@@ -493,31 +567,79 @@ async function liveControlledTabs(exceptSessionId?: string): Promise<Set<number>
 }
 
 /* tabs_create for a URL a released tab of the same Agent Host already shows takes that tab into this
-   session instead of opening another copy (ADR-0027). */
+   session instead of opening another copy (ADR-0025, ADR-0027). This branch must run only after the
+   session's own Controlled Tab and Controlled blank tab have been checked (ADR-0031, ADR-0032). */
 async function takeReleasedTab(request: NativeRequest, session: SessionState, controlled: Set<number>, group: GroupDescriptor): Promise<unknown> {
   const url = typeof request.params.url === "string" ? request.params.url : undefined;
   if (!url) return undefined;
   const records = await agentTabRecords();
-  const open = (await chrome.tabs.query({})).flatMap((tab) => tab.id === undefined ? [] : [{ id: tab.id, url: tab.url }]);
+  const open = (await chrome.tabs.query({})).flatMap((tab) => tab.id === undefined ? [] : [{
+    id: tab.id, url: tab.url, pinned: tab.pinned, incognito: tab.incognito
+  }]);
   const tabId = reusableReleasedTab(records, session.leaseHostId, await liveControlledTabs(request.sessionId), open, (tabUrl) => sameNavigationTarget(tabUrl, url));
-  if (tabId === undefined) return undefined;
+  /* A tab this session already controls is not a released tab; browser.dispatch will reuse it
+     under ADR-0023 without pretending it was adopted again. */
+  if (tabId === undefined || controlled.has(tabId)) return undefined;
+  const tab = await chrome.tabs.get(tabId).catch(() => undefined);
+  if (!tab) return undefined;
   controlled.add(tabId);
   delete records[tabId]!.releasedAt;
   if (session.label) records[tabId]!.label = session.label;
   await chrome.storage.session.set({ [AGENT_TABS_KEY]: records });
   await browser.adoptGroup(group, [tabId]);
-  const tab = await chrome.tabs.get(tabId);
+  /* Written before the adoption lock opens again: the next session must see this tab as held. */
+  await saveControlledTabs(request.sessionId, controlled);
   return { tabId, windowId: tab.windowId, url: tab.url ? redactUrl(tab.url) : undefined, reused: true, adopted: true };
+}
+
+/* A tab the person already has at the requested URL is taken into the session instead of opening a
+   duplicate (ADR-0031). A tab recorded as an agent's is left to takeReleasedTab, which knows how to
+   hand it back with its record. The tab is joined to this session's group rather than adopting the
+   group it already lives in: that group is the person's. */
+async function takeExistingTab(request: NativeRequest, controlled: Set<number>, group: GroupDescriptor): Promise<unknown> {
+  const url = typeof request.params.url === "string" ? request.params.url : undefined;
+  if (!url) return undefined;
+  const records = await agentTabRecords();
+  const sessionWindows = new Set<number>();
+  for (const tabId of controlled) {
+    const tab = await chrome.tabs.get(tabId).catch(() => undefined);
+    if (tab) sessionWindows.add(tab.windowId);
+  }
+  const focused = await chrome.windows.getLastFocused({ windowTypes: ["normal"] }).catch(() => undefined);
+  const tabId = adoptableOpenTab(await chrome.tabs.query({}), {
+    records,
+    liveControlled: await liveControlledTabs(request.sessionId),
+    sessionControlled: controlled,
+    windowIds: sessionWindows,
+    focusedWindowId: focused?.id,
+    matches: (candidate) => sameNavigationTarget(candidate, url)
+  });
+  if (tabId === undefined) return undefined;
+  const tab = await chrome.tabs.get(tabId).catch(() => undefined);
+  /* The person may have navigated the tab between the query and this read. */
+  if (!tab?.url || !sameNavigationTarget(tab.url, url)) return undefined;
+  controlled.add(tabId);
+  try {
+    await browser.ensureTabGroup(group, tabId);
+    /* Written before the adoption lock opens again: the next session must see this tab as held. */
+    await saveControlledTabs(request.sessionId, controlled);
+    return { tabId, windowId: tab.windowId, url: tab.url ? redactUrl(tab.url) : undefined, reused: true, adopted: true };
+  } catch {
+    controlled.delete(tabId);
+    return undefined;
+  }
 }
 
 async function sweepReleasedTabs(): Promise<void> {
   const records = await agentTabRecords();
   if (!Object.values(records).some((record) => record.releasedAt !== undefined && Date.now() - record.releasedAt >= RELEASED_TAB_TTL_MS)) return;
-  const focused = new Set((await chrome.windows.getAll()).filter((window) => window.focused).flatMap((window) => window.id === undefined ? [] : [window.id]));
   const open = (await chrome.tabs.query({})).flatMap((tab) => tab.id === undefined ? [] : [{
     id: tab.id,
-    grouped: tab.groupId !== undefined && tab.groupId !== -1,
-    inView: tab.active === true && focused.has(tab.windowId)
+    groupId: tab.groupId,
+    active: tab.active,
+    pinned: tab.pinned,
+    audible: tab.audible,
+    incognito: tab.incognito
   }]);
   for (const tabId of releasedTabsToClose(records, Date.now(), await liveControlledTabs(), open)) {
     await chrome.tabs.remove(tabId).catch(() => undefined);
@@ -529,15 +651,58 @@ async function sweepReleasedTabs(): Promise<void> {
   await chrome.storage.session.set({ [AGENT_TABS_KEY]: records });
 }
 
+/* A blank tab left in a connector group has no content worth keeping: ADR-0027's ten minutes
+   exists for pages, not placeholders. The group title is the only durable owner mark, and a tab a
+   live session holds or the person is looking at is left alone. */
+async function sweepOrphanBlanks(agentCreatedOnly = true): Promise<void> {
+  const groups = await chrome.tabGroups.query({}).catch(() => []);
+  const connectorGroups = new Map(
+    groups.filter((group) => (group.title ?? "").startsWith(GROUP_MARK)).map((group) => [group.id, group.title ?? ""])
+  );
+  if (!connectorGroups.size) return;
+  const tabs = (await chrome.tabs.query({})).filter((tab) => tab.groupId !== undefined && connectorGroups.has(tab.groupId));
+  const focused = new Set((await chrome.windows.getAll())
+    .filter((window) => window.focused)
+    .flatMap((window) => window.id === undefined ? [] : [window.id]));
+  /* Chrome may not be the focused app, so the last window it had is still where the person left
+     off looking. */
+  const lastFocused = await chrome.windows.getLastFocused({ windowTypes: ["normal"] }).catch(() => undefined);
+  if (lastFocused?.id !== undefined) focused.add(lastFocused.id);
+  const records = await agentTabRecords();
+  const agentCreated = agentCreatedOnly ? new Set(Object.keys(records).map(Number)) : undefined;
+  const close = orphanBlankTabsToClose(
+    tabs.map((tab) => ({ ...tab, groupTitle: connectorGroups.get(tab.groupId!) })),
+    {
+      liveControlled: await liveControlledTabs(),
+      focusedWindowIds: focused,
+      connectorTitlePrefix: GROUP_MARK,
+      ...(agentCreated ? { agentCreated } : {})
+    }
+  );
+  for (const tabId of close) await chrome.tabs.remove(tabId).catch(() => undefined);
+}
+
+/* A one-time migration for blanks an earlier build created without recording them. After it runs,
+   the periodic sweep closes only tabs this build knows the agent created, so a tab the person
+   opened can never be mistaken for one. */
+const BLANK_SWEEP_FLOOR_KEY = "blankSweepFloor";
+async function sweepLegacyBlanks(): Promise<void> {
+  const stored = await chrome.storage.local.get(BLANK_SWEEP_FLOOR_KEY);
+  if (stored[BLANK_SWEEP_FLOOR_KEY] === 1) return;
+  await sweepOrphanBlanks(false);
+  await chrome.storage.local.set({ [BLANK_SWEEP_FLOOR_KEY]: 1 });
+}
+
 async function agentTabRecords(): Promise<AgentTabRecords> {
   const stored = (await chrome.storage.session.get(AGENT_TABS_KEY))[AGENT_TABS_KEY];
   return isRecord(stored) ? stored as AgentTabRecords : {};
 }
 
-/* Only a tab the agent itself opened is recorded, so adoption can never reach a tab the person
-   opened or handed over through the panel. */
+/* Only a tab the agent itself opened is recorded, so label_session resumption (ADR-0025) can
+   never reach a tab the person opened or handed over through the panel; tabs_create's open-tab
+   adoption is a separate path (ADR-0031). */
 async function recordAgentTab(result: unknown, session: SessionState): Promise<void> {
-  if (!isRecord(result) || result.reused !== false || typeof result.tabId !== "number" || !session.leaseHostId) return;
+  if (!shouldRecordAgentTab(result) || !session.leaseHostId) return;
   const records = await agentTabRecords();
   records[result.tabId] = { hostId: session.leaseHostId, ...(session.label ? { label: session.label } : {}) };
   await chrome.storage.session.set({ [AGENT_TABS_KEY]: records });

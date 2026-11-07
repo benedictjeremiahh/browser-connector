@@ -1,4 +1,4 @@
-import { GROUP_MARK, groupColor, sessionGroupLabel } from "../src/naming";
+import { GROUP_COLORS, GROUP_MARK, groupColor, sessionGroupLabel } from "../src/naming";
 import { describe, expect, it } from "vitest";
 
 describe("tab group naming", () => {
@@ -26,9 +26,22 @@ describe("tab group naming", () => {
     expect(characters.at(-1)).toBe("…");
   });
 
-  it("gives one host one color and a stable default", () => {
+  it("falls back to the host colour when no session id is available", () => {
     expect(groupColor("opencode")).toBe(groupColor("opencode"));
     expect(groupColor(undefined)).toBe("green");
     expect(groupColor("  ")).toBe("green");
+  });
+
+  it("gives one session one color, whatever host or label it has", () => {
+    expect(groupColor("opencode", "session-a")).toBe(groupColor("opencode", "session-a"));
+    expect(groupColor("opencode", "session-a")).toBe(groupColor("codex", "session-a"));
+    expect(groupColor(undefined, "session-a")).toBe(groupColor("opencode", "session-a"));
+    expect(groupColor("opencode", "")).toBe(groupColor("opencode"));
+  });
+
+  it("gives different sessions different colors in practice", () => {
+    const colors = new Set(Array.from({ length: 32 }, (_, index) => groupColor("opencode", `session-${index}`)));
+    expect(colors.size).toBeGreaterThan(1);
+    for (const color of colors) expect(GROUP_COLORS).toContain(color);
   });
 });

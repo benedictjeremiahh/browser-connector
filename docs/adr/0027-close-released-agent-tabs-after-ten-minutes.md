@@ -1,5 +1,8 @@
 # Close released agent tabs after ten minutes
 
+Revised by ADR-0031, 2026-11-07: a tab adopted from outside the session is never recorded, so this
+ten-minute close never applies to it.
+
 ADR-0017 kept every tab after its lease ended, and ADR-0025 let a later session with the same label take them back. In practice an orchestrator labels each piece of work differently, so nothing ever took them back: every session left its tabs behind, and a person running several agent checks a day ended up with a row of identical pages they had to close by hand.
 
 Two changes, both limited to tabs the agent itself opened through `tabs_create`, which are the only tabs the extension records:

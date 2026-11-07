@@ -97,7 +97,7 @@ function renderAudit(state: PanelState): void {
   auditRoot.replaceChildren();
   for (const event of state.auditEvents) {
     const item = document.createElement("li");
-    item.textContent = `${event.hostId} · ${event.method} · ${event.outcome}${event.origin ? ` · ${event.origin}` : ""}`;
+    item.textContent = `${event.hostId} · ${event.method} · ${event.outcome}${event.origin ? ` · ${event.origin}` : ""}${event.message ? ` · ${event.message}` : ""}`;
     const time = document.createElement("time");
     time.dateTime = new Date(event.timestamp).toISOString();
     time.textContent = new Date(event.timestamp).toLocaleString();

@@ -18,8 +18,9 @@ pages, so the floor goes back everywhere else.
 - **Protected and Critical classifications stay recorded, not gated.** A click on a submit button
   on a local page still runs without a prompt.
 - **Host Pairing stays automatic.** A paired host reaches nothing until an origin above lets it.
-- An unanswered approval is denied after 50 seconds, below the relay's 60 second request timeout,
-  so the agent sees a denial rather than an unknown outcome. The toolbar badge counts what waits.
+- An unanswered approval returns an `approval_timeout` error after 50 seconds, below the relay's
+  60 second request timeout, so the agent sees a definite failure rather than an unknown outcome.
+  The toolbar badge counts what waits.
 
 ## Consequences
 

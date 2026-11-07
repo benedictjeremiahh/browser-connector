@@ -6,6 +6,9 @@ When a session names itself with `label_session`, the extension now hands it the
 
 Only tabs the agent itself opened through `tabs_create` are recorded for adoption. A tab the person opened, or handed over through the panel, is never adopted this way, so ADR-0017's opt-in rule for the person's own tabs stands. The record lives in session storage and disappears with the browser session, as the tab groups themselves do.
 
+Superseded in part by ADR-0031: `tabs_create` may adopt a tab the person opened at the requested
+URL; label-based resumption still never takes such a tab.
+
 ## Consequences
 
 An agent that wants its earlier tabs back must label its session with the same, stable name, before it opens new ones. Two different pieces of work under one label from one host will share tabs; callers that run several such pieces of work, such as an orchestrator running tasks, put a work identifier into the label. A host that never labels its sessions behaves exactly as before.

@@ -1,5 +1,9 @@
 # Reuse a Controlled Tab before creating one
 
+Revised by ADR-0031, 2026-11-07: `tabs_create` now also adopts an already-open tab at the
+requested URL, including one the person opened; the count-only rule and the unchanged-boundary
+claim below no longer stand.
+
 `tabs_create` searches this session's own Controlled Tabs for one already at the requested URL before it opens a new tab, and returns `reused: true` when it finds one. Matching ignores the URL fragment, because a fragment is a position inside a document rather than a different document. When no controlled tab matches and a new one is opened, the result also reports how many tabs outside the control boundary hold the same URL — as a count, never as an id, title, or URL.
 
 Claude in Chrome, the behavioral baseline, always opens a new tab and asks the user to drag existing tabs into Claude's group. This deviates from that, and is recorded here because [ADR-0002](0002-use-claude-in-chrome-as-the-behavioral-baseline.md) requires a deliberate deviation to be justified rather than presented as parity. An agent that reopens the page it is already working on duplicates its own state, and a second controlled copy of one document makes every Page Reference, console record, and network record ambiguous by forcing the agent to remember which copy it meant.

@@ -3,11 +3,12 @@ import {
   boundedText,
   clampLimit,
   exactOrigin,
+  isBlankTabUrl,
   isRestrictedUrl,
   redactUrl,
   sameNavigationTarget
 } from "./policy";
-import type { GroupColor } from "./naming";
+import { GROUP_MARK, type GroupColor } from "./naming";
 import {
   RUNTIME_MISSING,
   injectedAssert,
@@ -179,7 +180,7 @@ export class BrowserController {
 
   private async dispatchMethod(method: string, params: Record<string, unknown>, controlledTabIds: Set<number>, group: GroupDescriptor): Promise<unknown> {
     switch (method) {
-      case "tabs_context": return this.tabsContext(controlledTabIds, params.createIfEmpty === true, group);
+      case "tabs_context": return this.tabsContext(controlledTabIds);
       case "tabs_create": return this.tabsCreateSettled(controlledTabIds, params, group);
       case "tabs_activate": return this.tabsActivate(asTabId(params.tabId), controlledTabIds);
       case "tabs_close": return this.tabsClose(controlledTabIds, asTabId(params.tabId));
@@ -198,7 +199,7 @@ export class BrowserController {
       case "resize_window": return this.emulateViewport(params, controlledTabIds);
       case "upload_file": return this.uploadFile(params);
       case "download_file": return this.downloadFile(asTabId(params.tabId), asString(params.url));
-      case "browser_batch": return this.browserBatch(params, controlledTabIds);
+      case "browser_batch": return this.browserBatch(params, controlledTabIds, group);
       default: throw connectorError("unknown_tool", `Unknown browser tool: ${method}`);
     }
   }
@@ -403,25 +404,38 @@ export class BrowserController {
     this.attachedTabs.clear();
   }
 
-  private async tabsContext(controlledTabIds: Set<number>, createIfEmpty: boolean, group: GroupDescriptor): Promise<unknown> {
-    if (controlledTabIds.size === 0 && createIfEmpty) await this.tabsCreate(controlledTabIds, undefined, group);
-    const tabs = await Promise.all([...controlledTabIds].map((tabId) => chrome.tabs.get(tabId).catch(() => undefined)));
+  /* Adoption paths return before dispatch, so they ask for the mark themselves; the marker sync
+     is idempotent and skips tabs it already marked. */
+  async syncMarkers(tabIds: Iterable<number>): Promise<void> {
+    await this.markers.sync(tabIds).catch(() => undefined);
+  }
+
+  /* A read never changes the browser: the old createIfEmpty path opened about:blank, and a blank
+     tab the connector could not record was left behind when the agent asked for its real URL
+     next (ADR-0032). An empty result names the next step instead. */
+  private async tabsContext(controlledTabIds: Set<number>): Promise<unknown> {
+    const tabs = (await Promise.all([...controlledTabIds].map((tabId) => chrome.tabs.get(tabId).catch(() => undefined))))
+      .filter(Boolean);
     return {
-      tabs: tabs.filter(Boolean).map((tab) => ({
+      tabs: tabs.map((tab) => ({
         id: tab!.id,
         windowId: tab!.windowId,
         title: tab!.title,
         url: tab!.url ? redactUrl(tab!.url) : undefined,
         active: tab!.active
-      }))
+      })),
+      ...(tabs.length === 0
+        ? { hint: "No controlled tabs. Call tabs_create with the URL you need; it reuses or adopts an open tab at that URL instead of opening a duplicate." }
+        : {})
     };
   }
 
   /* Reuse before create. An agent that asks for the page it is already working on
      should land on that page, not on a second copy of it: two controlled copies of
      one document make every Page Reference, console record and network record
-     ambiguous. Only this session's own Controlled Tabs are searched, so nothing
-     the user did not hand over becomes reachable (ADR-0017, ADR-0023). */
+     ambiguous. A Controlled Tab at the URL wins first, then a Controlled background
+     blank; only afterward may an open tab be adopted outside this method
+     (ADR-0023, ADR-0031, ADR-0032). */
   private async tabsCreate(controlledTabIds: Set<number>, url?: string, group: GroupDescriptor = DEFAULT_GROUP): Promise<unknown> {
     if (url && isRestrictedUrl(url)) throw connectorError("restricted_url", `Cannot open privileged or unsupported URL: ${url}`);
     if (url) {
@@ -429,6 +443,27 @@ export class BrowserController {
       if (existing !== undefined) {
         const tab = await chrome.tabs.get(existing);
         return { tabId: existing, windowId: tab.windowId, url: tab.url ? redactUrl(tab.url) : redactUrl(url), reused: true };
+      }
+    }
+    /* A blank tab this session already holds is a placeholder, not a destination: navigating it
+       is what the agent meant, and creating a second tab would leave the blank behind (ADR-0032).
+       Only a background blank is reused; an active one may be the person's. */
+    const blank = await this.reuseControlledBlank(controlledTabIds);
+    if (blank !== undefined) {
+      try {
+        if (url) await chrome.tabs.update(blank, { url, active: false });
+        const tab = await chrome.tabs.get(blank);
+        return {
+          tabId: blank,
+          windowId: tab.windowId,
+          /* The update has not committed yet, so tab.url can still be about:blank; the requested
+             URL is the one this call navigated the tab to. */
+          url: url ? redactUrl(url) : tab.url ? redactUrl(tab.url) : redactUrl("about:blank"),
+          reused: true,
+          reusedBlank: true
+        };
+      } catch {
+        /* The blank disappeared or Chrome refused the navigation; fall through and open one. */
       }
     }
     /* Work tabs open in the background: the person keeps the tab they are using (ADR-0024). */
@@ -453,6 +488,22 @@ export class BrowserController {
     return undefined;
   }
 
+  private async reuseControlledBlank(controlledTabIds: Set<number>): Promise<number | undefined> {
+    for (const tabId of controlledTabIds) {
+      const tab = await chrome.tabs.get(tabId).catch(() => undefined);
+      if (tab && !tab.active && isBlankTabUrl(tab.url, tab.pendingUrl)) return tabId;
+    }
+    return undefined;
+  }
+
+  /* Whether tabs_create can satisfy this request from a tab the session already holds, before an
+     adoption helper looks outside the boundary. A Controlled Tab at the URL wins over a Controlled
+     blank, and both win over a released or already-open tab (ADR-0023, ADR-0031). */
+  async canReuseControlled(controlledTabIds: Set<number>, url?: string): Promise<boolean> {
+    if (url && await this.reuseControlledTab(controlledTabIds, url) !== undefined) return true;
+    return await this.reuseControlledBlank(controlledTabIds) !== undefined;
+  }
+
   /* The Controlled Tab boundary is what keeps tabs the user did not hand over
      invisible. A count is not a tab: it answers "is this already open somewhere I
      may not touch?" without naming anything outside the boundary, so tabs_context
@@ -464,12 +515,22 @@ export class BrowserController {
     ).length;
   }
 
-  private async ensureTabGroup(group: GroupDescriptor, tabId: number): Promise<void> {
+  /* Moves a tab into this session's group. It is deliberately different from adoptGroup: this
+     one does not take over the group the tab already lives in, which is what an adopted tab
+     needs because that group belongs to the person, not to the agent. */
+  async ensureTabGroup(group: GroupDescriptor, tabId: number): Promise<void> {
     try {
       const existing = this.groupIds.get(group.key);
       if (existing !== undefined) {
         await chrome.tabs.group({ groupId: existing, tabIds: [tabId] });
         if (group.label) await chrome.tabGroups.update(existing, { title: group.label, ...colorProperty(group) }).catch(() => {});
+        return;
+      }
+      const recovered = await this.recoverGroup(group);
+      if (recovered !== undefined) {
+        this.groupIds.set(group.key, recovered);
+        await chrome.tabs.group({ groupId: recovered, tabIds: [tabId] });
+        if (group.label) await chrome.tabGroups.update(recovered, { title: group.label, ...colorProperty(group) }).catch(() => {});
         return;
       }
       const groupId = await chrome.tabs.group({ tabIds: [tabId] });
@@ -480,17 +541,29 @@ export class BrowserController {
     }
   }
 
-  /* Adopted tabs bring their group with them: the session continues in the group the work
-     already lives in rather than pulling the tabs into a new one (ADR-0025). */
+  /* Adopted tabs bring their group with them only when that group is a connector group: the
+     session continues where the work already lives (ADR-0025). A person's group is not taken
+     over; the tab moves into a new connector group instead. */
   async adoptGroup(group: GroupDescriptor, tabIds: number[]): Promise<void> {
     if (this.groupIds.has(group.key)) {
       for (const tabId of tabIds) await this.ensureTabGroup(group, tabId);
       return;
     }
     const tabs = await Promise.all(tabIds.map((tabId) => chrome.tabs.get(tabId).catch(() => undefined)));
-    const groupId = tabs.find((tab) => tab && tab.groupId !== undefined && tab.groupId >= 0)?.groupId;
-    if (groupId !== undefined) this.groupIds.set(group.key, groupId);
+    const candidate = tabs.find((tab) => tab && tab.groupId !== undefined && tab.groupId >= 0);
+    if (candidate?.groupId !== undefined) {
+      const current = await Promise.resolve(chrome.tabGroups?.get?.(candidate.groupId)).catch(() => undefined);
+      if ((current?.title ?? "").startsWith(GROUP_MARK)) this.groupIds.set(group.key, candidate.groupId);
+    }
     for (const tabId of tabIds) await this.ensureTabGroup(group, tabId);
+  }
+
+  /* The worker's map of session to group does not survive a worker restart, so a group already in
+     the tab strip is found again by the title and color it was given, rather than starting a
+     second group for the same session. */
+  private async recoverGroup(group: GroupDescriptor): Promise<number | undefined> {
+    const groups = (await Promise.resolve(chrome.tabGroups?.query?.({})).catch(() => [])) ?? [];
+    return groups.find((candidate) => candidate.title === group.label && (!group.color || candidate.color === group.color))?.id;
   }
 
   /* A rename before any tab exists has no group to update yet; the label is already stored on
@@ -978,7 +1051,7 @@ export class BrowserController {
     return { ...(result.result?.value as object ?? {}), artifact: true };
   }
 
-  private async browserBatch(params: Record<string, unknown>, controlledTabIds: Set<number>): Promise<unknown> {
+  private async browserBatch(params: Record<string, unknown>, controlledTabIds: Set<number>, group: GroupDescriptor = DEFAULT_GROUP): Promise<unknown> {
     const actions = Array.isArray(params.actions) ? params.actions : [];
     const results: unknown[] = [];
     for (let index = 0; index < actions.length; index += 1) {
@@ -988,7 +1061,7 @@ export class BrowserController {
         throw connectorError("invalid_batch", `Invalid action at index ${index}`);
       }
       try {
-        results.push(await this.dispatch(action.tool, action.arguments as Record<string, unknown>, controlledTabIds));
+        results.push(await this.dispatch(action.tool, action.arguments as Record<string, unknown>, controlledTabIds, group));
       } catch (error) {
         return { completed: index, results, failedAt: index, error: normalizeError(error), atomic: false };
       }
@@ -1582,6 +1655,7 @@ function asTabId(value: unknown): number {
   if (!Number.isInteger(id) || id < 0) throw connectorError("invalid_arguments", "Expected a valid tab ID");
   return id;
 }
+
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));

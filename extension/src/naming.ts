@@ -44,13 +44,16 @@ export function sessionGroupLabel(session: {
   return clamp(`${GROUP_MARK} Browser Connector`);
 }
 
-/* Same host, same color, every time and across restarts — a person learns the
-   color once and then reads the tab strip instead of the titles. */
-export function groupColor(hostId: string | undefined): GroupColor {
-  const host = hostId?.trim();
-  if (!host) return "green";
+/* The color names the session, not the host: a person runs many sessions from one host,
+   and identical groups in the tab strip make concurrent work indistinguishable. The
+   session id is stable for the life of the MCP process, so a rename does not change it,
+   and a host with no session to name falls back to its own color. */
+export function groupColor(hostId: string | undefined, sessionId?: string): GroupColor {
+  const session = sessionId?.trim();
+  const seed = session ? `session:${session}` : hostId?.trim() ?? "";
+  if (!seed) return "green";
   let hash = 0;
-  for (const character of host) {
+  for (const character of seed) {
     hash = (hash * 31 + (character.codePointAt(0) ?? 0)) >>> 0;
   }
   return GROUP_COLORS[hash % GROUP_COLORS.length]!;

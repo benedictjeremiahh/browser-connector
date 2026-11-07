@@ -9,10 +9,12 @@ Use Browser Connector only when the user asks to work in their real local browse
 
 ## Start every browser session
 
-1. Call `tabs_context` before every other browser tool.
+1. Call `tabs_context` once before any other browser tool. It is read-only, takes no arguments, and never opens a tab; it returns only the tabs this session already controls.
 2. Never reuse a tab ID or Page Reference from another session.
-3. Reuse an existing tab only if the user explicitly made it a Controlled Tab. Otherwise use `tabs_create`.
-4. If the extension is disconnected, ask the user to open Chrome and the Browser Connector side panel. Do not repeatedly retry.
+3. A session label is applied automatically from `BROWSER_CONNECTOR_SESSION_LABEL`, else the MCP server's working-directory name, else the host id. If you can describe the work better, call `label_session` before the first `tabs_create`: the same label from the same Agent Host is how a new session finds the tabs an earlier session opened for that work.
+4. Get the page you need with `tabs_create(url)`. It reuses, in order, a Controlled Tab already at that URL, a Controlled background blank tab, a released tab this Agent Host opened earlier, then an already-open tab at that URL (including one the person opened, which joins this session's group), and only creates a background tab when none exists. Call it once per URL; do not open a blank tab "to have one" and do not call it again for a page you already control.
+5. An adopted tab from outside this session, including one the person opened, was not created in this session; do not close it with `tabs_close` unless the person asks.
+6. If the extension is disconnected, ask the user to open Chrome and the Browser Connector side panel. Do not repeatedly retry.
 
 ## Interaction
 
@@ -26,7 +28,7 @@ Use Browser Connector only when the user asks to work in their real local browse
 
 ## Safety and recovery
 
-- The Connector Panel asks the person before a site other than a local development origin, and before every `javascript_tool`, `upload_file` and `download_file` call. An unanswered request is denied after 50 seconds: say what you are waiting for and retry once the person is there. Never attempt to bypass or weaken it.
+- The Connector Panel asks the person before a site other than a local development origin, and before every `javascript_tool`, `upload_file` and `download_file` call. An unanswered request returns an `approval_timeout` error after 50 seconds: say what you are waiting for and retry once the person is there. Never attempt to bypass or weaken it.
 - Login, CAPTCHA, passkeys, biometrics, password-manager UI, and browser permission dialogs are user-only steps. Pause and ask the user to complete them.
 - Never request cookies, authorization headers, passwords, or browser-storage secrets.
 - A failed mutation may return `outcome_unknown`. Re-read browser state before deciding what to do and never blindly replay the mutation.

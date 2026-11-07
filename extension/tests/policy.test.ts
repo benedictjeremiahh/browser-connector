@@ -1,4 +1,4 @@
-import { boundedText, classifyRequest, exactOrigin, isLocalDevelopmentOrigin, isRestrictedUrl, methodsNeedingApproval, redactUrl } from "../src/policy";
+import { boundedText, classifyRequest, exactOrigin, isBlankTabUrl, isLocalDevelopmentOrigin, isRestrictedUrl, methodsNeedingApproval, redactUrl, sameNavigationTarget } from "../src/policy";
 import { describe, expect, it } from "vitest";
 
 describe("connector policy", () => {
@@ -23,6 +23,22 @@ describe("connector policy", () => {
   it("classifies Claude-shaped read tools as read-only", () => {
     expect(classifyRequest("read_page", {}).risk).toBe("read_only");
     expect(classifyRequest("read_network_requests", { includeResponseBody: true }).risk).toBe("protected");
+  });
+
+  it("keeps tabs_context a read even if an older caller passes createIfEmpty", () => {
+    expect(classifyRequest("tabs_context", {}).risk).toBe("read_only");
+    expect(classifyRequest("tabs_context", { createIfEmpty: true }).risk).toBe("read_only");
+  });
+
+  it("recognizes the blank destinations a tab may start at", () => {
+    expect(isBlankTabUrl("about:blank")).toBe(true);
+    expect(isBlankTabUrl("about:blank#top")).toBe(true);
+    expect(isBlankTabUrl(undefined, "chrome://newtab/")).toBe(true);
+    expect(isBlankTabUrl("chrome://newtab")).toBe(true);
+    expect(isBlankTabUrl("chrome://settings")).toBe(false);
+    expect(isBlankTabUrl("chrome://newtabfoo")).toBe(false);
+    expect(isBlankTabUrl("https://example.com/")).toBe(false);
+    expect(isBlankTabUrl("about:blank", "https://example.com/")).toBe(false);
   });
 
   it("treats wait_for and assert as read-only, including inside a batch", () => {
@@ -53,6 +69,12 @@ describe("connector policy", () => {
     expect(isRestrictedUrl("chrome://settings")).toBe(true);
     expect(isRestrictedUrl("https://example.com/path")).toBe(false);
     expect(exactOrigin("http://localhost:3000/a")).toBe("http://localhost:3000");
+  });
+
+  it("treats the same page with a different fragment or query order as one target", () => {
+    expect(sameNavigationTarget("https://example.com/a#one", "https://example.com/a#two")).toBe(true);
+    expect(sameNavigationTarget("https://example.com/?b=2&a=1", "https://example.com/?a=1&b=2")).toBe(true);
+    expect(sameNavigationTarget("https://example.com/?a=1", "https://example.com/?a=2")).toBe(false);
   });
 
   it("redacts query values and bounds UTF-8 output", () => {

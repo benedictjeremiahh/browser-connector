@@ -32,13 +32,13 @@ The MCP bridge and Native Broker are subcommands of one standalone binary. Chrom
 
 All observations are bounded and pageable. Page, console, and network output is Untrusted Browser Content. Element Page References are opaque and become stale when their tab or document generation changes.
 
-`tabs_create` reuses a Controlled Tab already at the requested URL before it opens a new one, and reports how many tabs outside the control boundary hold that URL. `computer` covers click (left, right, middle), double click, hover, drag, typing, key presses with modifiers and repeat, scroll, wait, and screenshot with a region crop.
+`tabs_create` reuses a Controlled Tab already at the requested URL, a controlled blank tab, or an already-open tab at that URL before it opens a new one. `tabs_context` is read-only and never opens a tab. `computer` covers click (left, right, middle), double click, hover, drag, typing, key presses with modifiers and repeat, scroll, wait, and screenshot with a region crop.
 
 ## Permissions and safety
 
 - Only paired hosts can request a Control Lease.
 - Only one Agent Host controls a Browser Session at a time.
-- Existing tabs require explicit user opt-in; agent-created tabs join an ephemeral visible tab group.
+- A tab already showing the requested URL is adopted into the lease group; other existing tabs stay outside the boundary. Agent-created tabs join an ephemeral visible tab group.
 - Manual mode approves every browser mutation. Auto mode allows routine mutations covered by a Site Grant.
 - Protected Actions always require approval. Critical Actions additionally show a consequence-specific warning and cannot be persistently approved.
 - Financial and irreversible actions are possible only as Critical Actions; they are not silently blocked or silently executed.
