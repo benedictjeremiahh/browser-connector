@@ -284,12 +284,11 @@ export function injectedAssert(expectations: PageExpectation[], generation: numb
   const expandedOf = (element: Element) => element.getAttribute("aria-expanded") === "true" || (element as HTMLDetailsElement).open === true;
   const selectedOf = (element: Element) => element.getAttribute("aria-selected") === "true" || (element as HTMLOptionElement).selected === true;
   /* A label and its control both match the same name; the control is what an assertion is about. */
+  /* State, value and count are about the control, even when the control has no box
+     and the person interacts through its label. Visibility is checked below. */
   const controlFor = (element: HTMLElement): HTMLElement => {
     if (element.tagName.toLowerCase() !== "label") return element;
-    const control = (element as HTMLLabelElement).control as HTMLElement | null;
-    if (!control) return element;
-    const box = control.getBoundingClientRect();
-    return box.width > 0 || box.height > 0 ? control : element;
+    return ((element as HTMLLabelElement).control as HTMLElement | null) ?? element;
   };
 
   const targets = (expectation: PageExpectation): { list: HTMLElement[]; stale?: true } => {
@@ -326,7 +325,9 @@ export function injectedAssert(expectations: PageExpectation[], generation: numb
     if (stale) return { passed: false, observed: "Page Reference is stale; call find or read_page again" };
     const parts = [plural(list.length)];
     if (!list.length) return { passed: expectation.state === "hidden", observed: parts[0]! };
-    const anyVisible = list.some(element => rt.visible(element));
+    /* A hidden checkbox reached through its visible label is still seen by the person. */
+    const anyVisible = list.some(element => rt.visible(element)
+      || [...((element as HTMLInputElement).labels ?? [])].some(label => rt.visible(label)));
     /* A name usually matches both a field and its label; a value belongs to the field. */
     const fields = expectation.value === undefined ? [] : list.filter(isField);
     const pool = fields.length ? fields : list;

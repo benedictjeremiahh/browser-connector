@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { BrowserController, injectedActiveElement, injectedClickGuard, parseExpectations } from "../src/browser";
 import { SnapshotStore } from "../src/snapshots";
+import { injectedAssert } from "../src/page-runtime";
+import { sameTargetDifferentHash } from "../src/policy";
 
 function event() {
   const listeners = new Set<(...args: unknown[]) => void>();
@@ -289,5 +291,35 @@ describe("interaction feedback", () => {
     h.tabs.get.mockResolvedValue({ id: 7, windowId: 9, url: "https://example.test/?a=1&b=2", title: "Page", active: true, status: "complete" } as never);
     await h.controller.dispatch("tabs_create", { url: "https://example.test/?b=2&a=1", settle: false }, new Set([7]));
     expect(h.tabs.update).not.toHaveBeenCalledWith(7, { url: "https://example.test/?b=2&a=1" });
+  });
+
+  it("judges a hidden control by its control, not by its visible label", () => {
+    const label: Record<string, unknown> = {
+      tagName: "LABEL", control: null, innerText: "Accept", textContent: "Accept",
+      getBoundingClientRect: () => ({ width: 100, height: 20 }), getAttribute: () => null
+    };
+    const input: Record<string, unknown> = {
+      tagName: "INPUT", type: "checkbox", checked: true, disabled: false, labels: [label],
+      getBoundingClientRect: () => ({ width: 0, height: 0 }), getAttribute: () => null,
+      matches: () => false, closest: () => null
+    };
+    label.control = input;
+    (globalThis as { __browserConnectorRuntime?: unknown }).__browserConnectorRuntime = {
+      scan: () => ({ query: () => [label, input], resolve: () => null }),
+      visible: (element: unknown) => element === label,
+      nameOf: () => "Accept",
+      roleMatches: () => true,
+      is: (element: unknown, name: string) => name === "HTMLInputElement" && element === input,
+      activeIn: () => null,
+      visibleText: () => ""
+    };
+    expect(injectedAssert([{ index: 0, kind: "element", name: "Accept", state: "checked" }], 1)[0]).toMatchObject({ passed: true });
+    expect(injectedAssert([{ index: 0, kind: "count", name: "Accept", equals: 1 }], 1)[0]).toMatchObject({ passed: true });
+  });
+
+  it("treats a hash route as a navigation only when the fragment differs", () => {
+    expect(sameTargetDifferentHash("https://x/a?a=1&b=2#/route1", "https://x/a?b=2&a=1#/route2")).toBe(true);
+    expect(sameTargetDifferentHash("https://x/a#/route2", "HTTPS://X/a#/route2")).toBe(false);
+    expect(sameTargetDifferentHash("https://x/a#/route1", "https://x/a#/route1")).toBe(false);
   });
 });

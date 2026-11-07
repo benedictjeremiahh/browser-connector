@@ -1365,7 +1365,13 @@ function injectedReadPage(generation: number, maxBytes: number, offset: number, 
   const controlTags = new Set(["a", "button", "input", "select", "textarea", "summary"]);
   /* A <label for=email> and its input both match the same text, and the label is not
      the thing an agent can fill. Resolve the label to its control and dedupe. */
-  const hasBox = (element: Element) => { const box = element.getBoundingClientRect(); return box.width > 0 || box.height > 0; };
+  const hasBox = (element: Element) => {
+    const box = element.getBoundingClientRect();
+    if (!(box.width > 0 && box.height > 0)) return false;
+    const view = element.ownerDocument?.defaultView;
+    const style = view?.getComputedStyle?.(element);
+    return style?.visibility !== "hidden" && (style?.clip ?? "auto") === "auto" && (style?.clipPath ?? "none") === "none";
+  };
   /* A visually hidden checkbox is clicked through its visible label, so the label
      stays the target when the control has no box. */
   const resolveLabel = (element: Element): Element => {
@@ -1537,7 +1543,11 @@ function injectedFind(generation: number, query: string, limit: number, offset: 
     const control = (lifted as HTMLLabelElement).control as HTMLElement | null;
     if (!control) return lifted;
     const box = control.getBoundingClientRect();
-    return box.width > 0 || box.height > 0 ? control : lifted;
+    const view = control.ownerDocument?.defaultView;
+    const style = view?.getComputedStyle?.(control);
+    const shown = box.width > 0 && box.height > 0 && style?.visibility !== "hidden"
+      && (style?.clip ?? "auto") === "auto" && (style?.clipPath ?? "none") === "none";
+    return shown ? control : lifted;
   };
   const innermost = [...new Set(hits.filter(element => !hits.some(other => other !== element && encloses(element, other))).map(lift))];
   /* Exact names first, then names that start with the query, then any that contain it; within each,

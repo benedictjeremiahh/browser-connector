@@ -94,14 +94,12 @@ export function sameNavigationTarget(left: string, right: string): boolean {
    already-open SPA. A query written in another order is the same target, not a
    navigation, so it must not reload the page and destroy its state. */
 export function sameTargetDifferentHash(left: string, right: string): boolean {
-  if (left === right) return false;
   try {
     const a = new URL(left);
     const b = new URL(right);
-    if (!["http:", "https:"].includes(a.protocol) || a.protocol !== b.protocol) return false;
-    a.hash = "";
-    b.hash = "";
-    return a.href === b.href;
+    /* Compare the canonical target, so query order and case normalization do not
+       count, and require the fragments themselves to differ. */
+    return sameNavigationTarget(left, right) && a.hash !== b.hash;
   } catch {
     return false;
   }
