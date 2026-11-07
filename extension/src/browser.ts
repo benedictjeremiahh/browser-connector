@@ -184,13 +184,13 @@ export class BrowserController {
       case "tabs_create": return this.tabsCreateSettled(controlledTabIds, params, group);
       case "tabs_activate": return this.tabsActivate(asTabId(params.tabId), controlledTabIds);
       case "tabs_close": return this.tabsClose(controlledTabIds, asTabId(params.tabId));
-      case "navigate": return this.settled(asTabId(params.tabId), params, () => this.navigate(asTabId(params.tabId), asString(params.action), asOptionalString(params.url)));
-      case "computer": return SETTLING_ACTIONS.has(String(params.action)) ? this.settled(asTabId(params.tabId), params, () => this.computer(params)) : this.computer(params);
+      case "navigate": return this.settled(asTabId(params.tabId), params, () => this.navigate(asTabId(params.tabId), asString(params.action), asOptionalString(params.url)), controlledTabIds);
+      case "computer": return SETTLING_ACTIONS.has(String(params.action)) ? this.settled(asTabId(params.tabId), params, () => this.computer(params), controlledTabIds) : this.computer(params);
       case "read_page": return this.readPage(asTabId(params.tabId), params.maxBytes, params.cursor, asOptionalString(params.scopeRef), params.filter === "all" ? "all" : "interactive", params.viewportOnly === true, asOptionalString(params.diffFrom));
       case "get_page_text": return this.getPageText(asTabId(params.tabId), params.maxBytes, params.cursor, asOptionalString(params.scopeRef));
       case "find": return this.find(asTabId(params.tabId), asString(params.query), params.limit, params.cursor);
-      case "form_input": return this.settled(asTabId(params.tabId), params, () => this.formInput(asTabId(params.tabId), asString(params.pageRef), params.value));
-      case "fill_form": return this.settled(asTabId(params.tabId), params, () => this.fillForm(asTabId(params.tabId), params.fields));
+      case "form_input": return this.settled(asTabId(params.tabId), params, () => this.formInput(asTabId(params.tabId), asString(params.pageRef), params.value), controlledTabIds);
+      case "fill_form": return this.settled(asTabId(params.tabId), params, () => this.fillForm(asTabId(params.tabId), params.fields), controlledTabIds);
       case "wait_for": return this.waitFor(asTabId(params.tabId), params);
       case "assert": return this.assertExpectations(asTabId(params.tabId), params);
       case "javascript_tool": return this.javascriptTool(asTabId(params.tabId), asString(params.source));
@@ -207,7 +207,7 @@ export class BrowserController {
   /* Runs an action and reports what it did once the page settles: where the tab is, whether the URL
      changed, notices the page announced (alerts, toasts, dialogs), new console errors and failed
      requests. Pass settle: false to skip the wait. */
-  private async settled(tabId: number, params: Record<string, unknown>, act: () => Promise<unknown>): Promise<unknown> {
+  private async settled(tabId: number, params: Record<string, unknown>, act: () => Promise<unknown>, controlledTabIds?: Set<number>): Promise<unknown> {
     // Results quote the page, so they carry the same untrusted mark as a page read.
     if (params.settle === false) return act();
     /* Network and console records exist only once the debugger is attached; settling never attaches
@@ -221,7 +221,17 @@ export class BrowserController {
     const initial = await this.mutationState(tabId);
     const noticesBefore = initial.sequence;
     const shownBefore = new Set(initial.present);
-    const result = await act();
+    /* A target=_blank leaves this tab unchanged, so without this the agent sees
+       urlChanged:false and retries. Only tabs this session's page opened are named. */
+    const opened: Array<Record<string, unknown>> = [];
+    const onCreated = (tab: chrome.tabs.Tab) => {
+      if (tab.id === undefined || tab.openerTabId === undefined || !controlledTabIds?.has(tab.openerTabId)) return;
+      opened.push({ tabId: tab.id, ...(tab.url ? { url: redactUrl(tab.url) } : {}), ...(tab.title ? { title: tab.title } : {}) });
+    };
+    chrome.tabs.onCreated?.addListener?.(onCreated);
+    let result: unknown;
+    try { result = await act(); }
+    finally { chrome.tabs.onCreated?.removeListener?.(onCreated); }
     const started = Date.now();
     let lastCount = -1;
     let lastChange = Date.now();
@@ -257,6 +267,7 @@ export class BrowserController {
         monitoring: { console: monitored, network: monitored },
         ...(changeCount !== undefined ? { changeCount } : {}),
         ...(isRecord(focus) ? { focus } : {}),
+        ...(opened.length ? { openedTabs: opened.slice(0, 5), hint: "The page opened a new tab. Call tabs_create with its URL to control it; it stays outside this session until you do." } : {}),
         ...(notices.length ? { notices } : {}),
         ...(errors.length ? { consoleErrors: errors } : {}),
         ...(failed.length ? { failedRequests: failed } : {}),
@@ -288,30 +299,36 @@ export class BrowserController {
     const urlContains = asOptionalString(params.urlContains);
     const networkIdle = params.networkIdle === true;
     if (!text && !textGone && !selector && !urlContains && !networkIdle) throw connectorError("invalid_arguments", "wait_for needs at least one of text, textGone, selector, urlContains or networkIdle");
+    const mode = params.mode === undefined ? "all" : asString(params.mode);
+    if (mode !== "all" && mode !== "any") throw connectorError("invalid_arguments", "mode must be \"all\" or \"any\"");
     const timeout = clampLimit(params.timeoutMs, WAIT_DEFAULT_MS, WAIT_MAX_MS);
     if (networkIdle) await this.ensureDebugger(tabId);
     const started = Date.now();
     let idleSince = Date.now();
-    let missing: string[] = [];
     while (true) {
-      missing = [];
+      const checks: Array<{ label: string; ok: boolean }> = [];
       const tab = await chrome.tabs.get(tabId);
-      if (urlContains && !(tab.url ?? "").includes(urlContains)) missing.push(`urlContains ${JSON.stringify(urlContains)}`);
+      if (urlContains) checks.push({ label: `urlContains ${JSON.stringify(urlContains)}`, ok: (tab.url ?? "").includes(urlContains) });
       if (text || textGone || selector) {
-        const [result] = await chrome.scripting.executeScript({ target: { tabId }, func: injectedWaitCheck, args: [text ?? null, textGone ?? null, selector ?? null] }).catch(() => [undefined]);
-        const check = isRecord(result?.result) ? result!.result as { text?: boolean; textGone?: boolean; selector?: boolean } : {};
-        if (text && check.text !== true) missing.push(`text ${JSON.stringify(text)}`);
-        if (textGone && check.textGone !== true) missing.push(`textGone ${JSON.stringify(textGone)}`);
-        if (selector && check.selector !== true) missing.push(`selector ${JSON.stringify(selector)}`);
+        /* Same runtime as read_page, find and assert: open shadow roots, same-origin
+           frames and visible text, not inline script and hidden DOM. */
+        const check = await this.runInPage(tabId, injectedWaitCheck, [text ?? null, textGone ?? null, selector ?? null]).catch(() => undefined);
+        if (isRecord(check) && check.invalidSelector === true) throw connectorError("invalid_arguments", `selector is not valid CSS: ${selector}`);
+        const result = isRecord(check) ? check as { text?: boolean; textGone?: boolean; selector?: boolean } : {};
+        if (text) checks.push({ label: `text ${JSON.stringify(text)}`, ok: result.text === true });
+        if (textGone) checks.push({ label: `textGone ${JSON.stringify(textGone)}`, ok: result.textGone === true });
+        if (selector) checks.push({ label: `selector ${JSON.stringify(selector)}`, ok: result.selector === true });
       }
       if (networkIdle) {
         const pending = (this.networkRecords.get(tabId) ?? []).filter((record) => !record.done && record.status === undefined && Date.now() - (record.seenAt ?? 0) < WAIT_MAX_MS).length;
         if (pending > 0) idleSince = Date.now();
-        if (Date.now() - idleSince < 500) missing.push("networkIdle");
+        checks.push({ label: "networkIdle", ok: Date.now() - idleSince >= 500 });
       }
-      if (!missing.length) return { met: true, waitedMs: Date.now() - started, url: tab.url ? redactUrl(tab.url) : undefined, title: tab.title, untrusted: true };
+      const met = mode === "any" ? checks.some(check => check.ok) : checks.every(check => check.ok);
+      if (met) return { met: true, waitedMs: Date.now() - started, url: tab.url ? redactUrl(tab.url) : undefined, title: tab.title, untrusted: true };
       if (Date.now() - started >= timeout) {
-        throw connectorError("wait_timeout", `After ${timeout} ms still waiting for: ${missing.join(", ")}. The tab is at ${tab.url ? redactUrl(tab.url) : "an unknown URL"} (${tab.title ?? "untitled"}).`);
+        const missing = mode === "any" ? checks.map(check => check.label).join(" or ") : checks.filter(check => !check.ok).map(check => check.label).join(", ");
+        throw connectorError("wait_timeout", `After ${timeout} ms still waiting for: ${missing}. The tab is at ${tab.url ? redactUrl(tab.url) : "an unknown URL"} (${tab.title ?? "untitled"}).`);
       }
       await sleep(200);
     }
@@ -361,7 +378,7 @@ export class BrowserController {
   private async tabsCreateSettled(controlledTabIds: Set<number>, params: Record<string, unknown>, group: GroupDescriptor): Promise<unknown> {
     const created = await this.tabsCreate(controlledTabIds, asOptionalString(params.url), group);
     if (params.settle === false || !isRecord(created) || typeof created.tabId !== "number" || !asOptionalString(params.url)) return created;
-    return this.settled(created.tabId, params, async () => created);
+    return this.settled(created.tabId, params, async () => created, controlledTabIds);
   }
 
   async describePageRef(tabId: number, pageRef: string): Promise<PageRefContext> {
@@ -374,6 +391,14 @@ export class BrowserController {
      installed. The runtime is installed once per document; if a page lost it anyway, the function
      says so and it is installed again. */
   private async runInPage<Args extends unknown[], Result>(tabId: number, func: (...args: Args) => Result, args: Args): Promise<unknown> {
+    /* An MV3 worker restart empties documentGenerations while the page still holds its
+       refs. Adopt the page's generation instead of minting a new one and invalidating
+       every pN-* reference between two human turns. */
+    if (!this.documentGenerations.has(tabId)) {
+      const [probe] = await chrome.scripting.executeScript({ target: { tabId }, func: injectedDocumentGeneration }).catch(() => []);
+      const known = probe?.result;
+      if (typeof known === "number" && known > 0) this.documentGenerations.set(tabId, known);
+    }
     for (let attempt = 0; ; attempt += 1) {
       const generation = this.documentGenerations.get(tabId) ?? 1;
       if (this.runtimeInstalled.get(tabId) !== generation) {
@@ -431,7 +456,8 @@ export class BrowserController {
         windowId: tab!.windowId,
         title: tab!.title,
         url: tab!.url ? redactUrl(tab!.url) : undefined,
-        active: tab!.active
+        active: tab!.active,
+        ...(tab!.id !== undefined && this.documentGenerations.has(tab!.id) ? { documentGeneration: this.documentGenerations.get(tab!.id) } : {})
       })),
       ...(tabs.length === 0
         ? { hint: "No controlled tabs. Call tabs_create with the URL you need; it reuses or adopts an open tab at that URL instead of opening a duplicate." }
@@ -450,8 +476,15 @@ export class BrowserController {
     if (url) {
       const existing = await this.reuseControlledTab(controlledTabIds, url);
       if (existing !== undefined) {
-        const tab = await chrome.tabs.get(existing);
-        return { tabId: existing, windowId: tab.windowId, url: tab.url ? redactUrl(tab.url) : redactUrl(url), reused: true };
+        let tab = await chrome.tabs.get(existing);
+        /* sameNavigationTarget ignores the fragment, and a hash route is a different
+           screen. Navigate when the full URL differs before reporting a reuse. */
+        const navigated = !!tab.url && tab.url !== url;
+        if (navigated) {
+          await chrome.tabs.update(existing, { url });
+          tab = await chrome.tabs.get(existing);
+        }
+        return { tabId: existing, windowId: tab.windowId, url: tab.url ? redactUrl(tab.url) : redactUrl(url), reused: true, ...(navigated ? { navigated: true } : {}) };
       }
     }
     /* A blank tab this session already holds is a placeholder, not a destination: navigating it
@@ -910,11 +943,29 @@ export class BrowserController {
       const modifiers = parseModifiers(params.modifiers);
       await this.showCursor(tabId, point, "click");
       await sleep(CLICK_DWELL_MS);
-      await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", ...point, modifiers });
-      await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", button, buttons: held, clickCount, ...point, modifiers });
-      await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", button, buttons: 0, clickCount, ...point, modifiers });
+      /* A layout shift during the dwell can move a different element under the point.
+         Re-check the target's own identity before pressing, and press where it is now. */
+      const ref = typeof params.pageRef === "string" ? params.pageRef : undefined;
+      const generation = this.documentGenerations.get(tabId) ?? 1;
+      let pressAt = point;
+      let target: Record<string, unknown> | undefined;
+      if (ref) {
+        const guard = await this.runInPage(tabId, injectedClickGuard, [ref, generation]);
+        if (guard === null || guard === undefined) throw await this.staleRefError(tabId, ref);
+        if (isRecord(guard) && typeof guard.blockedBy === "string") throw connectorError("click_intercepted", `${ref} is now covered by ${guard.blockedBy} (quoted page content, untrusted)`);
+        if (isRecord(guard) && isRecord(guard.point)) pressAt = guard.point as { x: number; y: number };
+        target = { ref, ...(isRecord(guard) && typeof guard.role === "string" ? { role: guard.role } : {}), ...(isRecord(guard) && typeof guard.name === "string" ? { name: guard.name } : {}) };
+        if (pressAt.x !== point.x || pressAt.y !== point.y) await this.showCursor(tabId, pressAt, "click");
+      }
+      await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", ...pressAt, modifiers });
+      await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", button, buttons: held, clickCount, ...pressAt, modifiers });
+      try {
+        await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", button, buttons: 0, clickCount, ...pressAt, modifiers });
+      } catch {
+        throw connectorError("browser_error", "The click was pressed but its release could not be confirmed; inspect the tab before retrying so a second click does not apply twice.", true);
+      }
       await this.ping(tabId);
-      return { clicked: point, clickCount, button };
+      return { clicked: pressAt, clickCount, button, ...(target ? { target } : {}) };
     }
     throw connectorError("invalid_arguments", `Unknown computer action: ${action}`);
   }
@@ -1154,6 +1205,7 @@ export class BrowserController {
     const point = await this.runInPage(tabId, injectedRefPoint, [pageRef, this.documentGenerations.get(tabId) ?? 1, hitTest]);
     if (!point) throw await this.staleRefError(tabId, pageRef);
     if (isRecord(point) && point.blocked === "hidden") throw connectorError("element_not_visible", `${pageRef} has no visible box`);
+    if (isRecord(point) && point.blocked === "offscreen") throw connectorError("element_not_visible", `${pageRef} sits outside the visible viewport even after scrolling its frame into view. Scroll the page or enlarge the window, then retry.`);
     if (isRecord(point) && point.blocked === "disabled") throw connectorError("element_disabled", `${pageRef} is disabled`);
     if (isRecord(point) && typeof point.blockedBy === "string") throw connectorError("click_intercepted", `${pageRef} is covered by ${point.blockedBy} (quoted page content, untrusted)`);
     return point as { x: number; y: number };
@@ -1444,13 +1496,20 @@ function injectedDescribeRef(pageRef: string, generation: number): { description
 
 /* The point is in top-level viewport coordinates, which is what the debugger's mouse events take,
    even when the element sits inside an iframe. */
-async function injectedRefPoint(pageRef: string, generation: number, hitTest = false): Promise<{ x: number; y: number } | { blocked: "hidden" | "disabled" } | { blockedBy: string } | null> {
+async function injectedRefPoint(pageRef: string, generation: number, hitTest = false): Promise<{ x: number; y: number } | { blocked: "hidden" | "disabled" | "offscreen" } | { blockedBy: string } | null> {
   const rt = (globalThis as RuntimeGlobal).__browserConnectorRuntime;
   if (!rt) throw new Error("browser-connector-runtime-missing");
   const state = rt.currentState(generation);
   if (!state) return null;
   const element = rt.scan().resolve(pageRef, state);
   if (!element) return null;
+  const hosts = rt.hostChain(element);
+  /* A frame below the fold has no top-viewport point. Scroll each host into view,
+     outermost first, before measuring the element inside it. */
+  for (const host of [...hosts].reverse()) {
+    const frame = host as HTMLElement;
+    if (typeof frame.scrollIntoView === "function") frame.scrollIntoView({ block: "center", inline: "center", behavior: "instant" as ScrollBehavior });
+  }
   /* Instant, then two frames: a smooth scroll or a layout shift would otherwise move the target
      after its centre was measured, and the click would land on whatever slid into that spot. */
   element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" as ScrollBehavior });
@@ -1471,12 +1530,12 @@ async function injectedRefPoint(pageRef: string, generation: number, hitTest = f
      as well; inside an iframe, something in the top page can still cover the whole frame. */
   const rootNode = element.getRootNode?.() as (Partial<Document> & { nodeType?: number }) | undefined;
   const ownRoot = rootNode?.nodeType === 11 && typeof rootNode.elementFromPoint === "function" ? rootNode : undefined;
-  const hosts = rt.hostChain(element);
   const frames = hosts.filter(host => /^i?frame$/i.test(String(host.tagName)));
   /* The centre first; a wide wrapper's centre can be a gap, so a few inner points next. */
   const insetX = Math.min(12, rect.width / 4); const insetY = Math.min(8, rect.height / 4);
   const points = [centre, { x: rect.left + insetX, y: centre.y }, { x: rect.right - insetX, y: centre.y }, { x: centre.x, y: rect.top + insetY }, { x: centre.x, y: rect.bottom - insetY }];
   let blocker: Element | null = null;
+  let offscreen = false;
   for (const point of points) {
     let hit = ownRoot ? ownRoot.elementFromPoint!(point.x, point.y) : ownerDocument.elementFromPoint(point.x, point.y);
     if (ownRoot && !hit) {
@@ -1487,6 +1546,8 @@ async function injectedRefPoint(pageRef: string, generation: number, hitTest = f
     const reachesElement = hit && (hit === element || element.contains(hit) || labels.some(label => label === hit || label.contains(hit)));
     if (reachesElement) {
       const top = toTop(point);
+      /* The renderer ignores a press outside the viewport; report that instead of a click. */
+      if (top.x < 0 || top.y < 0 || top.x > innerWidth || top.y > innerHeight) { offscreen = true; continue; }
       const outer = frames.length ? document.elementFromPoint(top.x, top.y) : null;
       if (!frames.length || !outer || hosts.includes(outer) || frames[frames.length - 1]!.contains(outer)) return top;
       blocker ??= outer;
@@ -1494,10 +1555,36 @@ async function injectedRefPoint(pageRef: string, generation: number, hitTest = f
     }
     blocker ??= hit;
   }
+  if (offscreen) return { blocked: "offscreen" };
   if (!blocker) return toTop(centre);
   const describe = (node: Element) => `${node.getAttribute("role") || node.tagName.toLowerCase()} "${((node as HTMLElement).innerText || node.getAttribute("aria-label") || "").trim().replace(/\s+/g, " ").slice(0, 60)}"`;
   const covering = blocker.closest("[role=dialog],[role=alertdialog],[role=alert],[role=status],dialog,header,nav") ?? blocker;
   return { blockedBy: describe(covering) };
+}
+
+/* After the dwell, before the press: is the element still the one at its own centre,
+   and where is that centre now? Returns the element's identity so the result names it. */
+function injectedClickGuard(pageRef: string, generation: number): { point: { x: number; y: number }; role?: string; name?: string } | { blockedBy: string } | null {
+  const rt = (globalThis as RuntimeGlobal).__browserConnectorRuntime;
+  if (!rt) throw new Error("browser-connector-runtime-missing");
+  const state = rt.currentState(generation);
+  const element = state ? rt.scan().resolve(pageRef, state) : null;
+  if (!element) return null;
+  const rect = element.getBoundingClientRect();
+  const view = element.ownerDocument?.defaultView ?? globalThis;
+  if (rect.width === 0 || rect.height === 0 || view.getComputedStyle(element).visibility === "hidden") return { blockedBy: "a hidden element" };
+  const origin = rt.frameOffset(element);
+  const point = { x: rect.left + rect.width / 2 + origin.x, y: rect.top + rect.height / 2 + origin.y };
+  const ownerDocument = element.ownerDocument ?? document;
+  if (typeof ownerDocument.elementFromPoint !== "function") return { point, role: element.getAttribute("role") || element.tagName.toLowerCase(), name: rt.nameOf(element as HTMLElement, 120) };
+  const hit = ownerDocument.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+  const labels = [...((element as HTMLInputElement).labels ?? [])];
+  const reaches = hit && (hit === element || element.contains(hit) || labels.some(label => label === hit || label.contains(hit)));
+  if (!reaches && hit) {
+    const described = `${hit.getAttribute("role") || hit.tagName.toLowerCase()} "${((hit as HTMLElement).innerText || hit.getAttribute("aria-label") || "").trim().replace(/\s+/g, " ").slice(0, 60)}"`;
+    return { blockedBy: described };
+  }
+  return { point, role: element.getAttribute("role") || element.tagName.toLowerCase(), name: rt.nameOf(element as HTMLElement, 120) };
 }
 
 function injectedFocusRef(pageRef: string, generation: number): boolean {
@@ -1564,6 +1651,12 @@ function injectedScrollState(pageRef: string | null, generation: number): { x: n
 
 /* The focused element as a Page Reference, so a settle result can name where the
    next keystroke would go without a second read_page. */
+/* The page's own ref generation, if it still belongs to the current document. */
+function injectedDocumentGeneration(): number | null {
+  const state = (globalThis as RuntimeGlobal).__browserConnectorPageRefState;
+  return state && state.document === document ? state.generation : null;
+}
+
 function injectedFocusInfo(generation: number): { ref?: string; role?: string; name?: string } | null {
   const rt = (globalThis as RuntimeGlobal).__browserConnectorRuntime;
   if (!rt) return null;
@@ -1745,20 +1838,24 @@ function injectedMutationState(): { count: number; sequence: number; notices: Ar
   return { count: state.count, sequence: state.sequence, notices: state.notices, present };
 }
 
-function injectedWaitCheck(text: string | null, textGone: string | null, selector: string | null): { text?: boolean; textGone?: boolean; selector?: boolean } {
-  /* Case-insensitive, over both rendered and raw text: CSS text-transform changes innerText. */
-  const body = `${document.body?.innerText ?? ""}\n${document.body?.textContent ?? ""}`.toLowerCase();
-  const visible = (element: Element | null) => {
-    if (!element) return false;
-    const rect = element.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0 && getComputedStyle(element).visibility !== "hidden";
-  };
+function injectedWaitCheck(text: string | null, textGone: string | null, selector: string | null): { text?: boolean; textGone?: boolean; selector?: boolean; invalidSelector?: true } {
+  const rt = (globalThis as RuntimeGlobal).__browserConnectorRuntime;
+  if (!rt) throw new Error("browser-connector-runtime-missing");
+  const scan = rt.scan();
+  /* visibleText follows open shadow roots and same-origin frames; inline script text and
+     hidden DOM are not what a person sees. */
+  const body = rt.visibleText(scan).toLowerCase();
   let selectorOk: boolean | undefined;
-  if (selector !== null) { try { selectorOk = [...document.querySelectorAll(selector)].some(visible); } catch { selectorOk = false; } }
+  let invalidSelector: true | undefined;
+  if (selector !== null) {
+    try { selectorOk = scan.query(selector).some(element => rt.visible(element)); }
+    catch { invalidSelector = true; }
+  }
   return {
     ...(text !== null ? { text: body.includes(text.toLowerCase()) } : {}),
     ...(textGone !== null ? { textGone: !body.includes(textGone.toLowerCase()) } : {}),
-    ...(selectorOk !== undefined ? { selector: selectorOk } : {})
+    ...(selector !== null && selectorOk !== undefined ? { selector: selectorOk } : {}),
+    ...(invalidSelector ? { invalidSelector } : {})
   };
 }
 

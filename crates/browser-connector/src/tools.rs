@@ -395,6 +395,8 @@ pub struct WaitForArgs {
     /// Wait until no request has been in flight for 500 ms.
     #[serde(default)]
     pub network_idle: bool,
+    /// Whether every condition must hold (all, the default) or any one of them (any).
+    pub mode: Option<String>,
     /// Default 10000, at most 30000.
     pub timeout_ms: Option<u32>,
 }
@@ -816,7 +818,7 @@ impl BrowserService {
     }
 
     #[tool(
-        description = "Wait until the page shows a text, stops showing one (a spinner or 'Memuat'), shows a visible element for a CSS selector, has a URL containing a string, or has no request in flight. All given conditions must hold. On timeout the error names what is still missing and where the tab is. Use it instead of sleeping or polling with screenshots.",
+        description = "Wait until the page shows a text, stops showing one (a spinner or 'Memuat'), shows a visible element for a CSS selector, has a URL containing a string, or has no request in flight. By default all given conditions must hold; mode:\"any\" accepts the first one that does. It reads the same DOM as read_page, find and assert: open shadow roots, same-origin frames and visible text. On timeout the error names what is still missing and where the tab is. Use it instead of sleeping or polling with screenshots.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,

@@ -582,6 +582,9 @@ async function takeReleasedTab(request: NativeRequest, session: SessionState, co
   if (tabId === undefined || controlled.has(tabId)) return undefined;
   const tab = await chrome.tabs.get(tabId).catch(() => undefined);
   if (!tab) return undefined;
+  /* sameNavigationTarget matches the document, not the hash route inside it. */
+  const navigated = tab.url !== url;
+  if (navigated) await chrome.tabs.update(tabId, { url }).catch(() => undefined);
   controlled.add(tabId);
   delete records[tabId]!.releasedAt;
   if (session.label) records[tabId]!.label = session.label;
@@ -589,7 +592,8 @@ async function takeReleasedTab(request: NativeRequest, session: SessionState, co
   await browser.adoptGroup(group, [tabId]);
   /* Written before the adoption lock opens again: the next session must see this tab as held. */
   await saveControlledTabs(request.sessionId, controlled);
-  return { tabId, windowId: tab.windowId, url: tab.url ? redactUrl(tab.url) : undefined, reused: true, adopted: true };
+  const current = navigated ? await chrome.tabs.get(tabId).catch(() => tab) : tab;
+  return { tabId, windowId: current.windowId, url: current.url ? redactUrl(current.url) : redactUrl(url), reused: true, adopted: true, ...(navigated ? { navigated: true } : {}) };
 }
 
 /* A tab the person already has at the requested URL is taken into the session instead of opening a
@@ -618,12 +622,16 @@ async function takeExistingTab(request: NativeRequest, controlled: Set<number>, 
   const tab = await chrome.tabs.get(tabId).catch(() => undefined);
   /* The person may have navigated the tab between the query and this read. */
   if (!tab?.url || !sameNavigationTarget(tab.url, url)) return undefined;
+  /* The document matches, but a hash route inside it may not. */
+  const navigated = tab.url !== url;
+  if (navigated) await chrome.tabs.update(tabId, { url }).catch(() => undefined);
   controlled.add(tabId);
   try {
     await browser.ensureTabGroup(group, tabId);
     /* Written before the adoption lock opens again: the next session must see this tab as held. */
     await saveControlledTabs(request.sessionId, controlled);
-    return { tabId, windowId: tab.windowId, url: tab.url ? redactUrl(tab.url) : undefined, reused: true, adopted: true };
+    const current = navigated ? await chrome.tabs.get(tabId).catch(() => tab) : tab;
+    return { tabId, windowId: current.windowId, url: current.url ? redactUrl(current.url) : redactUrl(url), reused: true, adopted: true, ...(navigated ? { navigated: true } : {}) };
   } catch {
     controlled.delete(tabId);
     return undefined;

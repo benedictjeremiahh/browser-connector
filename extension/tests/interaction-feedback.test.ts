@@ -3,7 +3,13 @@ import { BrowserController, parseExpectations } from "../src/browser";
 import { SnapshotStore } from "../src/snapshots";
 
 function event() {
-  return { addListener: vi.fn(), removeListener: vi.fn() };
+  const listeners = new Set<(...args: unknown[]) => void>();
+  return {
+    addListener: vi.fn((listener: (...args: unknown[]) => void) => listeners.add(listener)),
+    removeListener: vi.fn((listener: (...args: unknown[]) => void) => listeners.delete(listener)),
+    emit: (...args: unknown[]) => { for (const listener of [...listeners]) listener(...args); },
+    size: () => listeners.size
+  };
 }
 
 function harness(respond: (name: string, args: unknown[]) => unknown) {
@@ -149,5 +155,64 @@ describe("interaction feedback", () => {
     ]);
     expect(parsed).toHaveLength(2);
     expect(() => parseExpectations([{ kind: "element", role: "button", state: "bogus" }])).toThrow();
+  });
+
+  it("waits for any condition when mode is any", async () => {
+    const h = harness((name) => name === "injectedWaitCheck" ? { text: false, selector: true } : null);
+    const result = await h.controller.dispatch("wait_for", { tabId: 7, text: "Done", selector: "#done", mode: "any" }, new Set([7])) as { met: boolean };
+    expect(result.met).toBe(true);
+  });
+
+  it("rejects an invalid selector immediately instead of waiting", async () => {
+    const h = harness((name) => name === "injectedWaitCheck" ? { invalidSelector: true } : null);
+    await expect(h.controller.dispatch("wait_for", { tabId: 7, selector: "[[[", timeoutMs: 1000 }, new Set([7])))
+      .rejects.toMatchObject({ code: "invalid_arguments" });
+  });
+
+  it("navigates a reused tab when only the hash differs", async () => {
+    const h = harness(() => null);
+    h.tabs.get.mockResolvedValue({ id: 7, windowId: 9, url: "https://example.test/#/orders/1", title: "Orders", active: true, status: "complete" } as never);
+    await h.controller.dispatch("tabs_create", { url: "https://example.test/#/orders/2", settle: false }, new Set([7]));
+    expect(h.tabs.update).toHaveBeenCalledWith(7, { url: "https://example.test/#/orders/2" });
+  });
+
+  it("reports an offscreen target instead of clicking", async () => {
+    const h = harness((name) => name === "injectedRefPoint" ? { blocked: "offscreen" } : null);
+    await expect(h.controller.dispatch("computer", { tabId: 7, action: "click", pageRef: "p7-1", settle: false }, new Set([7])))
+      .rejects.toMatchObject({ code: "element_not_visible" });
+  });
+
+  it("rejects the click when the target is covered after the dwell", async () => {
+    const h = harness((name) => {
+      if (name === "injectedRefPoint") return { x: 10, y: 20 };
+      if (name === "injectedClickGuard") return { blockedBy: 'dialog "Confirm"' };
+      return null;
+    });
+    await expect(h.controller.dispatch("computer", { tabId: 7, action: "click", pageRef: "p7-1", settle: false }, new Set([7])))
+      .rejects.toMatchObject({ code: "click_intercepted" });
+  });
+
+  it("reports a tab the page opened during a settled action", async () => {
+    const h = harness((name) => {
+      if (name === "injectedRefPoint") return { x: 10, y: 20 };
+      if (name === "injectedClickGuard") return { point: { x: 10, y: 20 }, role: "button", name: "Open" };
+      if (name === "injectedMutationState") return { count: 0, sequence: 0, notices: [], present: [] };
+      return null;
+    });
+    h.debuggerApi.sendCommand.mockImplementation(async (_target: unknown, method: string, params?: Record<string, unknown>) => {
+      if (method === "Input.dispatchMouseEvent" && params?.type === "mousePressed") {
+        h.tabs.onCreated.emit({ id: 99, openerTabId: 7, url: "https://example.test/new", title: "New" });
+      }
+      return {};
+    });
+    const result = await h.controller.dispatch("computer", { tabId: 7, action: "click", pageRef: "p7-1" }, new Set([7])) as { after: Record<string, unknown> };
+    expect(result.after.openedTabs).toEqual([{ tabId: 99, url: "https://example.test/new", title: "New" }]);
+  });
+
+  it("adopts the page's document generation after a worker restart", async () => {
+    const h = harness((name) => name === "injectedDocumentGeneration" ? 5 : null);
+    await h.controller.dispatch("read_page", { tabId: 7 }, new Set([7])).catch(() => undefined);
+    const context = await h.controller.dispatch("tabs_context", {}, new Set([7])) as { tabs: Array<Record<string, unknown>> };
+    expect(context.tabs[0]!.documentGeneration).toBe(5);
   });
 });
