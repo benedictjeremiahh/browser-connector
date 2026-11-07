@@ -240,6 +240,12 @@ export class BrowserController {
     const errors = since(this.consoleRecords.get(tabId)).filter((record) => record.level === "error" && !/^Warning: /.test(record.text)).slice(-3).map((record) => record.text.slice(0, 300));
     const failed = since(this.networkRecords.get(tabId)).filter((record) => record.failed || (record.status ?? 0) >= 400).slice(-5)
       .map((record) => ({ method: record.method, url: record.url, ...(record.status ? { status: record.status } : {}), ...(record.failed ? { error: record.failed } : {}) }));
+    /* An empty consoleErrors list means "none seen" only when the debugger is monitoring this tab;
+       without that, the absence says nothing. */
+    const monitored = this.attachedTabs.has(tabId);
+    const generation = this.documentGenerations.get(tabId) ?? 1;
+    const focus = await this.runInPage(tabId, injectedFocusInfo, [generation]).catch(() => null);
+    const changeCount = lastCount < 0 ? undefined : Math.max(0, lastCount - initial.count);
     return {
       ...(isRecord(result) ? result : { result }),
       after: {
@@ -248,6 +254,9 @@ export class BrowserController {
         urlChanged: tab?.url !== before.url,
         settled,
         waitedMs: Date.now() - started,
+        monitoring: { console: monitored, network: monitored },
+        ...(changeCount !== undefined ? { changeCount } : {}),
+        ...(isRecord(focus) ? { focus } : {}),
         ...(notices.length ? { notices } : {}),
         ...(errors.length ? { consoleErrors: errors } : {}),
         ...(failed.length ? { failedRequests: failed } : {}),
@@ -694,7 +703,7 @@ export class BrowserController {
      see the change, then reads it back: a value the page rejected is reported, not assumed. */
   private async formInput(tabId: number, pageRef: string, value: unknown): Promise<{ pageRef: string; changed: boolean; matched: boolean; actual?: unknown; before?: unknown; untrusted?: boolean }> {
     const outcome = await this.runInPage(tabId, injectedFormInput, [pageRef, value, this.documentGenerations.get(tabId) ?? 1]);
-    if (outcome === false || outcome === null || outcome === undefined) throw connectorError("stale_page_ref", `Page Reference is stale: ${pageRef}`);
+    if (outcome === false || outcome === null || outcome === undefined) throw await this.staleRefError(tabId, pageRef);
     if (isRecord(outcome) && outcome.unsupported === true) throw connectorError("invalid_arguments", `${pageRef} is not a text input, textarea, select or editable element. A custom select (role combobox) is used by clicking it, then clicking the option found with find; a file input uses upload_file.`);
     if (isRecord(outcome) && typeof outcome.refused === "string") throw connectorError("element_disabled", `${pageRef} is ${outcome.refused}`);
     if (isRecord(outcome) && outcome.missingOption === true) throw connectorError("invalid_arguments", `No option of ${pageRef} matches ${JSON.stringify(value)} by value or label. Options: ${String(outcome.options ?? "")}`);
@@ -1125,11 +1134,25 @@ export class BrowserController {
     return (await chrome.debugger.sendCommand({ tabId }, method, params)) ?? {};
   }
 
+  /* A stale ref usually means the element was re-created; name it and, when exactly
+     one current element has the same identity, give the caller its new ref. */
+  private async staleRefError(tabId: number, pageRef: string): Promise<Error & { code: string; outcomeUnknown: boolean }> {
+    const previous = this.snapshots.forRef(tabId, pageRef);
+    if (!previous) return connectorError("stale_page_ref", `Page Reference is stale: ${pageRef}`);
+    const generation = this.documentGenerations.get(tabId) ?? 1;
+    const replacement = await this.runInPage(tabId, injectedReplacementRef, [previous.role, previous.name, previous.href, previous.level, generation]).catch(() => null);
+    const label = [previous.role, previous.name].filter(part => typeof part === "string" && part).map(String).join(" ");
+    const suffix = typeof replacement === "string"
+      ? ` The element was re-created; use ${replacement} instead.`
+      : " The element is gone; call read_page again.";
+    return connectorError("stale_page_ref", `Page Reference is stale: ${pageRef}${label ? ` (${label.slice(0, 120)})` : ""}.${suffix}`);
+  }
+
   /* With hitTest, the point is one where the element itself would receive the click: a point covered
      by an overlay, a hidden element or a disabled control is an error that names the cause. */
   private async pointForRef(tabId: number, pageRef: string, hitTest = false): Promise<{ x: number; y: number }> {
     const point = await this.runInPage(tabId, injectedRefPoint, [pageRef, this.documentGenerations.get(tabId) ?? 1, hitTest]);
-    if (!point) throw connectorError("stale_page_ref", `Page Reference is stale: ${pageRef}`);
+    if (!point) throw await this.staleRefError(tabId, pageRef);
     if (isRecord(point) && point.blocked === "hidden") throw connectorError("element_not_visible", `${pageRef} has no visible box`);
     if (isRecord(point) && point.blocked === "disabled") throw connectorError("element_disabled", `${pageRef} is disabled`);
     if (isRecord(point) && typeof point.blockedBy === "string") throw connectorError("click_intercepted", `${pageRef} is covered by ${point.blockedBy} (quoted page content, untrusted)`);
@@ -1137,7 +1160,7 @@ export class BrowserController {
   }
 
   private async focusRef(tabId: number, pageRef: string): Promise<void> {
-    if (!await this.runInPage(tabId, injectedFocusRef, [pageRef, this.documentGenerations.get(tabId) ?? 1])) throw connectorError("stale_page_ref", `Page Reference is stale: ${pageRef}`);
+    if (!await this.runInPage(tabId, injectedFocusRef, [pageRef, this.documentGenerations.get(tabId) ?? 1])) throw await this.staleRefError(tabId, pageRef);
   }
 
   private onDebuggerEvent(tabId: number | undefined, method: string, params?: object): void {
@@ -1202,7 +1225,12 @@ function injectedReadPage(generation: number, maxBytes: number, offset: number, 
     : "a,button,input,select,textarea,[role],[contenteditable=true],summary,[tabindex],h1,h2,h3,h4,h5,h6,p,li";
   const wrapperRoles = new Set(["presentation", "none", "generic"]);
   const controlTags = new Set(["a", "button", "input", "select", "textarea", "summary"]);
-  const matched = scan.query(selector).filter(element => filter !== "interactive" || !wrapperRoles.has(element.getAttribute("role") ?? ""));
+  /* A <label for=email> and its input both match the same text, and the label is not
+     the thing an agent can fill. Resolve the label to its control and dedupe. */
+  const resolveLabel = (element: Element): Element =>
+    element.tagName.toLowerCase() === "label" ? ((element as HTMLLabelElement).control ?? element) : element;
+  const matched = [...new Set(scan.query(selector).map(resolveLabel))]
+    .filter(element => filter !== "interactive" || !wrapperRoles.has(element.getAttribute("role") ?? ""));
   /* Frames and shadow hosts whose inside cannot be read still appear, as a node that says so. */
   const listed = new Set<Element>(matched);
   const elements = [...matched, ...[...scan.opaque.keys()].filter(element => !listed.has(element))] as HTMLElement[];
@@ -1247,9 +1275,21 @@ function injectedReadPage(generation: number, maxBytes: number, offset: number, 
     /* A control is named by its label; a container is named briefly, or its text repeats every child's. */
     const control = controlTags.has(tag) || /^(button|link|tab|menuitem|option|checkbox|radio|switch|combobox|textbox|searchbox|slider|treeitem)$/.test(element.getAttribute("role") ?? "");
     const name = rt.nameOf(element, control ? 200 : 120);
+    /* The implicit role is what an agent needs to choose a primitive: a checkbox,
+       combobox and textbox all arrive as <input>/<select>, not as their role. */
+    const implicitRole = element.getAttribute("role")
+      || (tag === "a" ? (element.getAttribute("href") !== null ? "link" : tag)
+        : tag === "button" || tag === "summary" ? "button"
+          : tag === "select" ? "combobox"
+            : tag === "textarea" ? "textbox"
+              : /^h[1-6]$/.test(tag) ? "heading"
+                : tag === "img" ? "img"
+                  : tag === "input" ? (input!.type === "checkbox" ? "checkbox" : input!.type === "radio" ? "radio" : /^(button|submit|reset|image)$/.test(input!.type) ? "button" : input!.type === "range" ? "slider" : input!.type === "search" ? "searchbox" : "textbox")
+                    : tag);
     const node: Record<string, unknown> = {
       ref,
-      role: element.getAttribute("role") || tag,
+      role: implicitRole,
+      ...(input ? { type: input.type } : {}),
       name,
       disabled: "disabled" in element ? Boolean((element as HTMLButtonElement).disabled) : undefined,
       checked: "checked" in element ? Boolean((element as HTMLInputElement).checked) : undefined
@@ -1270,7 +1310,17 @@ function injectedReadPage(generation: number, maxBytes: number, offset: number, 
       try { const url = new URL(href); node.href = url.origin === location.origin ? url.pathname : url.origin + url.pathname; } catch { /* not a URL */ }
     }
     for (const key of Object.keys(node)) if (node[key] === undefined) delete node[key];
-    if (input) node.value = rt.sensitive(input) ? "[redacted]" : input.value.slice(0, 500);
+    if (rt.is(element, "HTMLSelectElement")) {
+      const select = element as HTMLSelectElement;
+      const selected = [...select.selectedOptions].map(option => option.text.trim());
+      node.options = [...select.options].slice(0, 30).map(option => ({ value: option.value, label: option.text.trim(), selected: option.selected }));
+      if (select.multiple) node.multiple = true;
+      node.value = select.multiple ? selected : selected[0] ?? "";
+    } else if (rt.is(element, "HTMLTextAreaElement")) {
+      node.value = (element as HTMLTextAreaElement).value.slice(0, 500);
+    } else if (input) {
+      node.value = rt.sensitive(input) ? "[redacted]" : input.value.slice(0, 500);
+    }
     const opaqueReason = scan.opaque.get(element);
     if (opaqueReason) {
       const title = element.getAttribute("title") || element.getAttribute("aria-label");
@@ -1337,7 +1387,12 @@ function injectedFind(generation: number, query: string, limit: number, offset: 
   const interactive = (element: HTMLElement) => /^(a|button|input|select|textarea|summary|label)$/i.test(element.tagName) || !!element.getAttribute("role") || element.hasAttribute?.("tabindex");
   /* A button's text sits in a span inside it; the control is what an agent acts on, so a match is
      lifted to its nearest interactive ancestor, and duplicates collapse. */
-  const lift = (element: HTMLElement) => (element.closest?.("a,button,input,select,textarea,summary,label,[role],[tabindex]") as HTMLElement | null) ?? element;
+  const lift = (element: HTMLElement) => {
+    const lifted = (element.closest?.("a,button,input,select,textarea,summary,label,[role],[tabindex]") as HTMLElement | null) ?? element;
+    return lifted.tagName.toLowerCase() === "label"
+      ? ((lifted as HTMLLabelElement).control as HTMLElement | null) ?? lifted
+      : lifted;
+  };
   const innermost = [...new Set(hits.filter(element => !hits.some(other => other !== element && encloses(element, other))).map(lift))];
   /* Exact names first, then names that start with the query, then any that contain it; within each,
      controls before other elements. "Keluar" should find the menu item, not "Laporan barang keluar". */
@@ -1507,6 +1562,79 @@ function injectedScrollState(pageRef: string | null, generation: number): { x: n
   return { x: window.scrollX, y: window.scrollY, ...(container ? { container: { top: container.scrollTop, left: container.scrollLeft } } : {}) };
 }
 
+/* The focused element as a Page Reference, so a settle result can name where the
+   next keystroke would go without a second read_page. */
+function injectedFocusInfo(generation: number): { ref?: string; role?: string; name?: string } | null {
+  const rt = (globalThis as RuntimeGlobal).__browserConnectorRuntime;
+  if (!rt) return null;
+  const state = rt.currentState(generation);
+  let root: Document | ShadowRoot = document;
+  let element: Element | null = null;
+  for (let depth = 0; depth < 8; depth += 1) {
+    const active: Element | null = root.activeElement;
+    if (!active) break;
+    element = active;
+    const shadow: ShadowRoot | null = (active as HTMLElement).shadowRoot;
+    if (shadow) { root = shadow; continue; }
+    if (active.tagName === "IFRAME") {
+      try {
+        const frame: Document | null = (active as HTMLIFrameElement).contentDocument;
+        if (frame) { root = frame; continue; }
+      } catch { /* cross-origin frame: report the iframe itself */ }
+    }
+    break;
+  }
+  if (!element) return null;
+  const html = element as HTMLElement;
+  return {
+    ...(state ? { ref: rt.refFor(state, html) } : {}),
+    role: element.getAttribute("role") || element.tagName.toLowerCase(),
+    name: rt.nameOf(html, 120)
+  };
+}
+
+/* A stale ref is usually a re-render, not a deletion. Look for exactly one element
+   with the old role and name and hand back its new ref; never retarget silently. */
+function injectedReplacementRef(role: unknown, name: unknown, href: unknown, level: unknown, generation: number): string | null {
+  const rt = (globalThis as RuntimeGlobal).__browserConnectorRuntime;
+  if (!rt) return null;
+  const state = rt.currentState(generation);
+  if (!state) return null;
+  const wantedRole = String(role ?? "");
+  const wantedName = String(name ?? "").slice(0, 200);
+  const wantedHref = String(href ?? "");
+  const wantedLevel = typeof level === "number" ? level : undefined;
+  const roleOf = (element: Element): string => {
+    const tag = element.tagName.toLowerCase();
+    const type = String((element as HTMLInputElement).type ?? "").toLowerCase();
+    return element.getAttribute("role")
+      || (tag === "a" ? (element.getAttribute("href") !== null ? "link" : tag)
+        : tag === "button" || tag === "summary" ? "button"
+          : tag === "select" ? "combobox"
+            : tag === "textarea" ? "textbox"
+              : /^h[1-6]$/.test(tag) ? "heading"
+                : tag === "img" ? "img"
+                  : tag === "input" ? (type === "checkbox" ? "checkbox" : type === "radio" ? "radio" : /^(button|submit|reset|image)$/.test(type) ? "button" : type === "range" ? "slider" : type === "search" ? "searchbox" : "textbox")
+                    : tag);
+  };
+  const matches = rt.scan().all().filter(element => {
+    if (roleOf(element) !== wantedRole) return false;
+    if (rt.nameOf(element as HTMLElement, 300).slice(0, 200) !== wantedName) return false;
+    if (wantedLevel !== undefined) {
+      const tag = element.tagName.toLowerCase();
+      if (/^h[1-6]$/.test(tag) && Number(tag[1]) !== wantedLevel) return false;
+    }
+    if (wantedHref) {
+      const anchor = element.tagName.toLowerCase() === "a" ? (element as HTMLAnchorElement).href : "";
+      let normalized = "";
+      try { const url = new URL(anchor); normalized = url.origin === location.origin ? url.pathname : url.origin + url.pathname; } catch { /* not a URL */ }
+      if (normalized !== wantedHref) return false;
+    }
+    return true;
+  });
+  return matches.length === 1 ? rt.refFor(state, matches[0] as HTMLElement) : null;
+}
+
 function injectedFormInput(pageRef: string, value: unknown, generation: number): false | { unsupported: true } | { refused: string } | { missingOption: true; options: string } | { invalidType: "boolean" } | { radioCannotUncheck: true } | { matched: boolean; actual: unknown; before?: unknown; unverified?: string } {
   const rt = (globalThis as RuntimeGlobal).__browserConnectorRuntime;
   if (!rt) throw new Error("browser-connector-runtime-missing");
@@ -1586,12 +1714,16 @@ function injectedMutationState(): { count: number; sequence: number; notices: Ar
   if (!global.__browserConnectorMutations) {
     const state: State = { count: 0, sequence: 0, notices: [] };
     global.__browserConnectorMutations = state;
-    /* Polite live regions are often whole tables or panels; only alert-like roles carry a toast. */
-    const noticeSelector = "[role=alert],[role=status],[role=dialog],[role=alertdialog],[aria-live=assertive]";
+    /* Polite live regions are often whole tables or panels, so a polite notice is
+       accepted only when it is short and visible; assertive roles carry a toast. */
+    const noticeSelector = "[role=alert],[role=status],[role=dialog],[role=alertdialog],[aria-live=assertive],[aria-live=polite]";
     /* Each announcement gets a sequence number, so the same "Tersimpan" shown twice is reported twice. */
     const note = (element: Element | null) => {
-      const text = (element as HTMLElement | null)?.innerText?.trim().replace(/\s+/g, " ").slice(0, 200);
+      const target = element as HTMLElement | null;
+      const text = target?.innerText?.trim().replace(/\s+/g, " ").slice(0, 200);
       if (!text || text.length >= 200) return;
+      const rect = target?.getBoundingClientRect();
+      if (rect && rect.width === 0 && rect.height === 0) return;
       state.sequence += 1;
       state.notices = [...state.notices, { sequence: state.sequence, text }].slice(-10);
     };
@@ -1608,7 +1740,7 @@ function injectedMutationState(): { count: number; sequence: number; notices: Ar
     }).observe(document.documentElement, { subtree: true, childList: true, characterData: true, attributes: true, attributeFilter: ["class", "hidden", "disabled", "open", "aria-selected", "aria-expanded", "aria-checked", "aria-hidden", "aria-busy"] });
   }
   const state = global.__browserConnectorMutations;
-  const present = [...document.querySelectorAll("[role=alert],[role=status],[role=dialog],[role=alertdialog],[aria-live=assertive]")]
+  const present = [...document.querySelectorAll("[role=alert],[role=status],[role=dialog],[role=alertdialog],[aria-live=assertive],[aria-live=polite]")]
     .map(element => (element as HTMLElement).innerText?.trim().replace(/\s+/g, " ").slice(0, 200)).filter((text): text is string => !!text);
   return { count: state.count, sequence: state.sequence, notices: state.notices, present };
 }
@@ -1960,7 +2092,7 @@ export type ParsedExpectation =
   | { index: number; kind: "url_matches" | "title_matches"; pattern: string };
 
 const EXPECTATION_KINDS = new Set(["text_present", "text_absent", "url_matches", "title_matches", "element", "count"]);
-const ELEMENT_STATES = new Set(["visible", "hidden", "enabled", "disabled", "checked", "unchecked"]);
+const ELEMENT_STATES = new Set(["visible", "hidden", "enabled", "disabled", "checked", "unchecked", "expanded", "collapsed", "selected", "pressed", "focused"]);
 
 /* Validates the whole list up front, so a typo in the tenth expectation does not waste the first nine. */
 export function parseExpectations(value: unknown): ParsedExpectation[] {
@@ -1999,7 +2131,7 @@ export function parseExpectations(value: unknown): ParsedExpectation[] {
     if (state !== undefined && !ELEMENT_STATES.has(state)) return fail(`state must be one of ${[...ELEMENT_STATES].join(", ")}`);
     const base = { index, ...(selector ? { selector } : {}), ...(pageRef ? { pageRef } : {}), ...(name ? { name } : {}), ...(role ? { role } : {}) };
     if (kind === "count") {
-      if (!selector) return fail("count needs a selector");
+      if (!selector && !pageRef && !name && !role) return fail("count needs a selector, a pageRef, a name or a role");
       const equals = count("equals"); const atLeast = count("atLeast"); const atMost = count("atMost");
       if (equals === undefined && atLeast === undefined && atMost === undefined) return fail("count needs equals, atLeast or atMost");
       return { ...base, kind, ...(equals !== undefined ? { equals } : {}), ...(atLeast !== undefined ? { atLeast } : {}), ...(atMost !== undefined ? { atMost } : {}), ...(entry.visible === true ? { visible: true } : {}) };

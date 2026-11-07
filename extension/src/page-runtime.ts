@@ -174,9 +174,40 @@ export function injectedInstallRuntime(): void {
     return (compute?.call(element.ownerDocument?.defaultView ?? globalThis, element)?.visibility ?? "visible") !== "hidden";
   };
 
-  const nameOf = (element: HTMLElement, limit = 200): string =>
-    (element.getAttribute("aria-label") || (element as HTMLInputElement).labels?.[0]?.innerText || element.getAttribute("title") || (element as HTMLInputElement).placeholder || element.innerText || "")
-      .trim().replace(/\s+/g, " ").slice(0, limit);
+  /* The accessible-name subset an agent relies on: aria-labelledby, aria-label, the
+     associated label or alt/value, then title and placeholder. Without this an icon
+     button named only by <img alt> or aria-labelledby is unreachable by find. */
+  const nameOf = (element: HTMLElement, limit = 200): string => {
+    const text = (value: string | null | undefined) => (value ?? "").trim().replace(/\s+/g, " ");
+    const byIds = (ids: string | null): string => {
+      if (!ids) return "";
+      const document = element.ownerDocument;
+      return ids.split(/\s+/).map(id => {
+        const target = document?.getElementById(id);
+        return target ? target.getAttribute("aria-label") || target.textContent || "" : "";
+      }).join(" ").trim();
+    };
+    const labelledBy = text(byIds(element.getAttribute("aria-labelledby")));
+    if (labelledBy) return labelledBy.slice(0, limit);
+    const ariaLabel = text(element.getAttribute("aria-label"));
+    if (ariaLabel) return ariaLabel.slice(0, limit);
+    const label = (element as HTMLInputElement).labels?.[0];
+    const labelText = text(label?.innerText || label?.textContent);
+    if (labelText) return labelText.slice(0, limit);
+    const alt = text((element as HTMLImageElement).alt);
+    if (alt) return alt.slice(0, limit);
+    const tag = element.tagName.toLowerCase();
+    if (tag === "input") {
+      const field = element as HTMLInputElement;
+      if (/^(button|submit|reset)$/.test(field.type) && field.value) return text(field.value).slice(0, limit);
+      if (field.type === "image" && field.alt) return text(field.alt).slice(0, limit);
+    }
+    const title = text(element.getAttribute("title"));
+    if (title) return title.slice(0, limit);
+    const placeholder = text((element as HTMLInputElement).placeholder);
+    if (placeholder) return placeholder.slice(0, limit);
+    return text(element.innerText).slice(0, limit);
+  };
 
   const roleMatches = (element: Element, role: string): boolean => {
     const wanted = role.trim().toLowerCase();
@@ -218,7 +249,7 @@ export interface PageExpectation {
   pageRef?: string;
   name?: string;
   role?: string;
-  state?: "visible" | "hidden" | "enabled" | "disabled" | "checked" | "unchecked";
+  state?: "visible" | "hidden" | "enabled" | "disabled" | "checked" | "unchecked" | "expanded" | "collapsed" | "selected" | "pressed" | "focused";
   value?: string;
   equals?: number;
   atLeast?: number;
@@ -249,6 +280,11 @@ export function injectedAssert(expectations: PageExpectation[], generation: numb
     || element.getAttribute("contenteditable") === "true"
     || ["textbox", "combobox", "searchbox", "spinbutton"].includes(element.getAttribute("role") ?? "");
   const checkedOf = (element: Element) => (element as HTMLInputElement).checked === true || element.getAttribute("aria-checked") === "true";
+  const expandedOf = (element: Element) => element.getAttribute("aria-expanded") === "true" || (element as HTMLDetailsElement).open === true;
+  const selectedOf = (element: Element) => element.getAttribute("aria-selected") === "true" || (element as HTMLOptionElement).selected === true;
+  /* A label and its control both match the same name; the control is what an assertion is about. */
+  const controlFor = (element: HTMLElement): HTMLElement =>
+    element.tagName.toLowerCase() === "label" ? ((element as HTMLLabelElement).control as HTMLElement | null) ?? element : element;
 
   const targets = (expectation: PageExpectation): { list: HTMLElement[]; stale?: true } => {
     if (expectation.pageRef) {
@@ -256,7 +292,7 @@ export function injectedAssert(expectations: PageExpectation[], generation: numb
       const found = state ? scan.resolve(expectation.pageRef, state) : null;
       return found ? { list: [found] } : { list: [], stale: true };
     }
-    let list = scan.query(expectation.selector ?? interactive);
+    let list = [...new Set(scan.query(expectation.selector ?? interactive).map(controlFor))];
     if (expectation.role) list = list.filter(element => rt.roleMatches(element, expectation.role!));
     if (expectation.name) {
       const needle = expectation.name.toLowerCase();
@@ -301,6 +337,16 @@ export function injectedAssert(expectations: PageExpectation[], generation: numb
       const checked = checkedOf(primary);
       parts.push(checked ? "checked" : "unchecked");
       passed = expectation.state === "checked" ? checked : !checked;
+    } else if (expectation.state === "expanded" || expectation.state === "collapsed") {
+      const expanded = expandedOf(primary);
+      parts.push(expanded ? "expanded" : "collapsed");
+      passed = expectation.state === "expanded" ? expanded : !expanded;
+    } else if (expectation.state === "selected" || expectation.state === "pressed" || expectation.state === "focused") {
+      const on = expectation.state === "selected" ? selectedOf(primary)
+        : expectation.state === "pressed" ? primary.getAttribute("aria-pressed") === "true"
+          : rt.activeIn(primary) === primary;
+      parts.push(on ? expectation.state : `not ${expectation.state}`);
+      passed = on;
     }
     if (expectation.value !== undefined) {
       const input = rt.is(primary, "HTMLInputElement") ? primary as HTMLInputElement : null;
@@ -309,9 +355,12 @@ export function injectedAssert(expectations: PageExpectation[], generation: numb
         passed = false;
         parts.push("value [redacted]: a sensitive field is never compared");
       } else {
-        const actual = String((primary as HTMLInputElement).value ?? primary.textContent ?? "");
-        passed = passed && actual === expectation.value;
-        parts.push(`value ${JSON.stringify(clip(actual, 60))}`);
+        const select = rt.is(primary, "HTMLSelectElement") ? primary as HTMLSelectElement : null;
+        const actual = select ? select.value : String((primary as HTMLInputElement).value ?? primary.textContent ?? "");
+        /* form_input accepts a select option by value or visible label; assert does too. */
+        const selectedLabel = select?.selectedOptions[0]?.text.trim();
+        passed = passed && (actual === expectation.value || selectedLabel === expectation.value);
+        parts.push(`value ${JSON.stringify(clip(actual, 60))}${selectedLabel && selectedLabel !== actual ? ` (label ${JSON.stringify(clip(selectedLabel, 60))})` : ""}`);
       }
     }
     return { passed, observed: parts.join("; ") };

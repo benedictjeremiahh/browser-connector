@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { BrowserController } from "../src/browser";
+import { BrowserController, parseExpectations } from "../src/browser";
+import { SnapshotStore } from "../src/snapshots";
 
 function event() {
   return { addListener: vi.fn(), removeListener: vi.fn() };
@@ -115,5 +116,38 @@ describe("interaction feedback", () => {
     const h = harness((name) => name === "injectedScrollState" ? { x: 0, y: 0 } : null);
     const result = await h.controller.dispatch("computer", { tabId: 7, action: "scroll", deltaX: 100, x: 10, y: 10 }, new Set([7])) as { scrolled: unknown };
     expect(result.scrolled).toEqual({ x: 100, y: 0 });
+  });
+
+  it("reports whether console and network were monitored, and what changed", async () => {
+    let mutations = 0;
+    const h = harness((name) => {
+      if (name === "injectedMutationState") {
+        mutations += 1;
+        return { count: mutations === 1 ? 0 : 2, sequence: 0, notices: [], present: [] };
+      }
+      if (name === "injectedFormInput") return { matched: true, actual: "ok" };
+      if (name === "injectedFocusInfo") return { ref: "p7-1", role: "textbox", name: "Email" };
+      return null;
+    });
+    const result = await h.controller.dispatch("form_input", { tabId: 7, pageRef: "p7-1", value: "x" }, new Set([7])) as { after: Record<string, unknown> };
+    expect(result.after.monitoring).toEqual({ console: false, network: false });
+    expect(result.after.changeCount).toBe(2);
+    expect(result.after.focus).toEqual({ ref: "p7-1", role: "textbox", name: "Email" });
+  });
+
+  it("finds the last node seen for a stale ref", () => {
+    const store = new SnapshotStore();
+    store.record(7, { generation: 1, key: "k", complete: true, nodes: [{ ref: "p7-1", role: "button", name: "Save" }] });
+    expect(store.forRef(7, "p7-1")).toMatchObject({ role: "button", name: "Save" });
+    expect(store.forRef(7, "p7-9")).toBeUndefined();
+  });
+
+  it("accepts the new element states and a count by role", () => {
+    const parsed = parseExpectations([
+      { kind: "element", role: "button", state: "expanded" },
+      { kind: "count", role: "button", equals: 2 }
+    ]);
+    expect(parsed).toHaveLength(2);
+    expect(() => parseExpectations([{ kind: "element", role: "button", state: "bogus" }])).toThrow();
   });
 });

@@ -419,6 +419,11 @@ pub enum ElementState {
     Disabled,
     Checked,
     Unchecked,
+    Expanded,
+    Collapsed,
+    Selected,
+    Pressed,
+    Focused,
 }
 
 /// One thing that should be true of the page. Which fields apply depends on `kind`.

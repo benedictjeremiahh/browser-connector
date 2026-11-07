@@ -33,6 +33,16 @@ export class SnapshotStore {
     return this.byTab.get(tabId)?.find(snapshot => snapshot.id === id);
   }
 
+  /* The last node seen for a ref, newest snapshot first: a stale error can name what
+     the element was and look for its replacement instead of only saying "stale". */
+  forRef(tabId: number, ref: string): PageNode | undefined {
+    for (const snapshot of [...(this.byTab.get(tabId) ?? [])].reverse()) {
+      const node = snapshot.nodes.find(candidate => candidate.ref === ref);
+      if (node) return node;
+    }
+    return undefined;
+  }
+
   clear(tabId: number): void {
     this.byTab.delete(tabId);
   }
