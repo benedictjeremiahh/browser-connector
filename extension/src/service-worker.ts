@@ -2,7 +2,7 @@ import { BrowserController, connectorError, normalizeError, type GroupDescriptor
 import { RELEASED_TAB_TTL_MS, adoptableOpenTab, adoptableTabs, orphanBlankTabsToClose, releasedTabsToClose, reusableReleasedTab, shouldRecordAgentTab, type AgentTabRecords } from "./adoption";
 import { GROUP_MARK, groupColor, sessionGroupLabel } from "./naming";
 import { SessionEndings, isSessionEnded } from "./session-endings";
-import { classifyRequest, exactOrigin, hostPermissionPattern, isLocalDevelopmentOrigin, methodsNeedingApproval, redactUrl, sameNavigationTarget } from "./policy";
+import { classifyRequest, exactOrigin, hostPermissionPattern, isLocalDevelopmentOrigin, methodsNeedingApproval, redactUrl, sameNavigationTarget, sameTargetDifferentHash } from "./policy";
 import {
   DEFAULT_STATE,
   type ApprovalRequest,
@@ -581,9 +581,11 @@ async function takeReleasedTab(request: NativeRequest, session: SessionState, co
      under ADR-0023 without pretending it was adopted again. */
   if (tabId === undefined || controlled.has(tabId)) return undefined;
   const tab = await chrome.tabs.get(tabId).catch(() => undefined);
-  if (!tab) return undefined;
+  /* The query snapshot is older than this read; do not overwrite a navigation the
+     person made in between. */
+  if (!tab?.url || !sameNavigationTarget(tab.url, url)) return undefined;
   /* sameNavigationTarget matches the document, not the hash route inside it. */
-  const navigated = tab.url !== url;
+  const navigated = sameTargetDifferentHash(tab.url, url);
   if (navigated) await chrome.tabs.update(tabId, { url }).catch(() => undefined);
   controlled.add(tabId);
   delete records[tabId]!.releasedAt;
@@ -623,7 +625,7 @@ async function takeExistingTab(request: NativeRequest, controlled: Set<number>, 
   /* The person may have navigated the tab between the query and this read. */
   if (!tab?.url || !sameNavigationTarget(tab.url, url)) return undefined;
   /* The document matches, but a hash route inside it may not. */
-  const navigated = tab.url !== url;
+  const navigated = sameTargetDifferentHash(tab.url, url);
   if (navigated) await chrome.tabs.update(tabId, { url }).catch(() => undefined);
   controlled.add(tabId);
   try {

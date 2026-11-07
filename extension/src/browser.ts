@@ -6,7 +6,8 @@ import {
   isBlankTabUrl,
   isRestrictedUrl,
   redactUrl,
-  sameNavigationTarget
+  sameNavigationTarget,
+  sameTargetDifferentHash
 } from "./policy";
 import { GROUP_MARK, type GroupColor } from "./naming";
 import {
@@ -164,12 +165,16 @@ export class BrowserController {
       this.networkRecords.delete(tabId);
       this.lastPoints.delete(tabId);
       this.viewports.delete(tabId);
+      this.dialogs.delete(tabId);
       this.snapshots.clear(tabId);
       this.runtimeInstalled.delete(tabId);
     });
     chrome.debugger.onEvent.addListener((source, method, params) => this.onDebuggerEvent(source.tabId, method, params));
     chrome.debugger.onDetach.addListener((source) => {
-      if (source.tabId !== undefined) this.attachedTabs.delete(source.tabId);
+      if (source.tabId !== undefined) {
+        this.attachedTabs.delete(source.tabId);
+        this.dialogs.delete(source.tabId);
+      }
     });
   }
 
@@ -234,9 +239,10 @@ export class BrowserController {
     chrome.tabs.onCreated?.addListener?.(onCreated);
     let result: unknown;
     try { result = await act(); }
-    finally { chrome.tabs.onCreated?.removeListener?.(onCreated); }
+    catch (error) { chrome.tabs.onCreated?.removeListener?.(onCreated); throw error; }
     const started = Date.now();
     let lastCount = -1;
+    let lastReliable = initial.reliable;
     let lastChange = Date.now();
     let settled = false;
     let notices: string[] = [];
@@ -244,6 +250,7 @@ export class BrowserController {
       /* A dialog stops the renderer, so the page will never look quiet again. */
       if (this.dialogs.has(tabId)) break;
       const state = await this.mutationState(tabId);
+      lastReliable = state.reliable;
       if (state.count !== lastCount) { lastCount = state.count; lastChange = Date.now(); }
       notices = [...new Set(state.notices.filter(notice => notice.sequence > noticesBefore && !shownBefore.has(notice.text)).map(notice => notice.text))];
       const pending = since(this.networkRecords.get(tabId)).filter((record) => !record.done && record.status === undefined).length;
@@ -258,9 +265,10 @@ export class BrowserController {
     /* An empty consoleErrors list means "none seen" only when the debugger is monitoring this tab;
        without that, the absence says nothing. */
     const monitored = this.attachedTabs.has(tabId);
-    const generation = this.documentGenerations.get(tabId) ?? 1;
+    const generation = await this.generation(tabId);
     const focus = await this.runInPage(tabId, injectedFocusInfo, [generation]).catch(() => null);
-    const changeCount = lastCount < 0 ? undefined : Math.max(0, lastCount - initial.count);
+    const changeCount = lastCount < 0 || !initial.reliable || !lastReliable ? undefined : Math.max(0, lastCount - initial.count);
+    chrome.tabs.onCreated?.removeListener?.(onCreated);
     return {
       ...(isRecord(result) ? result : { result }),
       after: {
@@ -283,16 +291,17 @@ export class BrowserController {
   }
 
   /* The page's own change counter, installed on first use; a new document starts a new counter. */
-  private async mutationState(tabId: number): Promise<{ count: number; sequence: number; notices: Array<{ sequence: number; text: string }>; present: string[] }> {
+  private async mutationState(tabId: number): Promise<{ count: number; sequence: number; notices: Array<{ sequence: number; text: string }>; present: string[]; reliable: boolean }> {
     try {
       const [result] = await chrome.scripting.executeScript({ target: { tabId }, func: injectedMutationState });
       const value = result?.result as unknown;
-      if (!isRecord(value) || typeof value.count !== "number" || !Array.isArray(value.notices)) return { count: 0, sequence: 0, notices: [], present: [] };
+      if (!isRecord(value) || typeof value.count !== "number" || !Array.isArray(value.notices)) return { count: 0, sequence: 0, notices: [], present: [], reliable: false };
       const notices = value.notices.filter(isRecord).map(notice => ({ sequence: Number(notice.sequence), text: String(notice.text) }));
-      return { count: value.count, sequence: Number(value.sequence ?? 0), notices, present: Array.isArray(value.present) ? value.present.map(String) : [] };
+      return { count: value.count, sequence: Number(value.sequence ?? 0), notices, present: Array.isArray(value.present) ? value.present.map(String) : [], reliable: true };
     } catch {
-      /* Mid-navigation: count as a change, so the page is not called quiet while it loads. */
-      return { count: Date.now(), sequence: 0, notices: [], present: [] };
+      /* Mid-navigation: count as a change, so the page is not called quiet while it loads.
+         The timestamp is a liveness sentinel, not a mutation count. */
+      return { count: Date.now(), sequence: 0, notices: [], present: [], reliable: false };
     }
   }
 
@@ -372,7 +381,7 @@ export class BrowserController {
     if (inPage.length) {
       let found: PageExpectationResult[] | undefined;
       try {
-        const raw = await this.runInPage(tabId, injectedAssert, [inPage, this.documentGenerations.get(tabId) ?? 1]);
+        const raw = await this.runInPage(tabId, injectedAssert, [inPage, await this.generation(tabId)]);
         if (Array.isArray(raw)) found = raw as PageExpectationResult[];
       } catch { /* mid-navigation or a page the extension cannot script */ }
       for (const expectation of inPage) {
@@ -390,7 +399,7 @@ export class BrowserController {
   }
 
   async describePageRef(tabId: number, pageRef: string): Promise<PageRefContext> {
-    const result = await this.runInPage(tabId, injectedDescribeRef, [pageRef, this.documentGenerations.get(tabId) ?? 1]);
+    const result = await this.runInPage(tabId, injectedDescribeRef, [pageRef, await this.generation(tabId)]);
     if (!isPageRefContext(result)) return { description: "" };
     return result;
   }
@@ -398,17 +407,20 @@ export class BrowserController {
   /* Runs a function in the page with the shared runtime (shadow roots, iframes, Page References)
      installed. The runtime is installed once per document; if a page lost it anyway, the function
      says so and it is installed again. */
+  /* The page is the source of truth for its ref generation. Adopt it on the first
+     touch after an MV3 worker restart, before any caller captures a generation. */
+  private async generation(tabId: number): Promise<number> {
+    const known = this.documentGenerations.get(tabId);
+    if (known !== undefined) return known;
+    const [probe] = await chrome.scripting.executeScript({ target: { tabId }, func: injectedDocumentGeneration }).catch(() => []);
+    const value = probe?.result;
+    if (typeof value === "number" && value > 0) { this.documentGenerations.set(tabId, value); return value; }
+    return 1;
+  }
+
   private async runInPage<Args extends unknown[], Result>(tabId: number, func: (...args: Args) => Result, args: Args): Promise<unknown> {
-    /* An MV3 worker restart empties documentGenerations while the page still holds its
-       refs. Adopt the page's generation instead of minting a new one and invalidating
-       every pN-* reference between two human turns. */
-    if (!this.documentGenerations.has(tabId)) {
-      const [probe] = await chrome.scripting.executeScript({ target: { tabId }, func: injectedDocumentGeneration }).catch(() => []);
-      const known = probe?.result;
-      if (typeof known === "number" && known > 0) this.documentGenerations.set(tabId, known);
-    }
     for (let attempt = 0; ; attempt += 1) {
-      const generation = this.documentGenerations.get(tabId) ?? 1;
+      const generation = await this.generation(tabId);
       if (this.runtimeInstalled.get(tabId) !== generation) {
         await chrome.scripting.executeScript({ target: { tabId }, func: injectedInstallRuntime, args: [] });
         this.runtimeInstalled.set(tabId, generation);
@@ -443,6 +455,7 @@ export class BrowserController {
   async detachAll(): Promise<void> {
     await Promise.all([...this.attachedTabs].map(async (tabId) => {
       try { await chrome.debugger.detach({ tabId }); } catch { /* already detached */ }
+      this.dialogs.delete(tabId);
     }));
     this.attachedTabs.clear();
   }
@@ -488,7 +501,7 @@ export class BrowserController {
         let tab = await chrome.tabs.get(existing);
         /* sameNavigationTarget ignores the fragment, and a hash route is a different
            screen. Navigate when the full URL differs before reporting a reuse. */
-        const navigated = !!tab.url && tab.url !== url;
+        const navigated = !!tab.url && sameTargetDifferentHash(tab.url, url);
         if (navigated) {
           await chrome.tabs.update(existing, { url });
           tab = await chrome.tabs.get(existing);
@@ -684,7 +697,7 @@ export class BrowserController {
     this.throwIfDialogOpen(tabId);
     const maxBytes = clampLimit(requestedMax, 65_536, 65_536);
     const offset = cursorOffset(cursor);
-    const generation = this.documentGenerations.get(tabId) ?? 1;
+    const generation = await this.generation(tabId);
     const page = await this.runInPage(tabId, injectedReadPage, [generation, maxBytes, offset, scopeRef ?? null, filter, viewportOnly]);
     if (!isRecord(page)) return { nodes: [], truncated: false, originalBytes: 0 };
     /* Links can carry tokens in their path (/reset/<token>); they go through the same redaction as every URL. */
@@ -718,7 +731,7 @@ export class BrowserController {
   private async getPageText(tabId: number, requestedMax: unknown, cursor: unknown, scopeRef?: string): Promise<unknown> {
     this.throwIfDialogOpen(tabId);
     const maxBytes = clampLimit(requestedMax, 65_536, 65_536);
-    const generation = this.documentGenerations.get(tabId) ?? 1;
+    const generation = await this.generation(tabId);
     const payload = await this.runInPage(tabId, injectedGetPageText, [scopeRef ?? null, generation]);
     const scoped = scopeRef !== undefined;
     const scopedPayload = isRecord(payload) ? payload : undefined;
@@ -737,7 +750,7 @@ export class BrowserController {
     this.throwIfDialogOpen(tabId);
     const limit = clampLimit(requestedLimit, 20, 50);
     const offset = cursorOffset(cursor);
-    const generation = this.documentGenerations.get(tabId) ?? 1;
+    const generation = await this.generation(tabId);
     const result = await this.runInPage(tabId, injectedFind, [generation, query, limit, offset]);
     const found = (result as { matches?: unknown[] } | undefined) ?? { matches: [], nextCursor: null };
     /* An empty result on a page that is still rendering looks the same as a real miss. */
@@ -749,7 +762,7 @@ export class BrowserController {
      see the change, then reads it back: a value the page rejected is reported, not assumed. */
   private async formInput(tabId: number, pageRef: string, value: unknown): Promise<{ pageRef: string; changed: boolean; matched: boolean; actual?: unknown; before?: unknown; untrusted?: boolean }> {
     this.throwIfDialogOpen(tabId);
-    const outcome = await this.runInPage(tabId, injectedFormInput, [pageRef, value, this.documentGenerations.get(tabId) ?? 1]);
+    const outcome = await this.runInPage(tabId, injectedFormInput, [pageRef, value, await this.generation(tabId)]);
     if (outcome === false || outcome === null || outcome === undefined) throw await this.staleRefError(tabId, pageRef);
     if (isRecord(outcome) && outcome.unsupported === true) throw connectorError("invalid_arguments", `${pageRef} is not a text input, textarea, select or editable element. A custom select (role combobox) is used by clicking it, then clicking the option found with find; a file input uses upload_file.`);
     if (isRecord(outcome) && typeof outcome.refused === "string") throw connectorError("element_disabled", `${pageRef} is ${outcome.refused}`);
@@ -854,22 +867,28 @@ export class BrowserController {
       const hasDelta = typeof params.deltaX === "number" || typeof params.deltaY === "number";
       const x = asOptionalNumber(params.deltaX) ?? 0;
       const y = asOptionalNumber(params.deltaY) ?? (hasDelta ? 0 : 600);
-      const generation = this.documentGenerations.get(tabId) ?? 1;
+      const generation = await this.generation(tabId);
       let at: { x: number; y: number };
+      let before: unknown;
       if (ref) {
+        /* Capture the position before pointForRef scrolls the element into view, or
+           the scroll the tool performs is the one it fails to report. */
+        before = await this.runInPage(tabId, injectedScrollState, [ref, generation]);
         at = await this.pointForRef(tabId, ref);
-      } else if (typeof params.x === "number" && typeof params.y === "number") {
-        at = { x: asNumber(params.x), y: asNumber(params.y) };
       } else {
-        const metrics = await this.cdp(tabId, "Page.getLayoutMetrics").catch(() => ({})) as { cssVisualViewport?: { clientWidth?: number; clientHeight?: number } };
-        at = { x: (metrics.cssVisualViewport?.clientWidth ?? 800) / 2, y: (metrics.cssVisualViewport?.clientHeight ?? 600) / 2 };
+        if (typeof params.x === "number" && typeof params.y === "number") {
+          at = { x: asNumber(params.x), y: asNumber(params.y) };
+        } else {
+          const metrics = await this.cdp(tabId, "Page.getLayoutMetrics").catch(() => ({})) as { cssVisualViewport?: { clientWidth?: number; clientHeight?: number } };
+          at = { x: (metrics.cssVisualViewport?.clientWidth ?? 800) / 2, y: (metrics.cssVisualViewport?.clientHeight ?? 600) / 2 };
+        }
+        before = await this.runInPage(tabId, injectedScrollState, [null, generation, at.x, at.y]);
       }
       await this.showCursor(tabId, at, "scroll");
-      const before = await this.runInPage(tabId, injectedScrollState, [ref, generation]);
       if (!ref || hasDelta) {
         await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseWheel", x: at.x, y: at.y, deltaX: x, deltaY: y });
       }
-      const after = await this.runInPage(tabId, injectedScrollState, [ref, generation]);
+      const after = await this.runInPage(tabId, injectedScrollState, [ref, generation, at.x, at.y]);
       const moved = isRecord(before) && isRecord(after)
         ? before.x !== after.x || before.y !== after.y
           || JSON.stringify(before.container ?? null) !== JSON.stringify(after.container ?? null)
@@ -888,7 +907,12 @@ export class BrowserController {
          value the way a person would, so the next insert overwrites it. */
       if (params.replace === true) await this.dispatchKey(tabId, "a", 4);
       if (params.keyEvents === true) {
-        for (const character of [...text]) await this.dispatchKey(tabId, character, 0);
+        for (const character of [...text]) {
+          /* dispatchKey carries text only for a single UTF-16 unit; an astral character
+             (emoji) would be sent as rawKeyDown with text undefined and vanish. */
+          if (character.length === 1) await this.dispatchKey(tabId, character, 0);
+          else await this.cdp(tabId, "Input.insertText", { text: character });
+        }
       } else {
         await this.cdp(tabId, "Input.insertText", { text });
       }
@@ -913,7 +937,7 @@ export class BrowserController {
       /* Both ends are hit-tested, so a covered source or a missed drop target is named
          before the pointer moves. */
       const from = await this.pointFrom(params, "pageRef", "x", "y", tabId, true);
-      await this.runInPage(tabId, injectedDragProbe, [true]).catch(() => undefined);
+      await this.dragProbe(tabId, true);
       await this.showCursor(tabId, from, "drag");
       await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", button: "none", buttons: 0, ...from, modifiers });
       let release = from;
@@ -941,7 +965,7 @@ export class BrowserController {
         released = true;
         /* Whether the page received dragstart/dragover/drop distinguishes an ignored
            gesture from a drop that landed somewhere unexpected. */
-        const events = await this.runInPage(tabId, injectedDragProbe, [false]).catch(() => undefined);
+        const events = await this.dragProbe(tabId, false);
         return { dragged: { from, to }, ...(isRecord(events) ? { events } : {}) };
       } catch (error) {
         const failure = normalizeError(error);
@@ -974,11 +998,11 @@ export class BrowserController {
       /* A layout shift during the dwell can move a different element under the point.
          Re-check the target's own identity before pressing, and press where it is now. */
       const ref = typeof params.pageRef === "string" ? params.pageRef : undefined;
-      const generation = this.documentGenerations.get(tabId) ?? 1;
+      const generation = await this.generation(tabId);
       let pressAt = point;
       let target: Record<string, unknown> | undefined;
       if (ref) {
-        const guard = await this.runInPage(tabId, injectedClickGuard, [ref, generation]);
+        const guard = await this.runInPage(tabId, injectedClickGuard, [ref, generation, point.x, point.y]);
         if (guard === null || guard === undefined) throw await this.staleRefError(tabId, ref);
         if (isRecord(guard) && typeof guard.blockedBy === "string") throw connectorError("click_intercepted", `${ref} is now covered by ${guard.blockedBy} (quoted page content, untrusted)`);
         if (isRecord(guard) && isRecord(guard.point)) pressAt = guard.point as { x: number; y: number };
@@ -1153,7 +1177,7 @@ export class BrowserController {
     const pageRef = asString(params.pageRef);
     const dataBase64 = asString(params.dataBase64);
     if (Math.floor(dataBase64.length * 0.75) > MAX_UPLOAD_BYTES) throw connectorError("file_too_large", "Upload exceeds 10 MiB");
-    const uploaded = await this.runInPage(tabId, injectedUpload, [pageRef, asString(params.name), asString(params.mimeType), dataBase64, this.documentGenerations.get(tabId) ?? 1]);
+    const uploaded = await this.runInPage(tabId, injectedUpload, [pageRef, asString(params.name), asString(params.mimeType), dataBase64, await this.generation(tabId)]);
     if (!uploaded) throw connectorError("upload_failed", "Target is stale or is not a file input");
     return { uploaded: true, name: params.name };
   }
@@ -1212,6 +1236,21 @@ export class BrowserController {
     }
   }
 
+  /* The page's drag events can be inside an iframe, so probe every frame and sum. */
+  private async dragProbe(tabId: number, reset: boolean): Promise<{ dragstart: number; dragover: number; drop: number } | undefined> {
+    const results = await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, func: injectedDragProbe, args: [reset] }).catch(() => undefined);
+    if (!Array.isArray(results)) return undefined;
+    return results.reduce((sum, frame) => {
+      const value = frame?.result;
+      if (!isRecord(value)) return sum;
+      return {
+        dragstart: sum.dragstart + Number(value.dragstart ?? 0),
+        dragover: sum.dragover + Number(value.dragover ?? 0),
+        drop: sum.drop + Number(value.drop ?? 0)
+      };
+    }, { dragstart: 0, dragover: 0, drop: 0 });
+  }
+
   private async cdp(tabId: number, method: string, params?: Record<string, unknown>): Promise<object> {
     return (await chrome.debugger.sendCommand({ tabId }, method, params)) ?? {};
   }
@@ -1231,7 +1270,7 @@ export class BrowserController {
   private async staleRefError(tabId: number, pageRef: string): Promise<Error & { code: string; outcomeUnknown: boolean }> {
     const previous = this.snapshots.forRef(tabId, pageRef);
     if (!previous) return connectorError("stale_page_ref", `Page Reference is stale: ${pageRef}`);
-    const generation = this.documentGenerations.get(tabId) ?? 1;
+    const generation = await this.generation(tabId);
     const replacement = await this.runInPage(tabId, injectedReplacementRef, [previous.role, previous.name, previous.href, previous.level, generation]).catch(() => null);
     const label = [previous.role, previous.name].filter(part => typeof part === "string" && part).map(String).join(" ");
     const suffix = typeof replacement === "string"
@@ -1243,7 +1282,7 @@ export class BrowserController {
   /* With hitTest, the point is one where the element itself would receive the click: a point covered
      by an overlay, a hidden element or a disabled control is an error that names the cause. */
   private async pointForRef(tabId: number, pageRef: string, hitTest = false): Promise<{ x: number; y: number }> {
-    const point = await this.runInPage(tabId, injectedRefPoint, [pageRef, this.documentGenerations.get(tabId) ?? 1, hitTest]);
+    const point = await this.runInPage(tabId, injectedRefPoint, [pageRef, await this.generation(tabId), hitTest]);
     if (!point) throw await this.staleRefError(tabId, pageRef);
     if (isRecord(point) && point.blocked === "hidden") throw connectorError("element_not_visible", `${pageRef} has no visible box`);
     if (isRecord(point) && point.blocked === "offscreen") throw connectorError("element_not_visible", `${pageRef} sits outside the visible viewport even after scrolling its frame into view. Scroll the page or enlarge the window, then retry.`);
@@ -1253,7 +1292,7 @@ export class BrowserController {
   }
 
   private async focusRef(tabId: number, pageRef: string): Promise<void> {
-    if (!await this.runInPage(tabId, injectedFocusRef, [pageRef, this.documentGenerations.get(tabId) ?? 1])) throw await this.staleRefError(tabId, pageRef);
+    if (!await this.runInPage(tabId, injectedFocusRef, [pageRef, await this.generation(tabId)])) throw await this.staleRefError(tabId, pageRef);
   }
 
   private onDebuggerEvent(tabId: number | undefined, method: string, params?: object): void {
@@ -1326,8 +1365,14 @@ function injectedReadPage(generation: number, maxBytes: number, offset: number, 
   const controlTags = new Set(["a", "button", "input", "select", "textarea", "summary"]);
   /* A <label for=email> and its input both match the same text, and the label is not
      the thing an agent can fill. Resolve the label to its control and dedupe. */
-  const resolveLabel = (element: Element): Element =>
-    element.tagName.toLowerCase() === "label" ? ((element as HTMLLabelElement).control ?? element) : element;
+  const hasBox = (element: Element) => { const box = element.getBoundingClientRect(); return box.width > 0 || box.height > 0; };
+  /* A visually hidden checkbox is clicked through its visible label, so the label
+     stays the target when the control has no box. */
+  const resolveLabel = (element: Element): Element => {
+    if (element.tagName.toLowerCase() !== "label") return element;
+    const control = (element as HTMLLabelElement).control;
+    return control && hasBox(control) ? control : element;
+  };
   const matched = [...new Set(scan.query(selector).map(resolveLabel))]
     .filter(element => filter !== "interactive" || !wrapperRoles.has(element.getAttribute("role") ?? ""));
   /* Frames and shadow hosts whose inside cannot be read still appear, as a node that says so. */
@@ -1488,9 +1533,11 @@ function injectedFind(generation: number, query: string, limit: number, offset: 
      lifted to its nearest interactive ancestor, and duplicates collapse. */
   const lift = (element: HTMLElement) => {
     const lifted = (element.closest?.("a,button,input,select,textarea,summary,label,[role],[tabindex]") as HTMLElement | null) ?? element;
-    return lifted.tagName.toLowerCase() === "label"
-      ? ((lifted as HTMLLabelElement).control as HTMLElement | null) ?? lifted
-      : lifted;
+    if (lifted.tagName.toLowerCase() !== "label") return lifted;
+    const control = (lifted as HTMLLabelElement).control as HTMLElement | null;
+    if (!control) return lifted;
+    const box = control.getBoundingClientRect();
+    return box.width > 0 || box.height > 0 ? control : lifted;
   };
   const innermost = [...new Set(hits.filter(element => !hits.some(other => other !== element && encloses(element, other))).map(lift))];
   /* Exact names first, then names that start with the query, then any that contain it; within each,
@@ -1629,7 +1676,7 @@ function injectedDragProbe(reset: boolean): { dragstart: number; dragover: numbe
 
 /* After the dwell, before the press: is the element still the one at its own centre,
    and where is that centre now? Returns the element's identity so the result names it. */
-function injectedClickGuard(pageRef: string, generation: number): { point: { x: number; y: number }; role?: string; name?: string } | { blockedBy: string } | null {
+export function injectedClickGuard(pageRef: string, generation: number, x: number, y: number): { point: { x: number; y: number }; role?: string; name?: string } | { blockedBy: string } | null {
   const rt = (globalThis as RuntimeGlobal).__browserConnectorRuntime;
   if (!rt) throw new Error("browser-connector-runtime-missing");
   const state = rt.currentState(generation);
@@ -1638,18 +1685,25 @@ function injectedClickGuard(pageRef: string, generation: number): { point: { x: 
   const rect = element.getBoundingClientRect();
   const view = element.ownerDocument?.defaultView ?? globalThis;
   if (rect.width === 0 || rect.height === 0 || view.getComputedStyle(element).visibility === "hidden") return { blockedBy: "a hidden element" };
+  /* Verify the point pointForRef already validated, in the element's own root: the
+     top document reports a shadow host, not the element inside it. */
   const origin = rt.frameOffset(element);
-  const point = { x: rect.left + rect.width / 2 + origin.x, y: rect.top + rect.height / 2 + origin.y };
+  const local = { x: x - origin.x, y: y - origin.y };
   const ownerDocument = element.ownerDocument ?? document;
-  if (typeof ownerDocument.elementFromPoint !== "function") return { point, role: element.getAttribute("role") || element.tagName.toLowerCase(), name: rt.nameOf(element as HTMLElement, 120) };
-  const hit = ownerDocument.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+  const rootNode = element.getRootNode?.() as (Partial<Document> & { nodeType?: number }) | undefined;
+  const ownRoot = rootNode?.nodeType === 11 && typeof rootNode.elementFromPoint === "function" ? rootNode : undefined;
+  const hit = ownRoot ? ownRoot.elementFromPoint!(local.x, local.y) : ownerDocument.elementFromPoint?.(local.x, local.y);
   const labels = [...((element as HTMLInputElement).labels ?? [])];
   const reaches = hit && (hit === element || element.contains(hit) || labels.some(label => label === hit || label.contains(hit)));
-  if (!reaches && hit) {
-    const described = `${hit.getAttribute("role") || hit.tagName.toLowerCase()} "${((hit as HTMLElement).innerText || hit.getAttribute("aria-label") || "").trim().replace(/\s+/g, " ").slice(0, 60)}"`;
-    return { blockedBy: described };
+  if (!reaches) {
+    const onTop = ownRoot ? ownerDocument.elementFromPoint?.(local.x, local.y) : null;
+    const blocker = onTop && !rt.hostChain(element).includes(onTop) ? onTop : hit;
+    if (blocker) {
+      const described = `${blocker.getAttribute("role") || blocker.tagName.toLowerCase()} "${((blocker as HTMLElement).innerText || blocker.getAttribute("aria-label") || "").trim().replace(/\s+/g, " ").slice(0, 60)}"`;
+      return { blockedBy: described };
+    }
   }
-  return { point, role: element.getAttribute("role") || element.tagName.toLowerCase(), name: rt.nameOf(element as HTMLElement, 120) };
+  return { point: { x, y }, role: element.getAttribute("role") || element.tagName.toLowerCase(), name: rt.nameOf(element as HTMLElement, 120) };
 }
 
 function injectedFocusRef(pageRef: string, generation: number): boolean {
@@ -1664,7 +1718,7 @@ function injectedFocusRef(pageRef: string, generation: number): boolean {
 
 /* The element that will receive the next keystroke, across open shadow roots and
    same-origin frames, so `type` reports the field the page actually kept. */
-function injectedActiveElement(): { tag: string; type?: string; role?: string; editable: boolean; value?: string; text?: string } | null {
+export function injectedActiveElement(): { tag: string; type?: string; role?: string; editable: boolean; value?: string; text?: string } | null {
   let root: Document | ShadowRoot = document;
   let element: Element | null = null;
   for (let depth = 0; depth < 8; depth += 1) {
@@ -1687,7 +1741,11 @@ function injectedActiveElement(): { tag: string; type?: string; role?: string; e
   const field = element as unknown as { type?: string; value?: string; readOnly?: boolean; disabled?: boolean; isContentEditable?: boolean };
   if (tag === "input") {
     const type = field.type ?? "text";
-    return { tag, type, ...(role ? { role } : {}), editable: !field.readOnly && !field.disabled, value: type === "password" ? "[redacted]" : String(field.value ?? "").slice(0, 500) };
+    const runtime = (globalThis as RuntimeGlobal).__browserConnectorRuntime;
+    /* read_page and form_input already redact OTP, card and password fields by name,
+       autocomplete and type; a typed read-back must not become the leak. */
+    const sensitive = runtime ? runtime.sensitive(element as HTMLInputElement) : type === "password";
+    return { tag, type, ...(role ? { role } : {}), editable: !field.readOnly && !field.disabled, value: sensitive ? "[redacted]" : String(field.value ?? "").slice(0, 500) };
   }
   if (tag === "textarea") return { tag, ...(role ? { role } : {}), editable: !field.readOnly && !field.disabled, value: String(field.value ?? "").slice(0, 500) };
   if (field.isContentEditable) return { tag, ...(role ? { role } : {}), editable: true, text: (element.textContent ?? "").slice(0, 500) };
@@ -1697,31 +1755,38 @@ function injectedActiveElement(): { tag: string; type?: string; role?: string; e
 
 /* Where the page and the element's nearest scrollable ancestor stand, so a scroll
    reports what moved instead of only what was requested. */
-function injectedScrollState(pageRef: string | null, generation: number): { x: number; y: number; container?: { top: number; left: number } } {
+function injectedScrollState(pageRef: string | null, generation: number, x?: number, y?: number): { x: number; y: number; container?: { top: number; left: number } } {
   const rt = (globalThis as RuntimeGlobal).__browserConnectorRuntime;
-  let container: HTMLElement | null = null;
-  if (pageRef && rt) {
-    const state = rt.currentState(generation);
-    let node = (state ? rt.scan().resolve(pageRef, state) : null) as HTMLElement | null;
+  const nearestScrollable = (start: HTMLElement | null): HTMLElement | null => {
+    let node = start;
     while (node && node !== document.body && node !== document.documentElement) {
       const style = getComputedStyle(node);
       const scrollable = /(auto|scroll|overlay)/.test(`${style.overflowY} ${style.overflowX}`)
         && (node.scrollHeight > node.clientHeight || node.scrollWidth > node.clientWidth);
-      if (scrollable) { container = node; break; }
+      if (scrollable) return node;
       node = node.parentElement;
     }
+    return null;
+  };
+  let container: HTMLElement | null = null;
+  if (pageRef && rt) {
+    const state = rt.currentState(generation);
+    container = nearestScrollable((state ? rt.scan().resolve(pageRef, state) : null) as HTMLElement | null);
+  } else if (typeof x === "number" && typeof y === "number") {
+    /* A coordinate wheel scrolls whatever is under the point, often an inner panel. */
+    container = nearestScrollable(document.elementFromPoint(x, y) as HTMLElement | null);
   }
   return { x: window.scrollX, y: window.scrollY, ...(container ? { container: { top: container.scrollTop, left: container.scrollLeft } } : {}) };
 }
 
-/* The focused element as a Page Reference, so a settle result can name where the
-   next keystroke would go without a second read_page. */
 /* The page's own ref generation, if it still belongs to the current document. */
 function injectedDocumentGeneration(): number | null {
   const state = (globalThis as RuntimeGlobal).__browserConnectorPageRefState;
   return state && state.document === document ? state.generation : null;
 }
 
+/* The focused element as a Page Reference, so a settle result can name where the
+   next keystroke would go without a second read_page. */
 function injectedFocusInfo(generation: number): { ref?: string; role?: string; name?: string } | null {
   const rt = (globalThis as RuntimeGlobal).__browserConnectorRuntime;
   if (!rt) return null;
@@ -1743,10 +1808,18 @@ function injectedFocusInfo(generation: number): { ref?: string; role?: string; n
     break;
   }
   if (!element) return null;
+  /* body and ordinary containers are not where a keystroke goes; reporting them
+     echoes page text into every result without naming a target. */
+  const tag = element.tagName.toLowerCase();
+  const role = element.getAttribute("role") ?? "";
+  const field = tag === "input" || tag === "textarea" || tag === "select"
+    || (element as HTMLElement).isContentEditable
+    || ["textbox", "searchbox", "combobox"].includes(role);
+  if (!field) return null;
   const html = element as HTMLElement;
   return {
     ...(state ? { ref: rt.refFor(state, html) } : {}),
-    role: element.getAttribute("role") || element.tagName.toLowerCase(),
+    role: element.getAttribute("role") || tag,
     name: rt.nameOf(html, 120)
   };
 }
@@ -1777,7 +1850,9 @@ function injectedReplacementRef(role: unknown, name: unknown, href: unknown, lev
   };
   const matches = rt.scan().all().filter(element => {
     if (roleOf(element) !== wantedRole) return false;
-    if (rt.nameOf(element as HTMLElement, 300).slice(0, 200) !== wantedName) return false;
+    const currentName = rt.nameOf(element as HTMLElement, 300);
+    const compare = Math.min(currentName.length, wantedName.length);
+    if (compare === 0 || currentName.slice(0, compare) !== wantedName.slice(0, compare)) return false;
     if (wantedLevel !== undefined) {
       const tag = element.tagName.toLowerCase();
       if (/^h[1-6]$/.test(tag) && Number(tag[1]) !== wantedLevel) return false;

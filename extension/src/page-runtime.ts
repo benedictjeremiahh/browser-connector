@@ -182,8 +182,9 @@ export function injectedInstallRuntime(): void {
     const byIds = (ids: string | null): string => {
       if (!ids) return "";
       const document = element.ownerDocument;
+      const root = element.getRootNode?.() as (Document & { getElementById?: (id: string) => Element | null }) | undefined;
       return ids.split(/\s+/).map(id => {
-        const target = document?.getElementById(id);
+        const target = (root?.getElementById?.(id)) ?? document?.getElementById(id);
         return target ? target.getAttribute("aria-label") || target.textContent || "" : "";
       }).join(" ").trim();
     };
@@ -283,8 +284,13 @@ export function injectedAssert(expectations: PageExpectation[], generation: numb
   const expandedOf = (element: Element) => element.getAttribute("aria-expanded") === "true" || (element as HTMLDetailsElement).open === true;
   const selectedOf = (element: Element) => element.getAttribute("aria-selected") === "true" || (element as HTMLOptionElement).selected === true;
   /* A label and its control both match the same name; the control is what an assertion is about. */
-  const controlFor = (element: HTMLElement): HTMLElement =>
-    element.tagName.toLowerCase() === "label" ? ((element as HTMLLabelElement).control as HTMLElement | null) ?? element : element;
+  const controlFor = (element: HTMLElement): HTMLElement => {
+    if (element.tagName.toLowerCase() !== "label") return element;
+    const control = (element as HTMLLabelElement).control as HTMLElement | null;
+    if (!control) return element;
+    const box = control.getBoundingClientRect();
+    return box.width > 0 || box.height > 0 ? control : element;
+  };
 
   const targets = (expectation: PageExpectation): { list: HTMLElement[]; stale?: true } => {
     if (expectation.pageRef) {

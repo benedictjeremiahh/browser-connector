@@ -90,6 +90,23 @@ export function sameNavigationTarget(left: string, right: string): boolean {
   return a !== undefined && a === navigationTarget(right);
 }
 
+/* Same document and same query, but a different fragment: a hash route inside an
+   already-open SPA. A query written in another order is the same target, not a
+   navigation, so it must not reload the page and destroy its state. */
+export function sameTargetDifferentHash(left: string, right: string): boolean {
+  if (left === right) return false;
+  try {
+    const a = new URL(left);
+    const b = new URL(right);
+    if (!["http:", "https:"].includes(a.protocol) || a.protocol !== b.protocol) return false;
+    a.hash = "";
+    b.hash = "";
+    return a.href === b.href;
+  } catch {
+    return false;
+  }
+}
+
 export function isRestrictedUrl(value: string): boolean {
   try {
     const url = new URL(value);

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { BrowserController, parseExpectations } from "../src/browser";
+import { BrowserController, injectedActiveElement, injectedClickGuard, parseExpectations } from "../src/browser";
 import { SnapshotStore } from "../src/snapshots";
 
 function event() {
@@ -51,7 +51,7 @@ function harness(respond: (name: string, args: unknown[]) => unknown) {
   return { controller: new BrowserController(), tabs, debuggerApi, scripting };
 }
 
-afterEach(() => { vi.unstubAllGlobals(); });
+afterEach(() => { vi.unstubAllGlobals(); delete (globalThis as { __browserConnectorRuntime?: unknown }).__browserConnectorRuntime; });
 
 describe("interaction feedback", () => {
   it("reports changed:false when the page rejected the value", async () => {
@@ -214,6 +214,8 @@ describe("interaction feedback", () => {
     await h.controller.dispatch("read_page", { tabId: 7 }, new Set([7])).catch(() => undefined);
     const context = await h.controller.dispatch("tabs_context", {}, new Set([7])) as { tabs: Array<Record<string, unknown>> };
     expect(context.tabs[0]!.documentGeneration).toBe(5);
+    const read = h.scripting.executeScript.mock.calls.find(([input]) => (input as { func?: { name?: string } }).func?.name === "injectedReadPage");
+    expect((read?.[0] as { args?: unknown[] }).args?.[0]).toBe(5);
   });
 
   it("fails fast when a JavaScript dialog blocks the page", async () => {
@@ -233,5 +235,59 @@ describe("interaction feedback", () => {
     expect(result.events).toEqual({ dragstart: 1, dragover: 3, drop: 0 });
     const pressed = h.debuggerApi.sendCommand.mock.calls.find(([, method, params]) => method === "Input.dispatchMouseEvent" && (params as { type?: string })?.type === "mousePressed");
     expect((pressed?.[2] as { modifiers?: number }).modifiers).toBe(8);
+  });
+
+  it("click guards an element inside an open shadow root without blocking it", () => {
+    const element = {
+      tagName: "BUTTON",
+      getBoundingClientRect: () => ({ left: 0, top: 0, width: 100, height: 20 }),
+      getAttribute: () => null,
+      getRootNode: () => ({ nodeType: 11, elementFromPoint: () => element }),
+      contains: () => false,
+      labels: []
+    };
+    vi.stubGlobal("document", { elementFromPoint: () => null, getElementById: () => null });
+    vi.stubGlobal("getComputedStyle", () => ({ visibility: "visible" }));
+    (globalThis as { __browserConnectorRuntime?: unknown }).__browserConnectorRuntime = {
+      currentState: () => ({}),
+      scan: () => ({ resolve: () => element }),
+      nameOf: () => "Save",
+      hostChain: () => [],
+      frameOffset: () => ({ x: 0, y: 0 }),
+      sensitive: () => false
+    };
+    expect(injectedClickGuard("p1-1", 1, 50, 10)).toEqual({ point: { x: 50, y: 10 }, role: "button", name: "Save" });
+  });
+
+  it("redacts a sensitive field that is not type=password", () => {
+    const field = { tagName: "INPUT", type: "text", value: "123456", name: "otp", id: "otp", autocomplete: "one-time-code", readOnly: false, disabled: false, shadowRoot: null, getAttribute: () => null };
+    vi.stubGlobal("document", { activeElement: field, getElementById: () => null });
+    (globalThis as { __browserConnectorRuntime?: unknown }).__browserConnectorRuntime = { sensitive: () => true };
+    expect(injectedActiveElement()).toMatchObject({ value: "[redacted]" });
+  });
+
+  it("reports the scroll a pageRef performed", async () => {
+    let call = 0;
+    const h = harness((name) => {
+      if (name === "injectedRefPoint") return { x: 10, y: 20 };
+      if (name === "injectedScrollState") { call += 1; return call === 1 ? { x: 0, y: 0 } : { x: 0, y: 300 }; }
+      return null;
+    });
+    const result = await h.controller.dispatch("computer", { tabId: 7, action: "scroll", pageRef: "p7-1" }, new Set([7])) as { moved: boolean };
+    expect(result.moved).toBe(true);
+  });
+
+  it("clears a dialog when the debugger detaches", async () => {
+    const h = harness(() => null);
+    h.debuggerApi.onEvent.emit({ tabId: 7 }, "Page.javascriptDialogOpening", { type: "alert", message: "Saved" });
+    h.debuggerApi.onDetach.emit({ tabId: 7 });
+    await expect(h.controller.dispatch("computer", { tabId: 7, action: "screenshot", settle: false }, new Set([7]))).resolves.toBeDefined();
+  });
+
+  it("does not reload a tab when only the query order differs", async () => {
+    const h = harness(() => null);
+    h.tabs.get.mockResolvedValue({ id: 7, windowId: 9, url: "https://example.test/?a=1&b=2", title: "Page", active: true, status: "complete" } as never);
+    await h.controller.dispatch("tabs_create", { url: "https://example.test/?b=2&a=1", settle: false }, new Set([7]));
+    expect(h.tabs.update).not.toHaveBeenCalledWith(7, { url: "https://example.test/?b=2&a=1" });
   });
 });
