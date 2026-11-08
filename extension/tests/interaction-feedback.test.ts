@@ -39,7 +39,7 @@ function harness(respond: (name: string, args: unknown[]) => unknown) {
     executeScript: vi.fn(async ({ func, args }: { func: (...values: never[]) => unknown; args: unknown[] }) => {
       const name = (func as { name?: string }).name ?? "";
       if (name === "injectedInstallRuntime") return [{ result: undefined }];
-      return [{ result: respond(name, args) }];
+      return [{ result: await respond(name, args) }];
     })
   };
   vi.stubGlobal("chrome", {
@@ -365,5 +365,19 @@ describe("interaction feedback", () => {
     const result = await h.controller.dispatch("computer", { tabId: 7, action: "drag", pageRef: "p7-1", toPageRef: "p7-2", settle: false }, new Set([7])) as { html5?: boolean };
     expect(result.html5).toBe(true);
     expect(h.debuggerApi.sendCommand.mock.calls.some(([, method, params]) => method === "Input.dispatchDragEvent" && (params as { type?: string }).type === "drop")).toBe(true);
+  });
+
+  it("ends the settle loop when a dialog opens while a script is blocked", async () => {
+    let polls = 0;
+    const h = harness((name) => {
+      if (name === "injectedMutationState") {
+        polls += 1;
+        return polls === 1 ? { count: 0, sequence: 0, notices: [], present: [], reliable: true } : new Promise(() => { /* blocked by the dialog */ });
+      }
+      return null;
+    });
+    setTimeout(() => h.debuggerApi.onEvent.emit({ tabId: 7 }, "Page.javascriptDialogOpening", { type: "confirm", message: "Proceed?" }), 10);
+    const result = await h.controller.dispatch("computer", { tabId: 7, action: "click", x: 10, y: 10 }, new Set([7])) as { after: Record<string, unknown> };
+    expect(result.after.dialog).toEqual({ type: "confirm", message: "Proceed?" });
   });
 });

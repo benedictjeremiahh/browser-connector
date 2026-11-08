@@ -227,10 +227,14 @@ export function injectedInstallRuntime(): void {
     return [element.getAttribute("role")?.toLowerCase(), implicit, tag].includes(wanted);
   };
 
-  /* innerText of a document follows open shadow roots, but not iframes, so frames are added. */
+  /* Chrome's innerText does not cross a shadow boundary, so each open shadow root
+     contributes its own text; iframe documents are added for the same reason. */
   const visibleText = (found: Scan): string =>
-    found.roots.filter(entry => entry.host === null || entry.root.nodeType === 9)
-      .map(entry => (entry.root as Document).body?.innerText ?? "").join("\n");
+    found.roots.filter(entry => entry.host === null || entry.root.nodeType === 9 || entry.root.nodeType === 11)
+      .map(entry => entry.root.nodeType === 11
+        ? ((entry.root as ShadowRoot).textContent ?? "")
+        : ((entry.root as Document).body?.innerText ?? ""))
+      .join("\n");
 
   global.__browserConnectorRuntime = {
     ensureState, currentState, refFor, scan, is,

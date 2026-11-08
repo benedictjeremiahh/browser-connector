@@ -143,6 +143,8 @@ export class BrowserController {
   private dialogs = new Map<number, { type: string; message: string }>();
   /* DragData handed over by Input.dragIntercepted during an HTML5 drag. */
   private dragData = new Map<number, unknown>();
+  /* Settle loops waiting for a dialog event that would block their scripting call. */
+  private readonly dialogWaiters = new Map<number, Set<() => void>>();
   private consoleRecords = new Map<number, ConsoleRecord[]>();
   private networkRecords = new Map<number, NetworkRecord[]>();
   /* Keyed by the session, not by the title: an agent may rename its session at any time, and
@@ -248,10 +250,19 @@ export class BrowserController {
     let lastChange = Date.now();
     let settled = false;
     let notices: string[] = [];
+    /* A dialog blocks the renderer, so executeScript never settles. Race each poll
+       against the dialog event instead of waiting for the MCP call to time out. */
+    let signalDialog: (() => void) | undefined;
+    const dialogOpened = new Promise<null>(resolve => {
+      signalDialog = () => resolve(null);
+      const waiters = this.dialogWaiters.get(tabId) ?? new Set();
+      waiters.add(signalDialog);
+      this.dialogWaiters.set(tabId, waiters);
+    });
     while (Date.now() - started < SETTLE_MAX_MS) {
-      /* A dialog stops the renderer, so the page will never look quiet again. */
       if (this.dialogs.has(tabId)) break;
-      const state = await this.mutationState(tabId);
+      const state = await Promise.race([this.mutationState(tabId), dialogOpened]);
+      if (state === null) break;
       lastReliable = state.reliable;
       if (state.count !== lastCount) { lastCount = state.count; lastChange = Date.now(); }
       notices = [...new Set(state.notices.filter(notice => notice.sequence > noticesBefore && !shownBefore.has(notice.text)).map(notice => notice.text))];
@@ -271,6 +282,11 @@ export class BrowserController {
     const focus = await this.runInPage(tabId, injectedFocusInfo, [generation]).catch(() => null);
     const changeCount = lastCount < 0 || !initial.reliable || !lastReliable ? undefined : Math.max(0, lastCount - initial.count);
     chrome.tabs.onCreated?.removeListener?.(onCreated);
+    if (signalDialog) {
+      const waiters = this.dialogWaiters.get(tabId);
+      waiters?.delete(signalDialog);
+      if (waiters && waiters.size === 0) this.dialogWaiters.delete(tabId);
+    }
     return {
       ...(isRecord(result) ? result : { result }),
       after: {
@@ -1327,6 +1343,8 @@ export class BrowserController {
     if (method === "Page.javascriptDialogOpening") {
       const event = params as { type?: string; message?: string };
       this.dialogs.set(tabId, { type: event.type ?? "alert", message: (event.message ?? "").slice(0, 300) });
+      for (const resolve of this.dialogWaiters.get(tabId) ?? []) resolve();
+      this.dialogWaiters.delete(tabId);
       return;
     }
     if (method === "Page.javascriptDialogClosed") { this.dialogs.delete(tabId); return; }
