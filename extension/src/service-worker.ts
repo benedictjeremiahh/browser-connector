@@ -1,6 +1,6 @@
 import { BrowserController, connectorError, normalizeError, type GroupDescriptor } from "./browser";
 import { RELEASED_TAB_TTL_MS, adoptableOpenTab, adoptableTabs, orphanBlankTabsToClose, releasedTabsToClose, reusableReleasedTab, shouldRecordAgentTab, type AgentTabRecords } from "./adoption";
-import { GROUP_MARK, groupColor, sessionGroupLabel } from "./naming";
+import { DEFAULT_MARK, explicitMark, groupColor, isConnectorGroupTitle, normalizeMark, sessionGroupLabel, sessionMark } from "./naming";
 import { SessionEndings, isSessionEnded } from "./session-endings";
 import { classifyRequest, exactOrigin, hostPermissionPattern, isLocalDevelopmentOrigin, methodsNeedingApproval, redactUrl, sameNavigationTarget, sameTargetDifferentHash } from "./policy";
 import {
@@ -144,6 +144,16 @@ async function handleNativeRequest(request: NativeRequest, port: chrome.runtime.
     risk = authorization.risk;
     origin = authorization.origin;
     const session = await sessionState(request.sessionId);
+    /* The mark names the topic and is fixed once it has a real topic. A generic
+       default is not stored, so a later label or URL can still supply one. */
+    if (!session.mark) {
+      const topic = typeof request.params.url === "string" ? request.params.url : undefined;
+      const derived = sessionMark({ label: session.label, url: topic });
+      if (derived !== DEFAULT_MARK) {
+        session.mark = derived;
+        await saveSessionState(session);
+      }
+    }
     const group = {
       key: request.sessionId,
       label: sessionGroupLabel(session),
@@ -496,6 +506,8 @@ interface SessionState {
   sessionId?: string;
   /* What this session is working on. Set by the relay's default label before the first browser request, and replaced when the agent calls label_session. */
   label?: string;
+  /* The topic mark in the tab group title, fixed once a real topic is known. */
+  mark?: string;
   controlledTabIds: number[];
   sessionSiteGrants: string[];
   touchedAt: number;
@@ -522,6 +534,20 @@ async function labelSession(request: NativeRequest, session: SessionState, contr
   const label = typeof request.params.label === "string" ? request.params.label.trim().slice(0, 60) : "";
   if (!label) throw connectorError("invalid_arguments", "A label is required");
   session.label = label;
+  /* The caller names the mark when it can. Otherwise an emoji it typed at the start
+     of the label wins, then the label's topic, and only then a fallback. */
+  const requested = typeof request.params.mark === "string" ? request.params.mark.trim() : "";
+  const chosen = requested ? normalizeMark(requested) : undefined;
+  if (requested && !chosen) throw connectorError("invalid_arguments", "mark must be a single emoji");
+  if (chosen) session.mark = chosen;
+  else {
+    const explicit = explicitMark(label);
+    if (explicit) session.mark = explicit;
+    else if (!session.mark) {
+      const derived = sessionMark({ label });
+      if (derived !== DEFAULT_MARK) session.mark = derived;
+    }
+  }
   await saveSessionState(session);
   const records = await agentTabRecords();
   for (const tabId of controlled) if (records[tabId]) records[tabId]!.label = label;
@@ -667,7 +693,7 @@ async function sweepReleasedTabs(): Promise<void> {
 async function sweepOrphanBlanks(agentCreatedOnly = true): Promise<void> {
   const groups = await chrome.tabGroups.query({}).catch(() => []);
   const connectorGroups = new Map(
-    groups.filter((group) => (group.title ?? "").startsWith(GROUP_MARK)).map((group) => [group.id, group.title ?? ""])
+    groups.filter((group) => isConnectorGroupTitle(group.title)).map((group) => [group.id, group.title ?? ""])
   );
   if (!connectorGroups.size) return;
   const tabs = (await chrome.tabs.query({})).filter((tab) => tab.groupId !== undefined && connectorGroups.has(tab.groupId));
@@ -685,7 +711,6 @@ async function sweepOrphanBlanks(agentCreatedOnly = true): Promise<void> {
     {
       liveControlled: await liveControlledTabs(),
       focusedWindowIds: focused,
-      connectorTitlePrefix: GROUP_MARK,
       ...(agentCreated ? { agentCreated } : {})
     }
   );
@@ -724,6 +749,7 @@ function normalizeSession(value: unknown, sessionId: string): SessionState {
     sessionId,
     leaseHostId: typeof record.leaseHostId === "string" ? record.leaseHostId : undefined,
     label: typeof record.label === "string" && record.label ? record.label : undefined,
+    mark: typeof record.mark === "string" && record.mark ? record.mark : undefined,
     controlledTabIds: Array.isArray(record.controlledTabIds) ? record.controlledTabIds.map(Number) : [],
     sessionSiteGrants: Array.isArray(record.sessionSiteGrants) ? record.sessionSiteGrants.map(String) : [],
     touchedAt: typeof record.touchedAt === "number" ? record.touchedAt : 0

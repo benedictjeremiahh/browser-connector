@@ -76,7 +76,7 @@ session.
 | `tabs_create` | Get a tab for a URL in this session's group: reuse a Controlled Tab at that URL, else a Controlled background blank tab, else a released tab this Agent Host opened earlier, else adopt an already-open tab at that URL (including one the person opened), else create a background tab. Call it once per URL. |
 | `tabs_activate` | Bring a controlled tab to the front. |
 | `tabs_close` | Close a controlled tab. |
-| `label_session` | Replace this session's automatic tab-group label with a better description of the work. |
+| `label_session` | Replace this session's automatic label and choose one topic emoji as the group mark. |
 | `navigate` | Go to a URL, back, forward, or reload. |
 | `read_page` / `get_page_text` | Accessibility snapshot with refs / bounded visible text. Both can scope to one element's subtree. `read_page` returns a `snapshotId`; pass it back as `diffFrom` to get only what was added, removed or changed. |
 | `find` | Elements by visible text or semantics, as refs. |
@@ -117,12 +117,14 @@ A few behaviours worth knowing:
   synthetic event never passes through, so the connector sends the corresponding editor
   command alongside the event.
 
-Chrome gives a tab group a title and a color, not an icon, so every group title starts with
-the same `🔌` mark. The rest is the session label: `BROWSER_CONNECTOR_SESSION_LABEL` when
-the Agent Host sets it, otherwise the MCP server's working-directory basename, otherwise
-the host id — never an opaque id. Each session gets its own color from Chrome's nine-color
-palette, so concurrent sessions are distinguishable before you read their titles; two
-sessions can still land on the same color, and the title remains the stronger identifier.
+Chrome gives a tab group a title and a color, not an icon, so the title starts with a mark.
+The mark names the topic: one emoji the agent chooses with `label_session`, otherwise one
+inferred from the label or the first URL, and `🌐` when neither says anything. The rest is
+the session label: `BROWSER_CONNECTOR_SESSION_LABEL` when the Agent Host sets it, otherwise
+the MCP server's working-directory basename, otherwise the host id — never an opaque id.
+Each session gets its own color from Chrome's nine-color palette, so concurrent sessions are
+distinguishable before you read their titles; two sessions can still land on the same color,
+and the title remains the stronger identifier.
 
 - **`tabs_create` reuses before it opens.** For a URL it takes, in order: a Controlled Tab
   already at that URL, a Controlled background blank tab, a released tab this Agent Host

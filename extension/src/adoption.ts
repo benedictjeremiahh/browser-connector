@@ -126,7 +126,8 @@ export function orphanBlankTabsToClose(
   options: {
     liveControlled: ReadonlySet<number>;
     focusedWindowIds: ReadonlySet<number>;
-    connectorTitlePrefix: string;
+    /* Omitted when the caller already selected the connector groups by id. */
+    connectorTitlePrefix?: string;
     /* Omitted only by the one-time migration for blanks an older build did not record. */
     agentCreated?: ReadonlySet<number>;
   }
@@ -134,7 +135,7 @@ export function orphanBlankTabsToClose(
   return tabs.filter((tab): tab is SweepTab & { id: number } =>
     typeof tab.id === "number"
     && (options.agentCreated === undefined || options.agentCreated.has(tab.id))
-    && (tab.groupTitle ?? "").startsWith(options.connectorTitlePrefix)
+    && (options.connectorTitlePrefix === undefined || (tab.groupTitle ?? "").startsWith(options.connectorTitlePrefix))
     && !tab.pinned
     && !tab.incognito
     && !options.liveControlled.has(tab.id)

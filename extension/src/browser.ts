@@ -9,7 +9,7 @@ import {
   sameNavigationTarget,
   sameTargetDifferentHash
 } from "./policy";
-import { GROUP_MARK, type GroupColor } from "./naming";
+import { isConnectorGroupTitle, type GroupColor } from "./naming";
 import {
   RUNTIME_MISSING,
   injectedAssert,
@@ -638,7 +638,7 @@ export class BrowserController {
     const candidate = tabs.find((tab) => tab && tab.groupId !== undefined && tab.groupId >= 0);
     if (candidate?.groupId !== undefined) {
       const current = await Promise.resolve(chrome.tabGroups?.get?.(candidate.groupId)).catch(() => undefined);
-      if ((current?.title ?? "").startsWith(GROUP_MARK)) this.groupIds.set(group.key, candidate.groupId);
+      if (isConnectorGroupTitle(current?.title)) this.groupIds.set(group.key, candidate.groupId);
     }
     for (const tabId of tabIds) await this.ensureTabGroup(group, tabId);
   }
