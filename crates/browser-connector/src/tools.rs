@@ -243,6 +243,8 @@ pub enum ComputerAction {
     Move,
     Hover,
     Drag,
+    MouseDown,
+    MouseUp,
     Scroll,
     Type,
     Key,
@@ -644,7 +646,7 @@ impl BrowserService {
     }
 
     #[tool(
-        description = "Mouse, keyboard, scroll, drag and screenshot actions in a controlled tab. Click by pageRef (from find or read_page), not coordinates: a pageRef click checks the element is visible, enabled and not covered, and fails with the covering element named. click, type, key and drag wait for the page to settle and return `after` (URL, title, page notices, console errors, failed requests), so you rarely need a screenshot to learn whether an action worked. `type` reads back the focused field's value or text; replace:true selects the current value first, and keyEvents:true sends keydown/keyup per character for fields that ignore insertText. A notice that appears well after the page goes quiet (a delayed toast) is not in `after`; wait_for its text instead. scroll with a pageRef brings it into view; otherwise it wheels at x/y or the viewport centre, which also scrolls inner panels. scroll returns the before/after position and whether anything moved. Screenshots are JPEG, downscaled to 1600 px by default (imageScale maps image pixels to CSS pixels). Prefer wait_for over the wait action. On macOS Cmd+A/C/V/X/Z run as editor commands.",
+        description = "Mouse, keyboard, scroll, drag and screenshot actions in a controlled tab. Click by pageRef (from find or read_page), not coordinates: a pageRef click checks the element is visible, enabled and not covered, and fails with the covering element named. click, type, key and drag wait for the page to settle and return `after` (URL, title, page notices, console errors, failed requests), so you rarely need a screenshot to learn whether an action worked. `type` reads back the focused field's value or text; replace:true selects the current value first, and keyEvents:true sends keydown/keyup per character for fields that ignore insertText. mouse_down and mouse_up hold and release the pointer across calls for canvas handles; drag also intercepts and completes an HTML5 drag when the page starts one. A notice that appears well after the page goes quiet (a delayed toast) is not in `after`; wait_for its text instead. scroll with a pageRef brings it into view; otherwise it wheels at x/y or the viewport centre, which also scrolls inner panels. scroll returns the before/after position and whether anything moved. Screenshots are JPEG, downscaled to 1600 px by default (imageScale maps image pixels to CSS pixels). Prefer wait_for over the wait action. On macOS Cmd+A/C/V/X/Z run as editor commands.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,

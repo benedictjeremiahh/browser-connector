@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { BrowserController, injectedActiveElement, injectedClickGuard, parseExpectations } from "../src/browser";
+import { BrowserController, injectedActiveElement, injectedClickGuard, injectedFormInput, parseExpectations } from "../src/browser";
 import { SnapshotStore } from "../src/snapshots";
 import { injectedAssert } from "../src/page-runtime";
 import { sameTargetDifferentHash } from "../src/policy";
@@ -321,5 +321,49 @@ describe("interaction feedback", () => {
     expect(sameTargetDifferentHash("https://x/a?a=1&b=2#/route1", "https://x/a?b=2&a=1#/route2")).toBe(true);
     expect(sameTargetDifferentHash("https://x/a#/route2", "HTTPS://X/a#/route2")).toBe(false);
     expect(sameTargetDifferentHash("https://x/a#/route1", "https://x/a#/route1")).toBe(false);
+  });
+
+  it("sets a hidden checkbox through its label ref", () => {
+    const control = {
+      tagName: "INPUT", type: "checkbox", checked: false, disabled: false, readOnly: false,
+      click() { this.checked = !this.checked; }, focus() {}, matches: () => false,
+      ownerDocument: { defaultView: globalThis }, getAttribute: () => null, dispatchEvent: () => true
+    };
+    const label = { tagName: "LABEL", control, getAttribute: () => null };
+    (globalThis as { __browserConnectorRuntime?: unknown }).__browserConnectorRuntime = {
+      currentState: () => ({}),
+      scan: () => ({ resolve: () => label }),
+      is: (element: unknown, name: string) => name === "HTMLInputElement" && element === control,
+      sensitive: () => false
+    };
+    expect(injectedFormInput("p1-1", true, 1)).toMatchObject({ matched: true, actual: true, before: false });
+  });
+
+  it("holds and releases the pointer across mouse_down and mouse_up", async () => {
+    const h = harness((name) => name === "injectedRefPoint" ? { x: 10, y: 20 } : null);
+    const down = await h.controller.dispatch("computer", { tabId: 7, action: "mouse_down", pageRef: "p7-1", button: "left", settle: false }, new Set([7]));
+    expect(down).toMatchObject({ pressed: { x: 10, y: 20 }, button: "left" });
+    const up = await h.controller.dispatch("computer", { tabId: 7, action: "mouse_up", x: 10, y: 20, settle: false }, new Set([7]));
+    expect(up).toMatchObject({ released: { x: 10, y: 20 }, button: "left" });
+    const types = h.debuggerApi.sendCommand.mock.calls.filter(([, method]) => method === "Input.dispatchMouseEvent").map(([, , params]) => (params as { type?: string }).type);
+    expect(types).toContain("mousePressed");
+    expect(types).toContain("mouseReleased");
+  });
+
+  it("completes an HTML5 drag when Chrome intercepts it", async () => {
+    const h = harness((name) => {
+      if (name === "injectedRefPoint") return { x: 10, y: 20 };
+      if (name === "injectedDragProbe") return { dragstart: 1, dragover: 1, drop: 1 };
+      return null;
+    });
+    h.debuggerApi.sendCommand.mockImplementation(async (_target: unknown, method: string, params?: Record<string, unknown>) => {
+      if (method === "Input.dispatchMouseEvent" && params?.type === "mouseMoved" && params.buttons === 1) {
+        h.debuggerApi.onEvent.emit({ tabId: 7 }, "Input.dragIntercepted", { data: { items: [], dragOperationsMask: 1 } });
+      }
+      return {};
+    });
+    const result = await h.controller.dispatch("computer", { tabId: 7, action: "drag", pageRef: "p7-1", toPageRef: "p7-2", settle: false }, new Set([7])) as { html5?: boolean };
+    expect(result.html5).toBe(true);
+    expect(h.debuggerApi.sendCommand.mock.calls.some(([, method, params]) => method === "Input.dispatchDragEvent" && (params as { type?: string }).type === "drop")).toBe(true);
   });
 });

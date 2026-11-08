@@ -141,6 +141,8 @@ export class BrowserController {
   private documentGenerations = new Map<number, number>();
   /* A blocking JavaScript dialog, reported by Page.javascriptDialogOpening. */
   private dialogs = new Map<number, { type: string; message: string }>();
+  /* DragData handed over by Input.dragIntercepted during an HTML5 drag. */
+  private dragData = new Map<number, unknown>();
   private consoleRecords = new Map<number, ConsoleRecord[]>();
   private networkRecords = new Map<number, NetworkRecord[]>();
   /* Keyed by the session, not by the title: an agent may rename its session at any time, and
@@ -889,10 +891,7 @@ export class BrowserController {
         await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseWheel", x: at.x, y: at.y, deltaX: x, deltaY: y });
       }
       const after = await this.runInPage(tabId, injectedScrollState, [ref, generation, at.x, at.y]);
-      const moved = isRecord(before) && isRecord(after)
-        ? before.x !== after.x || before.y !== after.y
-          || JSON.stringify(before.container ?? null) !== JSON.stringify(after.container ?? null)
-        : undefined;
+      const moved = isRecord(before) && isRecord(after) ? JSON.stringify(before) !== JSON.stringify(after) : undefined;
       return { ...(ref ? { scrolledTo: ref, point: at } : { at }), ...(!ref || hasDelta ? { scrolled: { x, y } } : {}), before, after, ...(moved !== undefined ? { moved } : {}) };
     }
     if (action === "type") {
@@ -938,6 +937,9 @@ export class BrowserController {
          before the pointer moves. */
       const from = await this.pointFrom(params, "pageRef", "x", "y", tabId, true);
       await this.dragProbe(tabId, true);
+      /* When the page starts an HTML5 drag, Chrome hands its DragData over instead of
+         leaving the renderer to guess from synthetic mouse moves. */
+      await this.cdp(tabId, "Input.setInterceptDrags", { enabled: true }).catch(() => undefined);
       await this.showCursor(tabId, from, "drag");
       await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", button: "none", buttons: 0, ...from, modifiers });
       let release = from;
@@ -961,16 +963,26 @@ export class BrowserController {
           });
         }
         await this.showCursor(tabId, to, "drag");
+        const data = this.dragData.get(tabId);
+        let html5 = false;
+        if (data !== undefined) {
+          for (const type of ["dragEnter", "dragOver", "drop"] as const) {
+            await this.cdp(tabId, "Input.dispatchDragEvent", { type, x: to.x, y: to.y, data });
+          }
+          html5 = true;
+        }
         await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", button: "left", buttons: 0, clickCount: 1, ...release, modifiers });
         released = true;
         /* Whether the page received dragstart/dragover/drop distinguishes an ignored
            gesture from a drop that landed somewhere unexpected. */
         const events = await this.dragProbe(tabId, false);
-        return { dragged: { from, to }, ...(isRecord(events) ? { events } : {}) };
+        return { dragged: { from, to }, ...(isRecord(events) ? { events } : {}), ...(html5 ? { html5: true } : {}) };
       } catch (error) {
         const failure = normalizeError(error);
         throw connectorError(failure.code, failure.message, true);
       } finally {
+        await this.cdp(tabId, "Input.setInterceptDrags", { enabled: false }).catch(() => undefined);
+        this.dragData.delete(tabId);
         if (pressed && !released) {
           try { await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", button: "left", buttons: 0, clickCount: 1, ...release, modifiers }); } catch { /* the catch above already says outcomeUnknown */ }
         }
@@ -982,6 +994,21 @@ export class BrowserController {
       await this.showCursor(tabId, point, "hover");
       await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", ...point });
       return { moved: point };
+    }
+    if (action === "mouse_down" || action === "mouse_up") {
+      const point = await this.pointFrom(params, "pageRef", "x", "y", tabId, action === "mouse_down");
+      const button = asOptionalString(params.button) ?? "left";
+      if (!["left", "right", "middle"].includes(button)) throw connectorError("invalid_arguments", `Unknown mouse button: ${button}`);
+      const held = button === "left" ? 1 : button === "right" ? 2 : 4;
+      const modifiers = parseModifiers(params.modifiers);
+      await this.showCursor(tabId, point, action === "mouse_down" ? "click" : "hover");
+      if (action === "mouse_down") {
+        await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", ...point, modifiers });
+        await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", button, buttons: held, clickCount: 1, ...point, modifiers });
+        return { pressed: point, button };
+      }
+      await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", button, buttons: 0, clickCount: 1, ...point, modifiers });
+      return { released: point, button };
     }
     if (action === "click" || action === "double_click" || action === "right_click" || action === "middle_click") {
       const clickCount = action === "double_click" ? 2 : 1;
@@ -1303,6 +1330,11 @@ export class BrowserController {
       return;
     }
     if (method === "Page.javascriptDialogClosed") { this.dialogs.delete(tabId); return; }
+    if (method === "Input.dragIntercepted") {
+      const event = params as { data?: unknown };
+      if (event.data !== undefined) this.dragData.set(tabId, event.data);
+      return;
+    }
     if (method === "Runtime.consoleAPICalled") {
       const event = params as { timestamp?: number; type?: string; args?: Array<{ value?: unknown; description?: string }> };
       const text = (event.args ?? []).map((arg) => String(arg.value ?? arg.description ?? "")).join(" ");
@@ -1765,8 +1797,11 @@ export function injectedActiveElement(): { tag: string; type?: string; role?: st
 
 /* Where the page and the element's nearest scrollable ancestor stand, so a scroll
    reports what moved instead of only what was requested. */
-function injectedScrollState(pageRef: string | null, generation: number, x?: number, y?: number): { x: number; y: number; container?: { top: number; left: number } } {
+function injectedScrollState(pageRef: string | null, generation: number, x?: number, y?: number): { x: number; y: number; container?: { top: number; left: number }; frames: Array<{ x: number; y: number }> } {
   const rt = (globalThis as RuntimeGlobal).__browserConnectorRuntime;
+  /* A scroll container may live inside a shadow root, whose parentElement is null. */
+  const parentOf = (node: HTMLElement): HTMLElement | null =>
+    node.parentElement ?? (((node.getRootNode?.() as ShadowRoot | undefined)?.host as HTMLElement | undefined) ?? null);
   const nearestScrollable = (start: HTMLElement | null): HTMLElement | null => {
     let node = start;
     while (node && node !== document.body && node !== document.documentElement) {
@@ -1774,19 +1809,51 @@ function injectedScrollState(pageRef: string | null, generation: number, x?: num
       const scrollable = /(auto|scroll|overlay)/.test(`${style.overflowY} ${style.overflowX}`)
         && (node.scrollHeight > node.clientHeight || node.scrollWidth > node.clientWidth);
       if (scrollable) return node;
-      node = node.parentElement;
+      node = parentOf(node);
     }
     return null;
   };
-  let container: HTMLElement | null = null;
+  /* For a coordinate, descend into an iframe or an open shadow root before choosing. */
+  const deepElement = (doc: Document, px: number, py: number, depth: number): Element | null => {
+    const hit = doc.elementFromPoint?.(px, py) ?? null;
+    if (!hit || depth > 6) return hit;
+    if (String(hit.tagName).toUpperCase() === "IFRAME") {
+      try {
+        const frame = (hit as HTMLIFrameElement).contentDocument;
+        if (frame) {
+          const rect = hit.getBoundingClientRect();
+          return deepElement(frame, px - rect.left - ((hit as HTMLElement).clientLeft || 0), py - rect.top - ((hit as HTMLElement).clientTop || 0), depth + 1);
+        }
+      } catch { /* cross-origin */ }
+      return hit;
+    }
+    const shadow = (hit as HTMLElement).shadowRoot;
+    if (shadow) return shadow.elementFromPoint?.(px, py) ?? hit;
+    return hit;
+  };
+  let element: HTMLElement | null = null;
   if (pageRef && rt) {
     const state = rt.currentState(generation);
-    container = nearestScrollable((state ? rt.scan().resolve(pageRef, state) : null) as HTMLElement | null);
+    element = (state ? rt.scan().resolve(pageRef, state) : null) as HTMLElement | null;
   } else if (typeof x === "number" && typeof y === "number") {
-    /* A coordinate wheel scrolls whatever is under the point, often an inner panel. */
-    container = nearestScrollable(document.elementFromPoint(x, y) as HTMLElement | null);
+    element = deepElement(document, x, y, 0) as HTMLElement | null;
   }
-  return { x: window.scrollX, y: window.scrollY, ...(container ? { container: { top: container.scrollTop, left: container.scrollLeft } } : {}) };
+  const container = nearestScrollable(element);
+  /* The element's own document and every frame between it and the top viewport. */
+  const frames: Array<{ x: number; y: number }> = [];
+  if (element) {
+    const own = element.ownerDocument?.defaultView;
+    if (own) frames.push({ x: own.scrollX, y: own.scrollY });
+    for (const host of rt?.hostChain(element) ?? []) {
+      if (!/^i?frame$/i.test(String(host.tagName))) continue;
+      try {
+        const view = (host as HTMLIFrameElement).contentWindow;
+        if (view) frames.push({ x: view.scrollX, y: view.scrollY });
+      } catch { /* cross-origin */ }
+    }
+  }
+  if (!frames.length) frames.push({ x: window.scrollX, y: window.scrollY });
+  return { x: window.scrollX, y: window.scrollY, ...(container ? { container: { top: container.scrollTop, left: container.scrollLeft } } : {}), frames };
 }
 
 /* The page's own ref generation, if it still belongs to the current document. */
@@ -1878,12 +1945,17 @@ function injectedReplacementRef(role: unknown, name: unknown, href: unknown, lev
   return matches.length === 1 ? rt.refFor(state, matches[0] as HTMLElement) : null;
 }
 
-function injectedFormInput(pageRef: string, value: unknown, generation: number): false | { unsupported: true } | { refused: string } | { missingOption: true; options: string } | { invalidType: "boolean" } | { radioCannotUncheck: true } | { matched: boolean; actual: unknown; before?: unknown; unverified?: string } {
+export function injectedFormInput(pageRef: string, value: unknown, generation: number): false | { unsupported: true } | { refused: string } | { missingOption: true; options: string } | { invalidType: "boolean" } | { radioCannotUncheck: true } | { matched: boolean; actual: unknown; before?: unknown; unverified?: string } {
   const rt = (globalThis as RuntimeGlobal).__browserConnectorRuntime;
   if (!rt) throw new Error("browser-connector-runtime-missing");
   const state = rt.currentState(generation);
-  const element = state ? rt.scan().resolve(pageRef, state) : null;
-  if (!element) return false;
+  const resolved = state ? rt.scan().resolve(pageRef, state) : null;
+  if (!resolved) return false;
+  /* read_page and find return the visible label when its control has no box; the
+     form value still belongs to the control. */
+  const element = resolved.tagName.toLowerCase() === "label"
+    ? ((resolved as HTMLLabelElement).control as HTMLElement | null) ?? resolved
+    : resolved;
   /* An element in an iframe is dispatched events built by its own window, and tested against its own classes. */
   const view = (element.ownerDocument?.defaultView ?? globalThis) as typeof globalThis;
   const fire = () => {
