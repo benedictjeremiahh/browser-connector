@@ -374,6 +374,8 @@ describe("interaction feedback", () => {
         polls += 1;
         return polls === 1 ? { count: 0, sequence: 0, notices: [], present: [], reliable: true } : new Promise(() => { /* blocked by the dialog */ });
       }
+      /* The post-loop focus probe must not run while the renderer is blocked. */
+      if (name === "injectedFocusInfo") return new Promise(() => { /* would hang */ });
       return null;
     });
     setTimeout(() => h.debuggerApi.onEvent.emit({ tabId: 7 }, "Page.javascriptDialogOpening", { type: "confirm", message: "Proceed?" }), 10);

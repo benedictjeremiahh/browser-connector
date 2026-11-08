@@ -278,8 +278,11 @@ export class BrowserController {
     /* An empty consoleErrors list means "none seen" only when the debugger is monitoring this tab;
        without that, the absence says nothing. */
     const monitored = this.attachedTabs.has(tabId);
-    const generation = await this.generation(tabId);
-    const focus = await this.runInPage(tabId, injectedFocusInfo, [generation]).catch(() => null);
+    /* Nothing may script the page while a dialog blocks the renderer, including the
+       focus probe: executeScript would never settle and the call would time out. */
+    const blocked = this.dialogs.has(tabId);
+    const generation = blocked ? undefined : await this.generation(tabId);
+    const focus = blocked || generation === undefined ? null : await this.runInPage(tabId, injectedFocusInfo, [generation]).catch(() => null);
     const changeCount = lastCount < 0 || !initial.reliable || !lastReliable ? undefined : Math.max(0, lastCount - initial.count);
     chrome.tabs.onCreated?.removeListener?.(onCreated);
     if (signalDialog) {
@@ -1547,17 +1550,27 @@ function injectedReadPage(generation: number, maxBytes: number, offset: number, 
 }
 
 function injectedGetPageText(scopeRef: string | null, generation: number): { text: string; scopeRef?: string; staleScopeRef?: true } {
+  const rt = (globalThis as RuntimeGlobal).__browserConnectorRuntime;
+  /* innerText stops at a shadow boundary, so each open shadow root inside the chosen
+     container contributes its own text. */
+  const shadowText = (container: Element | Document): string[] => {
+    if (!rt) return [];
+    return rt.scan().roots
+      .filter(entry => entry.root.nodeType === 11 && entry.host
+        && (container === document || container === entry.host || (container as Element).contains?.(entry.host) || entry.host.contains(container as Element)))
+      .map(entry => ((entry.root as ShadowRoot).textContent ?? "").trim())
+      .filter(Boolean);
+  };
   if (scopeRef !== null) {
-    const rt = (globalThis as RuntimeGlobal).__browserConnectorRuntime;
     if (!rt) throw new Error("browser-connector-runtime-missing");
     const state = rt.currentState(generation);
     const root = state ? rt.scan().resolve(scopeRef, state) : null;
     if (!root?.isConnected) return { text: "", scopeRef, staleScopeRef: true };
-    return { text: root.innerText ?? root.textContent ?? "", scopeRef };
+    return { text: [root.innerText ?? root.textContent ?? "", ...shadowText(root)].join("\n").trim(), scopeRef };
   }
   /* main first: a dashboard of several article cards has no single article that is the page. */
   const root = document.querySelector("main,[role=main]") ?? document.body;
-  return { text: (root as HTMLElement).innerText ?? root.textContent ?? "" };
+  return { text: [(root as HTMLElement).innerText ?? root.textContent ?? "", ...shadowText(root)].join("\n").trim() };
 }
 
 function injectedFind(generation: number, query: string, limit: number, offset: number): unknown {
