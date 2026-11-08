@@ -59,15 +59,15 @@ into from a local AI agent. No account, no server, no telemetry.
 
 **Category**: Developer Tools
 
-**Detailed description**:
+Detailed description:
 
-> 🚀 **Browser Connector**
+> 🚀 Browser Connector
 >
 > Drive the browser you are already signed into from an AI agent running on your own
 > machine. Browser Connector is a Chrome extension plus a local MCP server, built for one
 > loop: build, test and debug in a real browser without copying state between tools.
 >
-> ✨ **What the agent can do**
+> ✨ What the agent can do
 >
 > • Read a controlled tab: accessibility tree, visible text, screenshots, console messages
 >   and network metadata.
@@ -75,19 +75,19 @@ into from a local AI agent. No account, no server, no telemetry.
 > • Verify the result: it sees the page after an action, including errors, notices and
 >   changed elements.
 >
-> 🔒 **Local by design**
+> 🔒 Local by design
 >
 > Everything stays on your computer. There is no account, no server and no telemetry.
 > Page content travels over Chrome native messaging to the agent host you installed, and
 > nowhere else.
 >
-> 🧩 **What you need**
+> 🧩 What you need
 >
 > 1. This extension.
 > 2. The companion program, installed separately. It provides the MCP server and Chrome's
 >    native-messaging host.
 >
-> 📦 **Install the companion**
+> 📦 Install the companion
 >
 > npm (Node 18 or newer):
 >
@@ -101,7 +101,7 @@ into from a local AI agent. No account, no server, no telemetry.
 >
 > Then restart Chrome and approve Host Pairing in the Connector side panel.
 >
-> 🛡️ **Approval and control**
+> 🛡️ Approval and control
 >
 > • Pages served from your own machine (localhost, 127.0.0.1, *.localhost, *.test) need no
 >   approval.
@@ -110,17 +110,17 @@ into from a local AI agent. No account, no server, no telemetry.
 > • The side panel records every call in an audit log, and the Control Lease can be revoked
 >   at any time.
 >
-> 🛠️ **Built for developers**
+> 🛠️ Built for developers
 >
 > Use it from Codex, Claude or any agent host that can launch a local MCP server. It speaks
 > STDIO and works with the agent you already have.
 >
-> 🔗 **Open source**
+> 🔗 Open source
 >
 > Apache-2.0. Source, issues and the companion are at
 > https://github.com/benedictjeremiahh/browser-connector
 >
-> ⚠️ **Development tool**
+> ⚠️ Development tool
 >
 > Once you approve a site, a paired agent can read and change it, including where you are
 > signed in. Use it on sites you trust, and revoke the lease when you are done.
