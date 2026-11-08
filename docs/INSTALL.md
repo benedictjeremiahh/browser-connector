@@ -1,33 +1,65 @@
-# Install the MVP locally
+# Install Browser Connector
 
-The MVP supports macOS and Google Chrome. It is local-only and does not require a connector account.
+The MVP supports macOS and Google Chrome. It is local-only and does not require a
+connector account.
 
-## 1. Build and install the local binary
+There are two parts: the Chrome extension, and a companion program that provides the MCP
+server and Chrome's native-messaging host. The Web Store cannot install or run the
+companion; install it with one of the commands below.
 
-Rust and Node are required to build from source. Run:
+## 1. Install the extension
+
+From the Chrome Web Store, install **Browser Connector**.
+
+For development, build and load the unpacked extension:
+
+```sh
+(cd extension && npm install && npm run build)
+```
+
+Open `chrome://extensions`, enable Developer mode, choose **Load unpacked**, and select
+`extension/dist`. The development id is `kppdjhnonomijdjifhobgeaipejojbho`; the Store
+assigns a different id.
+
+## 2. Install the companion
+
+### npm (no Rust; Node 18 or newer)
+
+```sh
+npx browser-connector install
+```
+
+The installer copies the binary to `~/.local/bin/browser-connector`, registers the
+published Store extension id, and writes Chrome's native-messaging manifest. It never
+points Chrome at the npx cache.
+
+Use `--install-dir <dir>` to choose another stable directory, or `--extension-id <id>` to
+add the development id alongside the Store id.
+
+### Homebrew (no Node)
+
+```sh
+brew install benedictjeremiahh/tap/browser-connector
+browser-connector install --executable "$(brew --prefix)/bin/browser-connector"
+```
+
+The formula ships the same universal binary. Passing the linked `bin` path keeps Chrome's
+manifest pointing at a stable symlink across upgrades.
+
+### From source (Rust and Node)
 
 ```sh
 ./scripts/install-local.sh
+~/.local/bin/browser-connector install --extension-id kppdjhnonomijdjifhobgeaipejojbho
 ```
 
-This installs `browser-connector` into `~/.local/bin` by default and builds the unpacked extension at `extension/dist`.
+That builds `browser-connector` into `~/.local/bin` and the unpacked extension into
+`extension/dist`.
 
-## 2. Load the Chrome extension
+## 3. Pair and connect
 
-1. Open `chrome://extensions`.
-2. Enable Developer mode.
-3. Select **Load unpacked** and choose `extension/dist`.
-4. Confirm Chrome shows the pinned MVP development ID `kppdjhnonomijdjifhobgeaipejojbho`.
-
-## 3. Register native messaging
-
-```sh
-~/.local/bin/browser-connector install --extension-id kppdjhnonomijdjifhobgeaipejojbho --host-id codex
-```
-
-Restart Chrome so it discovers the native-messaging manifest. Open the Browser Connector side panel from the toolbar.
-
-## 4. Connect an Agent Host
+Restart Chrome so it discovers the native-messaging manifest. Open the Browser Connector
+side panel and approve Host Pairing.
 
 ### Codex plugin
 
@@ -37,21 +69,26 @@ The repo contains the plugin bundle at `plugins/browser-connector`. Its `.mcp.js
 browser-connector mcp --host-id codex
 ```
 
-This repository exposes the bundle through its repo marketplace. If **Browser Connector Development** is not listed yet, register the repository root once:
+This repository exposes the bundle through its repo marketplace. If **Browser Connector
+Development** is not listed yet, register the repository root once:
 
 ```sh
-codex plugin marketplace add /path/to/browser-connector-extension
+codex plugin marketplace add /path/to/browser-connector
 ```
 
-The repository is at <https://github.com/benedictjeremiahh/browser-connector> if you would rather register it from its Git URL.
+The repository is at <https://github.com/benedictjeremiahh/browser-connector> if you would
+rather register it from its Git URL.
 
-Restart the ChatGPT desktop app, open the Plugins Directory, choose **Browser Connector Development**, and install **Browser Connector**. Codex CLI users can run the command below or open `/plugins`; start a new session after installation.
+Restart the ChatGPT desktop app, open the Plugins Directory, choose **Browser Connector
+Development**, and install **Browser Connector**. Codex CLI users can run the command below
+or open `/plugins`; start a new session after installation.
 
 ```sh
 codex plugin add browser-connector@browser-connector-dev
 ```
 
-The plugin launches `~/.local/bin/browser-connector` by default. Set `BROWSER_CONNECTOR_BIN` for Codex if you installed the binary elsewhere.
+The plugin launches `~/.local/bin/browser-connector` by default. Set
+`BROWSER_CONNECTOR_BIN` for Codex if you installed the binary elsewhere.
 
 ### Generic MCP host
 
@@ -61,18 +98,20 @@ Configure a local STDIO server equivalent to:
 {
   "mcpServers": {
     "browser-connector": {
-      "command": "browser-connector",
+      "command": "~/.local/bin/browser-connector",
       "args": ["mcp", "--host-id", "my-agent-host"]
     }
   }
 }
 ```
 
-Use a stable, human-readable `host-id`; the Connector Panel displays it during pairing and while it holds the Control Lease.
+Use a stable, human-readable `host-id`; the Connector Panel displays it during pairing and
+while it holds the Control Lease.
 
-## 5. First request
+## 4. First request
 
-Ask the Agent Host to call `tabs_context`. The Connector Panel will request Host Pairing. Site access and consequential actions are approved independently in the panel.
+Ask the Agent Host to call `tabs_context`. The Connector Panel will request Host Pairing.
+Site access and consequential actions are approved independently in the panel.
 
 ## Troubleshooting
 
@@ -80,4 +119,10 @@ Ask the Agent Host to call `tabs_context`. The Connector Panel will request Host
 ~/.local/bin/browser-connector status --host-id codex
 ```
 
-The extension should stay connected whenever Chrome is running, even when no MCP server is active. If it shows disconnected, restart Chrome after native-manifest or binary changes and inspect Chrome's extension errors. Opening the side panel is needed for pairing and approvals, not for routine reconnection. If Chrome reports a debugger conflict, close DevTools or the other debugger before continuing.
+The extension should stay connected whenever Chrome is running, even when no MCP server is
+active. If it shows disconnected, restart Chrome after native-manifest or binary changes
+and inspect Chrome's extension errors. Opening the side panel is needed for pairing and
+approvals, not for routine reconnection. If Chrome reports a debugger conflict, close
+DevTools or the other debugger before continuing.
+
+`browser-connector uninstall` removes the native-messaging manifest and the copied binary.

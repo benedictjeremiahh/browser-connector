@@ -76,11 +76,16 @@ pub struct Installed {
     pub allowed_origins: Vec<String>,
 }
 
-pub fn install(extension_id: &str, host_id: &str, executable: &Path) -> Result<Installed> {
-    validate_extension_id(extension_id)?;
+pub fn install(extension_ids: &[String], host_id: &str, executable: &Path) -> Result<Installed> {
+    if extension_ids.is_empty() {
+        bail!("at least one extension id is required");
+    }
+    for extension_id in extension_ids {
+        validate_extension_id(extension_id)?;
+    }
     let mut config = ConnectorConfig::load_or_create(host_id)?;
     config.host_id = host_id.to_owned();
-    config.extension_id = Some(extension_id.to_owned());
+    config.extension_id = extension_ids.last().cloned();
     config.save()?;
 
     let executable = executable
@@ -90,7 +95,10 @@ pub fn install(extension_id: &str, host_id: &str, executable: &Path) -> Result<I
     install have different ids and are both legitimately the same user's, so replacing
     the list when the second is registered would silently cut the first one off. */
     let path = chrome_native_manifest_path()?;
-    let allowed_origins = merged_origins(existing_origins(&path), extension_id);
+    let mut allowed_origins = existing_origins(&path);
+    for extension_id in extension_ids {
+        allowed_origins = merged_origins(allowed_origins, extension_id);
+    }
     let manifest = NativeMessagingManifest {
         name: NATIVE_HOST_NAME,
         description: "Local native bridge for Browser Connector",
@@ -103,6 +111,17 @@ pub fn install(extension_id: &str, host_id: &str, executable: &Path) -> Result<I
         path,
         allowed_origins,
     })
+}
+
+/// Remove Chrome's native-messaging manifest for this host. The pairing config is
+/// left in place; `uninstall` is about the registration, not the host's secret.
+pub fn uninstall_manifest() -> Result<Option<PathBuf>> {
+    let path = chrome_native_manifest_path()?;
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(Some(path)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
+    }
 }
 
 /* What the manifest already allows. Nothing to preserve when the file is absent, and a

@@ -75,9 +75,13 @@ into from a local AI agent. No account, no server, no telemetry.
 > telemetry: page content travels over Chrome native messaging to the agent host
 > you installed, and nowhere else.
 >
-> The extension needs a companion program, installed separately. It is open
-> source under Apache-2.0 at https://github.com/benedictjeremiahh/browser-connector,
-> which is also where the MCP server and the install steps live.
+> The extension needs a companion program, installed separately. Install it with
+> "npx browser-connector install" (Node 18 or newer), or with Homebrew:
+> "brew install benedictjeremiahh/tap/browser-connector" followed by
+> "browser-connector install --executable $(brew --prefix)/bin/browser-connector".
+> Restart Chrome and approve Host Pairing in the side panel. The companion and its
+> source are open source under Apache-2.0 at
+> https://github.com/benedictjeremiahh/browser-connector
 >
 > This is a development tool. It does not ask before acting: any paired agent can
 > read and change any site the browser can reach, including where you are signed

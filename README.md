@@ -31,21 +31,42 @@ agent host ──STDIO──▶ browser-connector mcp ──unix socket──▶
 
 ## Install
 
-macOS and Google Chrome. Requires Rust and Node to build from source.
+macOS and Google Chrome. The extension and the companion are installed separately.
+
+### Extension
+
+Install **Browser Connector** from the Chrome Web Store. For development, load
+`extension/dist` from `chrome://extensions` with Developer mode on.
+
+### Companion
+
+npm, no Rust toolchain (Node 18 or newer):
+
+```sh
+npx browser-connector install
+```
+
+That copies the binary to `~/.local/bin/browser-connector` (not into the npx cache),
+registers the Store extension id, and writes Chrome's native-messaging manifest.
+
+Homebrew, no Node:
+
+```sh
+brew install benedictjeremiahh/tap/browser-connector
+browser-connector install --executable "$(brew --prefix)/bin/browser-connector"
+```
+
+From source, Rust and Node required:
 
 ```sh
 ./scripts/install-local.sh
+~/.local/bin/browser-connector install --extension-id kppdjhnonomijdjifhobgeaipejojbho
 ```
 
-That builds `browser-connector` into `~/.local/bin`, builds the unpacked extension into
-`extension/dist`, and prints the two manual steps: load `extension/dist` from
-`chrome://extensions` with Developer mode on, then register native messaging.
+Restart Chrome after any of these, open the Connector side panel, and approve Host
+Pairing. Remove the registration with `browser-connector uninstall`.
 
-```sh
-~/.local/bin/browser-connector install --extension-id <id> --host-id <your-host-id>
-```
-
-Restart Chrome afterwards, then add the MCP server to your agent host:
+Then add the MCP server to your agent host:
 
 ```json
 {

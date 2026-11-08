@@ -1,0 +1,31 @@
+{
+  "name": "browser-connector",
+  "version": "0.4.0",
+  "description": "Local MCP server and Chrome native-messaging host for the Browser Connector extension.",
+  "license": "Apache-2.0",
+  "os": ["darwin"],
+  "bin": {
+    "browser-connector": "bin/browser-connector"
+  },
+  "files": [
+    "bin/browser-connector",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/benedictjeremiahh/browser-connector.git"
+  },
+  "homepage": "https://github.com/benedictjeremiahh/browser-connector",
+  "bugs": {
+    "url": "https://github.com/benedictjeremiahh/browser-connector/issues"
+  },
+  "keywords": [
+    "mcp",
+    "chrome",
+    "browser-automation",
+    "native-messaging"
+  ]
+}

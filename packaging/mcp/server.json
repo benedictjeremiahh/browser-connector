@@ -1,0 +1,23 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.benedictjeremiahh/browser-connector",
+  "title": "Browser Connector",
+  "description": "Drive the browser you are already signed into from a local AI agent. The npm package is the companion; install the Chrome extension separately, then run `npx browser-connector install` once to register the native host.",
+  "version": "0.4.0",
+  "websiteUrl": "https://github.com/benedictjeremiahh/browser-connector",
+  "repository": {
+    "url": "https://github.com/benedictjeremiahh/browser-connector",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "browser-connector",
+      "version": "0.4.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "runtimeHint": "npx"
+    }
+  ]
+}
