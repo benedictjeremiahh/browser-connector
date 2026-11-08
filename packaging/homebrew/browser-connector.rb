@@ -18,7 +18,7 @@ class BrowserConnector < Formula
   depends_on :macos
 
   def install
-    bin.install "package/bin/browser-connector" => "browser-connector"
+    bin.install "bin/browser-connector" => "browser-connector"
   end
 
   def caveats
