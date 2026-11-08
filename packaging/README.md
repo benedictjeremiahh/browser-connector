@@ -17,11 +17,11 @@ No Apple Developer Program, no notarization, no `.pkg`.
 2. Publish to npm (requires `npm login`):
 
    ```sh
-   npm publish packaging/npm
+   npm publish packaging/npm --access public
    ```
 
-3. Put the tarball SHA-256 into `packaging/homebrew/browser-connector.rb`, then copy the
-   formula to `Formula/browser-connector.rb` in `benedictjeremiahh/homebrew-tap`.
+3. The formula and `Formula/browser-connector.rb` carry the registry tarball SHA-256.
+   Users tap this repository directly; no separate tap repository is needed.
 
 4. Publish the MCP Registry entry from `packaging/mcp/server.json` after the npm package
    exists. Use the listing copy in `packaging/marketplace/README.md` for mcp.so, Glama and

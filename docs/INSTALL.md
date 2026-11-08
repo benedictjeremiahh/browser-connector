@@ -26,7 +26,7 @@ assigns a different id.
 ### npm (no Rust; Node 18 or newer)
 
 ```sh
-npx browser-connector install
+npx @ceebee/browser-connector install
 ```
 
 The installer copies the binary to `~/.local/bin/browser-connector`, registers the
@@ -39,7 +39,8 @@ add the development id alongside the Store id.
 ### Homebrew (no Node)
 
 ```sh
-brew install benedictjeremiahh/tap/browser-connector
+brew tap benedictjeremiahh/browser-connector https://github.com/benedictjeremiahh/browser-connector
+brew install benedictjeremiahh/browser-connector/browser-connector
 browser-connector install --executable "$(brew --prefix)/bin/browser-connector"
 ```
 

@@ -4,14 +4,15 @@
 # audits it for notarization, which this free build does not have. A formula in a
 # private tap installs the same prebuilt universal binary without quarantine.
 #
-# Publish the npm package first, then replace SHA256 with the tarball's sha256
-# (scripts/package-npm.mjs prints it). Copy this file to Formula/browser-connector.rb
-# in the benedictjeremiahh/homebrew-tap repository.
+# The npm package is published, and the sha256 below is the registry tarball.
+# This file is also served from Formula/browser-connector.rb in this repository, so
+# users can tap the repository directly:
+#   brew tap benedictjeremiahh/browser-connector https://github.com/benedictjeremiahh/browser-connector
 class BrowserConnector < Formula
   desc "Local MCP server and Chrome native-messaging host for Browser Connector"
   homepage "https://github.com/benedictjeremiahh/browser-connector"
-  url "https://registry.npmjs.org/browser-connector/-/browser-connector-0.4.0.tgz"
-  sha256 "SHA256"
+  url "https://registry.npmjs.org/@ceebee/browser-connector/-/browser-connector-0.4.0.tgz"
+  sha256 "8e8de0b701b4b7a920411e9628bc44cd7e17e79ac98ec8df7bd84dd2aeabffd8"
   license "Apache-2.0"
 
   depends_on :macos

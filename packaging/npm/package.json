@@ -1,5 +1,5 @@
 {
-  "name": "browser-connector",
+  "name": "@ceebee/browser-connector",
   "version": "0.4.0",
   "description": "Local MCP server and Chrome native-messaging host for the Browser Connector extension.",
   "license": "Apache-2.0",

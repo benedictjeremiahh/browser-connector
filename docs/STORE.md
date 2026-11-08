@@ -76,8 +76,9 @@ into from a local AI agent. No account, no server, no telemetry.
 > you installed, and nowhere else.
 >
 > The extension needs a companion program, installed separately. Install it with
-> "npx browser-connector install" (Node 18 or newer), or with Homebrew:
-> "brew install benedictjeremiahh/tap/browser-connector" followed by
+> "npx @ceebee/browser-connector install" (Node 18 or newer), or with Homebrew:
+> "brew tap benedictjeremiahh/browser-connector https://github.com/benedictjeremiahh/browser-connector",
+> "brew install benedictjeremiahh/browser-connector/browser-connector", then
 > "browser-connector install --executable $(brew --prefix)/bin/browser-connector".
 > Restart Chrome and approve Host Pairing in the side panel. The companion and its
 > source are open source under Apache-2.0 at

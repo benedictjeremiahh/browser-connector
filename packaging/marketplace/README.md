@@ -14,13 +14,13 @@ account, no server, no telemetry.
 **Launch command**:
 
 ```sh
-npx -y browser-connector mcp --host-id <your-host-id>
+npx -y @ceebee/browser-connector mcp --host-id <your-host-id>
 ```
 
 **One-time companion install** (after installing the Chrome extension):
 
 ```sh
-npx browser-connector install
+npx @ceebee/browser-connector install
 ```
 
 **Repository**: https://github.com/benedictjeremiahh/browser-connector

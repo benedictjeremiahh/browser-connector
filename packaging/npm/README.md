@@ -6,7 +6,7 @@ Chrome extension: a local MCP server plus Chrome's native-messaging host.
 Install the extension from the Chrome Web Store first, then register the companion:
 
 ```sh
-npx browser-connector install
+npx @ceebee/browser-connector install
 ```
 
 That copies the binary to `~/.local/bin/browser-connector` (not into the npx cache),
@@ -16,7 +16,7 @@ manifest. Restart Chrome and approve Host Pairing in the Connector side panel.
 Run the MCP server from your agent host:
 
 ```sh
-npx browser-connector mcp --host-id codex
+npx @ceebee/browser-connector mcp --host-id codex
 # or, after install:
 ~/.local/bin/browser-connector mcp --host-id codex
 ```
@@ -24,7 +24,7 @@ npx browser-connector mcp --host-id codex
 Remove the manifest and the copied binary:
 
 ```sh
-npx browser-connector uninstall
+npx @ceebee/browser-connector uninstall
 ```
 
 The package is macOS-only and carries both arm64 and x64 slices. The binary is

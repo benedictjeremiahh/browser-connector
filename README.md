@@ -43,7 +43,7 @@ Install **Browser Connector** from the Chrome Web Store. For development, load
 npm, no Rust toolchain (Node 18 or newer):
 
 ```sh
-npx browser-connector install
+npx @ceebee/browser-connector install
 ```
 
 That copies the binary to `~/.local/bin/browser-connector` (not into the npx cache),
@@ -52,7 +52,8 @@ registers the Store extension id, and writes Chrome's native-messaging manifest.
 Homebrew, no Node:
 
 ```sh
-brew install benedictjeremiahh/tap/browser-connector
+brew tap benedictjeremiahh/browser-connector https://github.com/benedictjeremiahh/browser-connector
+brew install benedictjeremiahh/browser-connector/browser-connector
 browser-connector install --executable "$(brew --prefix)/bin/browser-connector"
 ```
 
