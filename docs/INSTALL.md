@@ -60,7 +60,7 @@ That builds `browser-connector` into `~/.local/bin` and the unpacked extension i
 ## 3. Pair and connect
 
 Restart Chrome so it discovers the native-messaging manifest. Open the Browser Connector
-side panel and approve Host Pairing.
+side panel and check that it shows **Connected**.
 
 ### Codex plugin
 

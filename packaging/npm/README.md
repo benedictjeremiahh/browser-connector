@@ -11,7 +11,7 @@ npx @ceebee/browser-connector install
 
 That copies the binary to `~/.local/bin/browser-connector` (not into the npx cache),
 registers the published Store extension id, and writes Chrome's native-messaging
-manifest. Restart Chrome and approve Host Pairing in the Connector side panel.
+manifest. Restart Chrome and check that the Connector side panel shows **Connected**.
 
 Run the MCP server from your agent host:
 

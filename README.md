@@ -64,8 +64,8 @@ From source, Rust and Node required:
 ~/.local/bin/browser-connector install --extension-id kppdjhnonomijdjifhobgeaipejojbho
 ```
 
-Restart Chrome after any of these, open the Connector side panel, and approve Host
-Pairing. Remove the registration with `browser-connector uninstall`.
+Restart Chrome after any of these and check that the Connector side panel shows
+**Connected**. Remove the registration with `browser-connector uninstall`.
 
 Then add the MCP server to your agent host:
 
@@ -85,6 +85,19 @@ Use a stable, readable `host-id`; the Connector Panel shows it. `--host-id openc
 each keeps its own local config.
 
 See [docs/INSTALL.md](docs/INSTALL.md) for the Codex plugin route and troubleshooting.
+
+## Tab control
+
+The Connector Panel shows the active tab and each agent session. Choose a session under **Give
+control to**. Each tab can have one controlling session. **Show** brings the chosen tab forward.
+**Take back** releases that tab, keeps it open, and prevents automatic adoption until you give
+control again. **Release all tabs** applies the same behavior across sessions.
+
+Chrome groups and the panel share a display name. Generic labels such as `Projects` use a
+numbered host name such as `🌐 OpenCode 2`. If two sessions use the same task name and emoji,
+the second title gets a stable suffix. Pending approvals identify the requesting session and
+affected tab. In **Allowed sites**, use **Add current site** or enter a site address manually.
+A saved grant applies to the exact HTTP or HTTPS origin across agent sessions.
 
 ## Tools
 

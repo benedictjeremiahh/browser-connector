@@ -87,24 +87,38 @@ export function isConnectorGroupTitle(title: string | undefined): boolean {
   return !!title && !!explicitMark(title);
 }
 
+const GENERIC_LABELS = new Set([
+  "project", "projects", "new project", "new tab", "new session", "untitled", "untitled session",
+  "workspace", "workspaces", "home", "dashboard", "browser", "session"
+]);
+
+export function meaningfulSessionLabel(label: string | undefined, hostId?: string): string | undefined {
+  const name = label ? withoutLeadingMark(label.trim()).replace(/\s+/g, " ").trim() : "";
+  if (!name) return undefined;
+  const host = hostId?.trim().toLowerCase();
+  const parts = name.toLowerCase().split(/\s+[·|–—-]\s+/u);
+  return parts.every((part) => part === host || GENERIC_LABELS.has(part)) ? undefined : name;
+}
+
 export function sessionGroupLabel(session: {
   label?: string;
   leaseHostId?: string;
-  sessionId?: string;
+  ordinal?: number;
   mark?: string;
+  sessionId?: string;
+  suffix?: string;
 }): string {
-  const label = session.label?.trim();
-  const mark = session.mark ?? sessionMark({ label });
-  if (label) return clamp(`${mark} ${withoutLeadingMark(label)}`);
+  const label = meaningfulSessionLabel(session.label, session.leaseHostId);
+  if (label) {
+    const suffix = session.suffix ? ` · ${session.suffix}` : "";
+    return clamp(`${session.mark ?? sessionMark({ label: session.label })} ${label}`, MAX_TITLE_CODE_POINTS - [...suffix].length) + suffix;
+  }
 
-  /* No agent-supplied label yet, so the context is who is driving: the host id is
-     the one thing here a person can read. The session id is deliberately not used
-     — a slice of a UUID tells nobody anything, and a title nobody can read is
-     worse than the same title twice. Two sessions from one host look alike until
-     the agent names them. */
   const host = session.leaseHostId?.trim();
-  if (host) return clamp(`${mark} ${host}`);
-  return clamp(`${mark} Browser Connector`);
+  if (!host) return `${DEFAULT_MARK} Browser Connector`;
+  const hostName = host.toLowerCase() === "opencode" ? "OpenCode" : host;
+  const suffix = session.ordinal === undefined ? "" : ` ${session.ordinal}`;
+  return clamp(`${session.ordinal === undefined ? session.mark ?? DEFAULT_MARK : DEFAULT_MARK} ${hostName}`, MAX_TITLE_CODE_POINTS - suffix.length) + suffix;
 }
 
 /* The color names the session, not the host: a person runs many sessions from one host,
@@ -122,8 +136,8 @@ export function groupColor(hostId: string | undefined, sessionId?: string): Grou
   return GROUP_COLORS[hash % GROUP_COLORS.length]!;
 }
 
-function clamp(value: string): string {
+function clamp(value: string, max = MAX_TITLE_CODE_POINTS): string {
   const characters = [...value];
-  if (characters.length <= MAX_TITLE_CODE_POINTS) return value;
-  return `${characters.slice(0, MAX_TITLE_CODE_POINTS - 1).join("")}…`;
+  if (characters.length <= max) return value;
+  return `${characters.slice(0, max - 1).join("")}…`;
 }

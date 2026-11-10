@@ -1,27 +1,31 @@
 import { BrowserController, connectorError, normalizeError, type GroupDescriptor } from "./browser";
 import { RELEASED_TAB_TTL_MS, adoptableOpenTab, adoptableTabs, orphanBlankTabsToClose, releasedTabsToClose, reusableReleasedTab, shouldRecordAgentTab, type AgentTabRecords } from "./adoption";
-import { DEFAULT_MARK, explicitMark, groupColor, isConnectorGroupTitle, normalizeMark, sessionGroupLabel, sessionMark } from "./naming";
+import { explicitMark, groupColor, isConnectorGroupTitle, meaningfulSessionLabel, normalizeMark, sessionGroupLabel, sessionMark, withoutLeadingMark } from "./naming";
 import { SessionEndings, isSessionEnded } from "./session-endings";
 import { classifyRequest, exactOrigin, hostPermissionPattern, isLocalDevelopmentOrigin, methodsNeedingApproval, redactUrl, sameNavigationTarget, sameTargetDifferentHash } from "./policy";
 import {
-  DEFAULT_STATE,
   type ApprovalRequest,
+  type ActivityState,
   type AuditEvent,
   type GrantDecision,
   type NativeRequest,
   type NativeResponse,
   type PanelState,
+  type PanelTab,
   type PersistedState,
   type Risk
 } from "./types";
 
+const SESSION_PREFIX = "s:";
+const AGENT_TABS_KEY = "agentTabs";
+const RECLAIMED_TABS_KEY = "reclaimedTabs";
 const NATIVE_HOST = "io.browser_connector.native";
 /* Below the relay's 60 second request timeout, so an unanswered approval fails with a definite
    approval_timeout rather than an outcome the agent cannot know. */
 const APPROVAL_TIMEOUT_MS = 50_000;
 const AUDIT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const browser = new BrowserController();
-const approvals = new Map<string, { request: ApprovalRequest; resolve: (decision: GrantDecision) => void }>();
+const approvals = new Map<string, { request: ApprovalRequest; sessionId: string; resolve: (decision: GrantDecision) => void }>();
 let nativePort: chrome.runtime.Port | undefined;
 let nativeConnected = false;
 let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
@@ -30,17 +34,41 @@ let leaseReleaseTimer: ReturnType<typeof setTimeout> | undefined;
 /* Adoption and tab creation both read which tabs no one else holds and then write this session's
    controlled set. Two requests arriving together must not take the same tab, so that decision
    runs one at a time; the approval wait before it is not serialized. */
-let tabDecision: Promise<unknown> = Promise.resolve();
+const hostOrdinals = new Map<string, number>();
+const sessionJobs = new Map<string, Promise<unknown>>();
+const pendingReleases = new Map<number, string>();
+let auditMutation: Promise<void> = Promise.resolve();
+let grantMutation: Promise<void> = Promise.resolve();
+let pairingMutation: Promise<void> = Promise.resolve();
+let releasingAll = false;
+const sessionsReady = restoreSessions();
+let tabDecision: Promise<unknown> = sessionsReady;
 function serializeTabDecision<T>(work: () => Promise<T>): Promise<T> {
   const next = tabDecision.then(work, work);
   tabDecision = next.catch(() => undefined);
   return next;
 }
 
+function queueSession<T>(sessionId: string, work: () => Promise<T>): Promise<T> {
+  const job = (sessionJobs.get(sessionId) ?? sessionsReady).then(work);
+  const settled = job.catch(() => undefined);
+  sessionJobs.set(sessionId, settled);
+  void settled.then(() => {
+    if (sessionJobs.get(sessionId) === settled) sessionJobs.delete(sessionId);
+  });
+  return job;
+}
+
+function cancelApprovals(sessionId?: string): void {
+  for (const pending of approvals.values()) {
+    if (sessionId === undefined || pending.sessionId === sessionId) pending.resolve("deny");
+  }
+}
+
 chrome.runtime.onInstalled.addListener(() => {
   void chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
   void pruneAudit();
-  void dropAutoApprovedSiteGrants();
+  void serializeTabDecision(dropAutoApprovedSiteGrants);
   void serializeTabDecision(sweepLegacyBlanks);
 });
 
@@ -51,9 +79,7 @@ const SITE_GRANT_FLOOR_KEY = "siteGrantFloor";
 async function dropAutoApprovedSiteGrants(): Promise<void> {
   const stored = await chrome.storage.local.get(SITE_GRANT_FLOOR_KEY);
   if (stored[SITE_GRANT_FLOOR_KEY] === 1) return;
-  const state = await persistedState();
-  state.alwaysSiteGrants = [];
-  await savePersistedState(state);
+  await updateAlwaysSiteGrants(() => []);
   for (const session of (await allSessions()).values()) {
     session.sessionSiteGrants = [];
     await saveSessionState(session);
@@ -74,7 +100,8 @@ chrome.alarms?.onAlarm.addListener((alarm) => {
 });
 chrome.tabs.onRemoved.addListener((tabId) => void removeControlledTab(tabId));
 chrome.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) => {
-  void handlePanelMessage(message).then(sendResponse, (error) => sendResponse({ ok: false, error: String(error) }));
+  void sessionsReady.then(() => handlePanelMessage(message))
+    .then(sendResponse, (error) => sendResponse({ ok: false, error: normalizeError(error).message }));
   return true;
 });
 
@@ -97,8 +124,16 @@ async function connectNative(): Promise<void> {
        makes it a no-op after the first run. */
     void serializeTabDecision(sweepLegacyBlanks);
     port.onMessage.addListener((message: unknown) => {
-      if (isNativeRequest(message)) void handleNativeRequest(message, port);
-      else if (isSessionEnded(message)) sessionEndings.ended(message.sessionId);
+      if (isNativeRequest(message)) {
+        if (releasingAll) {
+          port.postMessage({ kind: "response", id: message.id, error: {
+            code: "control_releasing", message: "Tab control is being released. Refresh your tab context."
+          } });
+          return;
+        }
+        sessionEndings.resumed(message.sessionId);
+        void queueSession(message.sessionId, () => handleNativeRequest(message, port));
+      } else if (isSessionEnded(message)) sessionEndings.ended(message.sessionId);
     });
     port.onDisconnect.addListener(() => {
       const disconnectMessage = chrome.runtime.lastError?.message;
@@ -125,46 +160,42 @@ function scheduleReconnect(): void {
 }
 
 const sessionEndings = new SessionEndings(async (sessionId) => {
-  const session = (await allSessions()).get(sessionId);
-  if (!session) return;
-  /* An ordinary end is not a revoked lease, so unlike releaseSession it records no denial. */
-  await chrome.storage.session.remove(SESSION_PREFIX + sessionId);
-  await browser.detachTabs(session.controlledTabIds);
-  await markReleased(session.controlledTabIds);
+  if (releasingAll) return;
+  cancelApprovals(sessionId);
+  await queueSession(sessionId, () => serializeTabDecision(async () => {
+    const session = (await allSessions()).get(sessionId);
+    if (!session) return;
+    /* An ordinary end keeps agent-created tabs eligible for the same work to resume. */
+    await chrome.storage.session.remove(SESSION_PREFIX + sessionId);
+    await browser.detachTabs(session.controlledTabIds);
+    await markReleased(session.controlledTabIds);
+  }));
   await broadcastState();
 });
 
 async function handleNativeRequest(request: NativeRequest, port: chrome.runtime.Port): Promise<void> {
-  sessionEndings.resumed(request.sessionId);
   let response: NativeResponse;
   let risk: Risk = "routine";
   let origin: string | undefined;
+  let sessionCreated = false;
   try {
-    const authorization = await authorize(request);
+    if (nativePort !== port) throw connectorError("disconnected", "The agent connection was lost");
+    if (releasingAll) throw connectorError("control_releasing", "Tab control is being released");
+    const authorization = await authorize(request, (created) => { sessionCreated = created; });
     risk = authorization.risk;
     origin = authorization.origin;
+    sessionCreated = authorization.sessionCreated;
     const session = await sessionState(request.sessionId);
-    /* The mark names the topic and is fixed once it has a real topic. A generic
-       default is not stored, so a later label or URL can still supply one. */
-    if (!session.mark) {
-      const topic = typeof request.params.url === "string" ? request.params.url : undefined;
-      const derived = sessionMark({ label: session.label, url: topic });
-      if (derived !== DEFAULT_MARK) {
-        session.mark = derived;
-        await saveSessionState(session);
-      }
-    }
-    const group = {
-      key: request.sessionId,
-      label: sessionGroupLabel(session),
-      color: groupColor(session.leaseHostId, session.sessionId)
-    };
+    const group = groupFor(session);
+    const validate = (method: string, params: Record<string, unknown>, controlled: Set<number>) =>
+      validateControlledTargets(method, params, controlled);
     let result: unknown;
     if (request.method === "label_session" || request.method === "tabs_create") {
       /* Read the controlled set inside the turn: an earlier request may have added a tab after this
          one read it, and the write that follows must not drop that tab. */
       result = await serializeTabDecision(async () => {
         const controlled = await controlledTabs(request.sessionId);
+        validate(request.method, request.params, controlled);
         let value: unknown;
         if (request.method === "label_session") {
           value = await labelSession(request, session, controlled);
@@ -187,9 +218,13 @@ async function handleNativeRequest(request: NativeRequest, port: chrome.runtime.
       });
     } else {
       const controlled = await controlledTabs(request.sessionId);
-      result = await browser.dispatch(request.method, request.params, controlled, group);
+      validate(request.method, request.params, controlled);
+      result = await browser.dispatch(request.method, request.params, controlled, group,
+        (method, params) => validate(method, params, controlled));
       if (request.method === "browser_batch" && isRecord(result) && Array.isArray(result.results)) {
-        for (const entry of result.results) await recordAgentTab(entry, session);
+        await serializeTabDecision(async () => {
+          for (const entry of (result as { results: unknown[] }).results) await recordAgentTab(entry, session);
+        });
       }
       await saveControlledTabs(request.sessionId, controlled);
     }
@@ -204,14 +239,17 @@ async function handleNativeRequest(request: NativeRequest, port: chrome.runtime.
     await audit(request, risk, origin, normalized.outcomeUnknown ? "unknown" : "failed", normalized.message);
   }
   try { port.postMessage(response); } catch { /* response lost; bridge returns outcome_unknown */ }
-  await broadcastState();
+  await broadcastState(sessionCreated || requestChangesLease(request) ? "full" : "activity");
 }
 
-async function authorize(request: NativeRequest): Promise<{ risk: Risk; origin?: string }> {
-  const state = await persistedState();
+async function authorize(
+  request: NativeRequest,
+  onSessionCreated: (created: boolean) => void
+): Promise<{ risk: Risk; origin?: string; sessionCreated: boolean }> {
+  const state = await readAuthorization();
   const pairedProof = state.pairedHosts[request.hostId];
   if (pairedProof !== request.pairingProof) {
-    const decision = await askApproval({
+    const decision = await askApproval(request.sessionId, {
       kind: "pairing",
       risk: "protected",
       hostId: request.hostId,
@@ -221,22 +259,26 @@ async function authorize(request: NativeRequest): Promise<{ risk: Risk; origin?:
       preview: `Host: ${request.hostId}\nSession: ${request.sessionId}`,
       allowPersistentGrant: false,
       allowSessionGrant: false
-    });
+    }, request);
     if (decision === "deny") throw connectorError("pairing_denied", "User denied Host Pairing");
-    state.pairedHosts[request.hostId] = request.pairingProof;
-    await savePersistedState(state);
+    await updatePairedHosts((pairedHosts) => ({ ...pairedHosts, [request.hostId]: request.pairingProof }));
   }
 
   /* No supersede and no browser_busy. Both existed because one record had to represent every
      session at once; with an entry per session there is no incumbent to displace and no other
      session's lease to collide with. */
   const session = await sessionState(request.sessionId);
+  const sessionCreated = !session.leaseHostId;
+  onSessionCreated(sessionCreated);
   if (leaseReleaseTimer) {
     clearTimeout(leaseReleaseTimer);
     leaseReleaseTimer = undefined;
   }
+  if (session.leaseHostId && session.leaseHostId !== request.hostId) {
+    throw connectorError("session_host_mismatch", "This browser session belongs to a different agent host");
+  }
   session.leaseHostId = request.hostId;
-  session.sessionId = request.sessionId;
+  session.ordinal ??= nextOrdinal(request.hostId);
   await saveSessionState(session);
 
   const controlled = new Set(session.controlledTabIds);
@@ -259,7 +301,7 @@ async function authorize(request: NativeRequest): Promise<{ risk: Risk; origin?:
      transfer wait for a person (ADR-0029). */
   const gated = methodsNeedingApproval(request.method, request.params);
   if (gated.length) {
-    const decision = await askApproval({
+    const decision = await askApproval(request.sessionId, {
       kind: "action",
       risk: classification.risk,
       hostId: request.hostId,
@@ -270,23 +312,23 @@ async function authorize(request: NativeRequest): Promise<{ risk: Risk; origin?:
       preview: actionPreview(request, targetDescription, origins),
       allowPersistentGrant: false,
       allowSessionGrant: false
-    });
+    }, request);
     if (decision === "deny") throw connectorError("action_denied", "User denied browser action");
   }
-  return { risk: classification.risk, origin: origins[0] };
+  return { risk: classification.risk, origin: origins[0], sessionCreated };
 }
 
 async function ensureSiteGrant(
   request: NativeRequest,
   origin: string,
-  state: PersistedState,
+  state: Pick<PersistedState, "alwaysSiteGrants">,
   session: SessionState
 ): Promise<void> {
   if (isLocalDevelopmentOrigin(origin)) return;
   const hasGrant = state.alwaysSiteGrants.includes(origin) || session.sessionSiteGrants.includes(origin);
   const hasChromePermission = await chrome.permissions.contains({ origins: [hostPermissionPattern(origin)] });
   if (hasGrant && hasChromePermission) return;
-  const decision = await askApproval({
+  const decision = await askApproval(request.sessionId, {
     kind: "site",
     risk: "routine",
     hostId: request.hostId,
@@ -297,13 +339,12 @@ async function ensureSiteGrant(
     preview: origin,
     allowPersistentGrant: true,
     allowSessionGrant: true
-  });
+  }, request);
   if (decision === "deny") throw connectorError("site_denied", `User denied access to ${origin}`);
   const nowPermitted = await chrome.permissions.contains({ origins: [hostPermissionPattern(origin)] });
   if (!nowPermitted) throw connectorError("chrome_permission_missing", `Chrome host permission was not granted for ${origin}`);
   if (decision === "always") {
-    state.alwaysSiteGrants = [...new Set([...state.alwaysSiteGrants, origin])];
-    await savePersistedState(state);
+    await updateAlwaysSiteGrants((grants) => grants.includes(origin) ? grants : [...grants, origin]);
   } else if (decision === "session") {
     session.sessionSiteGrants = [...new Set([...session.sessionSiteGrants, origin])];
     await saveSessionState(session);
@@ -311,6 +352,10 @@ async function ensureSiteGrant(
 }
 
 function validateControlledTargets(method: string, params: Record<string, unknown>, controlled: Set<number>): void {
+  if (releasingAll) throw connectorError("control_releasing", "Tab control is being released");
+  if ((method === "tabs_create" || method === "resize_window") && [...controlled].some((id) => pendingReleases.has(id))) {
+    throw connectorError("control_releasing", "The user is taking back a tab in this session");
+  }
   if (method === "tabs_context" || method === "tabs_create" || method === "resize_window" || method === "label_session") return;
   if (method === "browser_batch") {
     const actions = Array.isArray(params.actions) ? params.actions : [];
@@ -326,6 +371,24 @@ function validateControlledTargets(method: string, params: Record<string, unknow
   if (typeof params.tabId !== "number" || !controlled.has(params.tabId)) {
     throw connectorError("tab_not_controlled", "The requested tab is not a Controlled Tab");
   }
+  if (pendingReleases.has(params.tabId)) throw connectorError("control_releasing", "The user is taking back this tab");
+}
+
+const ACTIVITY_ONLY_METHODS = new Set([
+  "read_page", "get_page_text", "find", "read_console_messages", "read_network_requests", "wait_for", "assert"
+]);
+
+function requestChangesLease(request: NativeRequest): boolean {
+  const isActivityOnly = (method: string, params: Record<string, unknown>): boolean => {
+    if (method === "tabs_context") return params.createIfEmpty !== true;
+    if (method === "browser_batch") {
+      const actions = Array.isArray(params.actions) ? params.actions : [];
+      return actions.every((action) => isRecord(action) && typeof action.tool === "string" && isRecord(action.arguments)
+        && isActivityOnly(action.tool, action.arguments));
+    }
+    return ACTIVITY_ONLY_METHODS.has(method);
+  };
+  return !isActivityOnly(request.method, request.params);
 }
 
 async function requestOrigins(method: string, params: Record<string, unknown>): Promise<string[]> {
@@ -366,13 +429,29 @@ async function requestOrigins(method: string, params: Record<string, unknown>): 
 /* Host Pairing still resolves without a person: a paired host can reach nothing until a Site Grant
    or a local development origin lets it. Site and action approvals wait for the Connector Panel,
    and an unanswered one fails with approval_timeout (ADR-0029). */
-async function askApproval(input: Omit<ApprovalRequest, "id" | "createdAt">): Promise<GrantDecision> {
+async function askApproval(
+  sessionId: string,
+  input: Omit<ApprovalRequest, "id" | "createdAt" | "sessionName" | "targets">,
+  sourceRequest?: NativeRequest
+): Promise<GrantDecision> {
+  if (releasingAll || [...pendingReleases.values()].includes(sessionId)) return "deny";
   if (input.kind === "pairing") return "always";
-  const request: ApprovalRequest = { ...input, id: crypto.randomUUID(), createdAt: Date.now() };
+  const session = await sessionState(sessionId);
+  const sessionName = session.leaseHostId ? sessionGroupLabel(session) : sourceRequest?.hostId;
+  const targetIds = approvalTargetIds(sourceRequest);
+  const targets = (await Promise.all(targetIds.map(panelTab))).filter((tab): tab is PanelTab => tab !== undefined);
+  if (releasingAll || [...pendingReleases.values()].includes(sessionId)) return "deny";
+  const request: ApprovalRequest = {
+    ...input,
+    ...(sessionName ? { sessionName } : {}),
+    ...(targets.length ? { targets } : {}),
+    id: crypto.randomUUID(),
+    createdAt: Date.now()
+  };
   let timedOut = false;
   const decision = await new Promise<GrantDecision>((resolve) => {
     const timer = setTimeout(() => { timedOut = true; resolve("deny"); }, APPROVAL_TIMEOUT_MS);
-    approvals.set(request.id, { request, resolve: (value) => { clearTimeout(timer); resolve(value); } });
+    approvals.set(request.id, { request, sessionId, resolve: (value) => { clearTimeout(timer); resolve(value); } });
     void showPendingApprovals();
     void broadcastState();
   });
@@ -383,6 +462,21 @@ async function askApproval(input: Omit<ApprovalRequest, "id" | "createdAt">): Pr
     throw connectorError("approval_timeout", `Nobody answered "${request.title}" in the Connector Panel within ${APPROVAL_TIMEOUT_MS / 1000} seconds`);
   }
   return decision;
+}
+
+function approvalTargetIds(request: NativeRequest | undefined): number[] {
+  if (!request) return [];
+  const ids = new Set<number>();
+  const add = (value: unknown) => {
+    if (typeof value === "number" && Number.isSafeInteger(value)) ids.add(value);
+  };
+  add(request.params.tabId);
+  if (request.method === "browser_batch" && Array.isArray(request.params.actions)) {
+    for (const action of request.params.actions) {
+      if (isRecord(action) && isRecord(action.arguments)) add(action.arguments.tabId);
+    }
+  }
+  return [...ids];
 }
 
 async function showPendingApprovals(): Promise<void> {
@@ -398,6 +492,12 @@ async function handlePanelMessage(message: unknown): Promise<unknown> {
     await connectNative();
     return panelState();
   }
+  if (message.type === "get_activity") {
+    const events = await readAuditEvents();
+    const activity: ActivityState = { count: events.length };
+    if (message.includeEvents === true) activity.events = events.slice(-50).reverse();
+    return activity;
+  }
   if (message.type === "approval_decision") {
     const pending = approvals.get(String(message.approvalId));
     if (!pending) return { ok: false, error: "Approval request expired" };
@@ -408,33 +508,77 @@ async function handlePanelMessage(message: unknown): Promise<unknown> {
     await broadcastState();
     return { ok: true };
   }
-  if (message.type === "control_tab") {
-    const tabId = Number(message.tabId);
-    const origin = String(message.origin ?? "");
-    const session = await mostRecentSession();
-    if (!session.sessionId) return { ok: false, error: "No Agent Host session to add the tab to" };
-    session.controlledTabIds = [...new Set([...session.controlledTabIds, tabId])];
-    if (origin) session.sessionSiteGrants = [...new Set([...session.sessionSiteGrants, origin])];
-    await saveSessionState(session);
+  if (message.type === "control_tab" || message.type === "release_tab" || message.type === "show_tab") {
+    const { sessionId, tabId } = message;
+    if (typeof sessionId !== "string" || typeof tabId !== "number" || !Number.isSafeInteger(tabId)) {
+      return { ok: false, error: "Choose a tab and an agent session." };
+    }
+    if (releasingAll) return { ok: false, error: "Tab control is being released." };
+    const takingBack = message.type === "release_tab";
+    if (takingBack) {
+      if (pendingReleases.has(tabId)) return { ok: false, error: "This tab is already being released." };
+      pendingReleases.set(tabId, sessionId);
+      cancelApprovals(sessionId);
+    }
+    try {
+      await queueSession(sessionId, () => serializeTabDecision(async () => {
+        if (releasingAll) throw connectorError("control_releasing", "Tab control is being released");
+        const session = (await allSessions()).get(sessionId);
+        if (!session?.leaseHostId) throw connectorError("session_missing", "This agent session is no longer available.");
+        if (message.type === "control_tab") {
+          await claimTab(session, tabId, message.expectedUrl);
+          return;
+        }
+        if (!session.controlledTabIds.includes(tabId)) {
+          throw connectorError("tab_not_controlled", "This session no longer controls the tab.");
+        }
+        if (message.type === "show_tab") {
+          const tab = await chrome.tabs.update(tabId, { active: true });
+          if (tab?.windowId !== undefined) {
+            const window = await chrome.windows.get(tab.windowId);
+            if (window.state === "minimized") await chrome.windows.update(tab.windowId, { state: "normal" });
+            await chrome.windows.update(tab.windowId, { focused: true });
+          }
+          return;
+        }
+        const remaining = session.controlledTabIds.filter((id) => id !== tabId);
+        await protectReclaimedTabs([tabId]);
+        session.controlledTabIds = remaining;
+        await saveSessionState(session);
+        await browser.detachTabs([tabId]);
+        await browser.releaseGroup(groupFor(session), [tabId], remaining);
+      }));
+    } finally {
+      if (takingBack) pendingReleases.delete(tabId);
+    }
     await broadcastState();
     return { ok: true };
   }
   if (message.type === "revoke_site") {
-    const state = await persistedState();
-    state.alwaysSiteGrants = state.alwaysSiteGrants.filter(origin => origin !== String(message.origin));
-    await savePersistedState(state);
+    await updateAlwaysSiteGrants((grants) => grants.filter(origin => origin !== String(message.origin)));
+    await broadcastState();
+    return { ok: true };
+  }
+  if (message.type === "add_site") {
+    const origin = canonicalSiteOrigin(message.origin);
+    if (!origin) return { ok: false, error: "Enter a canonical HTTP or HTTPS origin." };
+    if (isLocalDevelopmentOrigin(origin)) return { ok: true, alreadyAllowed: true };
+    if ((await readAlwaysSiteGrants()).includes(origin)) return { ok: true, alreadyAllowed: true };
+    if (!await chrome.permissions.contains({ origins: [hostPermissionPattern(origin)] })) {
+      return { ok: false, error: "Chrome has not granted access to this site." };
+    }
+    const updated = await updateAlwaysSiteGrants((grants) => grants.includes(origin) ? grants : [...grants, origin]);
+    if (!updated.changed) return { ok: true, alreadyAllowed: true };
     await broadcastState();
     return { ok: true };
   }
   if (message.type === "revoke_lease") {
-    await releaseAllSessions("Revoked by user");
+    await releaseAllSessions("Revoked by user", true);
     return { ok: true };
   }
   if (message.type === "clear_log") {
-    const state = await persistedState();
-    state.auditEvents = [];
-    await savePersistedState(state);
-    await broadcastState();
+    await updateAuditEvents(() => []);
+    await broadcastState("activity");
     return { ok: true };
   }
   return { ok: false };
@@ -442,41 +586,99 @@ async function handlePanelMessage(message: unknown): Promise<unknown> {
 
 async function auditLease(hostId: string | undefined, message: string): Promise<void> {
   if (!hostId) return;
-  const state = await persistedState();
-  state.auditEvents.push({
+  await updateAuditEvents((events) => [...events, {
     id: crypto.randomUUID(), timestamp: Date.now(), hostId, method: "control_lease", outcome: "denied", risk: "routine", message
-  });
-  await savePersistedState(state);
+  }]);
 }
 
-async function releaseSession(session: SessionState, message: string): Promise<void> {
-  if (session.sessionId) await chrome.storage.session.remove(SESSION_PREFIX + session.sessionId);
-  await browser.detachTabs(session.controlledTabIds);
-  await markReleased(session.controlledTabIds);
-  await auditLease(session.leaseHostId, message);
+async function claimTab(session: SessionState, tabId: number, expectedUrl: unknown): Promise<void> {
+  if (!nativeConnected) throw connectorError("disconnected", "Reconnect before giving control.");
+  const owner = [...(await allSessions()).values()].find((candidate) => candidate.controlledTabIds.includes(tabId));
+  if (owner && owner.sessionId !== session.sessionId) {
+    throw connectorError("tab_already_controlled", `This tab is already controlled by ${sessionGroupLabel(owner)}.`);
+  }
+  const origin = typeof expectedUrl === "string" ? exactOrigin(expectedUrl) : undefined;
+  if (!origin) throw connectorError("unsupported_tab", "Switch to a website before giving control.");
+  if (!await chrome.permissions.contains({ origins: [hostPermissionPattern(origin)] })) {
+    throw connectorError("chrome_permission_missing", "Allow Browser Connector to access this site in Chrome, then try again.");
+  }
+  const tab = await chrome.tabs.get(tabId).catch(() => undefined);
+  if (!tab?.active || tab.url !== expectedUrl || (tab.pendingUrl && tab.pendingUrl !== tab.url)) {
+    throw connectorError("tab_changed", "The active tab changed. Check the tab and try again.");
+  }
+  if (!nativeConnected) throw connectorError("disconnected", "Reconnect before giving control.");
+  const reclaimed = await reclaimedTabs();
+  const wasReclaimed = reclaimed.delete(tabId);
+  if (!session.controlledTabIds.includes(tabId)) session.controlledTabIds.push(tabId);
+  if (!session.sessionSiteGrants.includes(origin)) session.sessionSiteGrants.push(origin);
+  await saveSessionState(session, wasReclaimed ? { [RECLAIMED_TABS_KEY]: [...reclaimed] } : {});
+  if (wasReclaimed && tab.groupId >= 0) {
+    const group = await chrome.tabGroups.get(tab.groupId).catch(() => undefined);
+    // A tab given back to an agent must stop appearing under a released group.
+    if (group?.title?.startsWith("Released · ")) await chrome.tabs.ungroup(tabId).catch(() => undefined);
+  }
+  await browser.syncMarkers([tabId]);
 }
 
-/* One native port carries every session, so its disconnect is the end of all of them. */
-async function releaseAllSessions(message: string): Promise<void> {
-  const sessions = [...(await allSessions()).values()];
-  for (const session of sessions) await releaseSession(session, message);
-  for (const pending of approvals.values()) pending.resolve("deny");
-  approvals.clear();
-  await broadcastState();
+async function releaseAllSessions(message: string, explicit = false): Promise<void> {
+  if (releasingAll) return;
+  releasingAll = true;
+  cancelApprovals();
+  try {
+    await Promise.all(sessionJobs.values());
+    await serializeTabDecision(async () => {
+      const sessions = await allSessions();
+      if (explicit) await protectReclaimedTabs([...sessions.values()].flatMap((session) => session.controlledTabIds));
+      await chrome.storage.session.remove([...sessions.keys()].map((id) => SESSION_PREFIX + id));
+      for (const session of sessions.values()) {
+        await browser.detachTabs(session.controlledTabIds);
+        if (explicit) await browser.releaseGroup(groupFor(session), session.controlledTabIds, []);
+        else await markReleased(session.controlledTabIds);
+        await auditLease(session.leaseHostId, message);
+      }
+    });
+  } finally {
+    releasingAll = false;
+    await broadcastState();
+  }
 }
 
 async function removeControlledTab(tabId: number): Promise<void> {
-  const records = await agentTabRecords();
-  if (records[tabId]) {
-    delete records[tabId];
-    await chrome.storage.session.set({ [AGENT_TABS_KEY]: records });
-  }
-  for (const session of (await allSessions()).values()) {
-    if (!session.controlledTabIds.includes(tabId)) continue;
-    session.controlledTabIds = session.controlledTabIds.filter((id) => id !== tabId);
+  await sessionsReady;
+  const sessions = await allSessions();
+  if (releasingAll) return;
+  await Promise.all([...sessions.keys()].map((id) => queueSession(id, async () => {
+    const session = await sessionState(id);
+    if (!session.controlledTabIds.includes(tabId)) return;
+    session.controlledTabIds = session.controlledTabIds.filter((value) => value !== tabId);
     await saveSessionState(session);
-  }
+  })));
+  await serializeTabDecision(async () => {
+    const records = await agentTabRecords();
+    const reclaimed = await reclaimedTabs();
+    if (records[tabId]) {
+      delete records[tabId];
+      await chrome.storage.session.set({ [AGENT_TABS_KEY]: records });
+    }
+    if (reclaimed.delete(tabId)) await chrome.storage.session.set({ [RECLAIMED_TABS_KEY]: [...reclaimed] });
+  });
   await broadcastState();
+}
+
+async function reclaimedTabs(): Promise<Set<number>> {
+  const stored = (await chrome.storage.session.get(RECLAIMED_TABS_KEY))[RECLAIMED_TABS_KEY];
+  return new Set(Array.isArray(stored) ? stored.filter((id): id is number => Number.isSafeInteger(id)) : []);
+}
+
+async function protectReclaimedTabs(tabIds: number[]): Promise<void> {
+  if (!tabIds.length) return;
+  const reclaimed = await reclaimedTabs();
+  const records = await agentTabRecords();
+  for (const tabId of tabIds) {
+    reclaimed.add(tabId);
+    delete records[tabId];
+  }
+  await chrome.storage.session.set({ [RECLAIMED_TABS_KEY]: [...reclaimed], [AGENT_TABS_KEY]: records });
 }
 
 async function audit(
@@ -486,19 +688,17 @@ async function audit(
   outcome: AuditEvent["outcome"],
   message?: string
 ): Promise<void> {
-  const state = await persistedState();
-  state.auditEvents = state.auditEvents.filter((event) => event.timestamp > Date.now() - AUDIT_RETENTION_MS);
-  state.auditEvents.push({
+  await updateAuditEvents((events) => {
+    const retained = events.filter((event) => event.timestamp > Date.now() - AUDIT_RETENTION_MS);
+    retained.push({
     id: crypto.randomUUID(), timestamp: Date.now(), hostId: request.hostId, method: request.method, origin, outcome, risk, message
+    });
+    return retained.slice(-500);
   });
-  state.auditEvents = state.auditEvents.slice(-500);
-  await savePersistedState(state);
 }
 
 async function pruneAudit(): Promise<void> {
-  const state = await persistedState();
-  state.auditEvents = state.auditEvents.filter((event) => event.timestamp > Date.now() - AUDIT_RETENTION_MS);
-  await savePersistedState(state);
+  await updateAuditEvents((events) => events.filter((event) => event.timestamp > Date.now() - AUDIT_RETENTION_MS));
 }
 
 interface SessionState {
@@ -510,64 +710,95 @@ interface SessionState {
   mark?: string;
   controlledTabIds: number[];
   sessionSiteGrants: string[];
-  touchedAt: number;
+  ordinal?: number;
+  suffix?: string;
 }
 
-async function persistedState(): Promise<PersistedState> {
-  const stored = await chrome.storage.local.get(DEFAULT_STATE) as Partial<PersistedState>;
+async function readAuthorization(): Promise<Pick<PersistedState, "pairedHosts" | "alwaysSiteGrants">> {
+  const { pairedHosts, alwaysSiteGrants } = await chrome.storage.local.get(["pairedHosts", "alwaysSiteGrants"]);
   return {
-    pairedHosts: stored.pairedHosts ?? {},
-    alwaysSiteGrants: stored.alwaysSiteGrants ?? [],
-    auditEvents: stored.auditEvents ?? []
+    pairedHosts: isRecord(pairedHosts) ? pairedHosts as Record<string, string> : {},
+    alwaysSiteGrants: Array.isArray(alwaysSiteGrants) ? alwaysSiteGrants.map(String) : []
   };
 }
 
-async function savePersistedState(state: PersistedState): Promise<void> {
-  await chrome.storage.local.set(state);
+async function readAlwaysSiteGrants(): Promise<string[]> {
+  const { alwaysSiteGrants } = await chrome.storage.local.get("alwaysSiteGrants");
+  return Array.isArray(alwaysSiteGrants) ? alwaysSiteGrants.map(String) : [];
 }
 
-const SESSION_PREFIX = "s:";
+async function readAuditEvents(): Promise<AuditEvent[]> {
+  const { auditEvents } = await chrome.storage.local.get("auditEvents");
+  return Array.isArray(auditEvents) ? auditEvents as AuditEvent[] : [];
+}
+
+async function updateAuditEvents(update: (events: AuditEvent[]) => AuditEvent[]): Promise<void> {
+  const next = auditMutation.then(async () => {
+    await chrome.storage.local.set({ auditEvents: update(await readAuditEvents()) });
+  });
+  auditMutation = next.catch(() => undefined);
+  return next;
+}
+
+async function updateAlwaysSiteGrants(update: (grants: string[]) => string[]): Promise<{ grants: string[]; changed: boolean }> {
+  let result: { grants: string[]; changed: boolean } = { grants: [], changed: false };
+  const next = grantMutation.then(async () => {
+    const current = await readAlwaysSiteGrants();
+    const grants = update(current);
+    result = { grants, changed: grants.length !== current.length || grants.some((origin, index) => origin !== current[index]) };
+    if (result.changed) await chrome.storage.local.set({ alwaysSiteGrants: grants });
+  });
+  grantMutation = next.catch(() => undefined);
+  await next;
+  return result;
+}
+
+async function updatePairedHosts(update: (hosts: Record<string, string>) => Record<string, string>): Promise<void> {
+  const next = pairingMutation.then(async () => {
+    const stored = await chrome.storage.local.get("pairedHosts");
+    const hosts = isRecord(stored.pairedHosts) ? stored.pairedHosts as Record<string, string> : {};
+    await chrome.storage.local.set({ pairedHosts: update(hosts) });
+  });
+  pairingMutation = next.catch(() => undefined);
+  return next;
+}
 
 /* Naming is session metadata, not a browser action, so it does not go through Browser.dispatch
    — but it does go through authorize first, like everything else the native host asks for. */
 async function labelSession(request: NativeRequest, session: SessionState, controlled: Set<number>): Promise<unknown> {
-  const label = typeof request.params.label === "string" ? request.params.label.trim().slice(0, 60) : "";
-  if (!label) throw connectorError("invalid_arguments", "A label is required");
-  session.label = label;
-  /* The caller names the mark when it can. Otherwise an emoji it typed at the start
-     of the label wins, then the label's topic, and only then a fallback. */
+  const raw = typeof request.params.label === "string" ? request.params.label.trim() : "";
+  if (!raw) throw connectorError("invalid_arguments", "A label is required");
   const requested = typeof request.params.mark === "string" ? request.params.mark.trim() : "";
   const chosen = requested ? normalizeMark(requested) : undefined;
   if (requested && !chosen) throw connectorError("invalid_arguments", "mark must be a single emoji");
-  if (chosen) session.mark = chosen;
-  else {
-    const explicit = explicitMark(label);
-    if (explicit) session.mark = explicit;
-    else if (!session.mark) {
-      const derived = sessionMark({ label });
-      if (derived !== DEFAULT_MARK) session.mark = derived;
-    }
-  }
+  const name = meaningfulSessionLabel(raw, session.leaseHostId);
+  if (!name) return { labelled: meaningfulSessionLabel(session.label, session.leaseHostId) ?? null, displayName: sessionGroupLabel(session) };
+
+  const previousGroup = groupFor(session);
+  const label = [...name].slice(0, 60).join("");
+  if (session.label !== label) session.suffix = undefined;
+  session.mark = chosen ?? explicitMark(raw) ?? (session.label === label ? session.mark : undefined) ?? sessionMark({ label });
+  session.label = label;
+  const titles = new Set([...(await allSessions()).values()]
+    .filter((other) => other.sessionId !== session.sessionId)
+    .map(sessionGroupLabel));
+  disambiguateSession(session, titles);
+  session.controlledTabIds = [...controlled];
   await saveSessionState(session);
   const records = await agentTabRecords();
   for (const tabId of controlled) if (records[tabId]) records[tabId]!.label = label;
   /* The same work resuming in a new session takes back the tabs it opened (ADR-0025). */
-  const liveControlled = new Set([...(await allSessions()).values()].flatMap((other) => other.sessionId === request.sessionId ? [] : other.controlledTabIds));
+  const liveControlled = await liveControlledTabs(request.sessionId);
   const openTabs = new Set((await chrome.tabs.query({})).flatMap((tab) => tab.id === undefined ? [] : [tab.id]));
   const adopted = adoptableTabs(records, session, liveControlled, openTabs).filter((tabId) => !controlled.has(tabId));
   for (const tabId of adopted) { controlled.add(tabId); delete records[tabId]!.releasedAt; }
   await chrome.storage.session.set({ [AGENT_TABS_KEY]: records });
   await saveControlledTabs(request.sessionId, controlled);
-  const group = { key: request.sessionId, label: sessionGroupLabel(session), color: groupColor(session.leaseHostId, session.sessionId) };
+  const group = groupFor(session);
+  await browser.renameGroup(group, previousGroup);
   if (adopted.length) await browser.adoptGroup(group, adopted);
-  /* The stored label is the session's label — the relay's default or the agent's replacement; the
-     title is that label wearing the session's mark, which is why the title is recomputed here
-     rather than reused. */
-  await browser.renameGroup(group);
-  return adopted.length ? { labelled: label, adoptedTabIds: adopted } : { labelled: label };
+  return { labelled: label, displayName: group.label, ...(adopted.length ? { adoptedTabIds: adopted } : {}) };
 }
-
-const AGENT_TABS_KEY = "agentTabs";
 
 async function markReleased(tabIds: number[]): Promise<void> {
   const records = await agentTabRecords();
@@ -589,7 +820,11 @@ async function markReleased(tabIds: number[]): Promise<void> {
 }
 
 async function liveControlledTabs(exceptSessionId?: string): Promise<Set<number>> {
-  return new Set([...(await allSessions()).values()].flatMap((other) => other.sessionId === exceptSessionId ? [] : other.controlledTabIds));
+  const unavailable = await reclaimedTabs();
+  for (const session of (await allSessions()).values()) {
+    if (session.sessionId !== exceptSessionId) for (const id of session.controlledTabIds) unavailable.add(id);
+  }
+  return unavailable;
 }
 
 /* tabs_create for a URL a released tab of the same Agent Host already shows takes that tab into this
@@ -620,7 +855,7 @@ async function takeReleasedTab(request: NativeRequest, session: SessionState, co
   await browser.adoptGroup(group, [tabId]);
   /* Written before the adoption lock opens again: the next session must see this tab as held. */
   await saveControlledTabs(request.sessionId, controlled);
-  const current = navigated ? await chrome.tabs.get(tabId).catch(() => tab) : tab;
+  const current = await chrome.tabs.get(tabId).catch(() => tab);
   return { tabId, windowId: current.windowId, url: current.url ? redactUrl(current.url) : redactUrl(url), reused: true, adopted: true, ...(navigated ? { navigated: true } : {}) };
 }
 
@@ -658,7 +893,7 @@ async function takeExistingTab(request: NativeRequest, controlled: Set<number>, 
     await browser.ensureTabGroup(group, tabId);
     /* Written before the adoption lock opens again: the next session must see this tab as held. */
     await saveControlledTabs(request.sessionId, controlled);
-    const current = navigated ? await chrome.tabs.get(tabId).catch(() => tab) : tab;
+    const current = await chrome.tabs.get(tabId).catch(() => tab);
     return { tabId, windowId: current.windowId, url: current.url ? redactUrl(current.url) : redactUrl(url), reused: true, adopted: true, ...(navigated ? { navigated: true } : {}) };
   } catch {
     controlled.delete(tabId);
@@ -752,7 +987,8 @@ function normalizeSession(value: unknown, sessionId: string): SessionState {
     mark: typeof record.mark === "string" && record.mark ? record.mark : undefined,
     controlledTabIds: Array.isArray(record.controlledTabIds) ? record.controlledTabIds.map(Number) : [],
     sessionSiteGrants: Array.isArray(record.sessionSiteGrants) ? record.sessionSiteGrants.map(String) : [],
-    touchedAt: typeof record.touchedAt === "number" ? record.touchedAt : 0
+    ordinal: typeof record.ordinal === "number" && Number.isSafeInteger(record.ordinal) && record.ordinal > 0 ? record.ordinal : undefined,
+    suffix: typeof record.suffix === "string" ? record.suffix : undefined
   };
 }
 
@@ -773,20 +1009,60 @@ async function sessionState(sessionId: string): Promise<SessionState> {
 
 /* The record carries its own id, so the callers that only ever held a record still work
    unchanged — only the readers that used to imply "the" session had to be told which one. */
-async function saveSessionState(state: SessionState): Promise<void> {
+async function saveSessionState(state: SessionState, updates: Record<string, unknown> = {}): Promise<void> {
   if (!state.sessionId) return;
-  await chrome.storage.session.set({
-    [SESSION_PREFIX + state.sessionId]: { ...state, touchedAt: Date.now() }
-  });
+  await chrome.storage.session.set({ ...updates, [SESSION_PREFIX + state.sessionId]: state });
 }
 
-/* For callers holding no session: the panel's control_tab, and the tab-removed listener. The
-   most recently used session is exactly what "the" session meant when there was only one. It
-   is a stopgap, not a model — the panel has no session of its own to name yet. */
-async function mostRecentSession(): Promise<SessionState> {
-  const sessions = [...(await allSessions()).values()];
-  if (!sessions.length) return normalizeSession(undefined, "");
-  return sessions.reduce((a, b) => (b.touchedAt > a.touchedAt ? b : a));
+function groupFor(session: SessionState): GroupDescriptor {
+  return { key: session.sessionId ?? "", label: sessionGroupLabel(session), color: groupColor(session.leaseHostId, session.sessionId) };
+}
+
+function nextOrdinal(hostId: string): number {
+  const key = hostId.toLowerCase();
+  const ordinal = (hostOrdinals.get(key) ?? 0) + 1;
+  hostOrdinals.set(key, ordinal);
+  return ordinal;
+}
+
+function disambiguateSession(session: SessionState, titles: Set<string>): void {
+  if (!titles.has(sessionGroupLabel(session))) return;
+  const identity = `${session.leaseHostId?.slice(0, 14) ?? "Session"} ${session.ordinal}`;
+  session.suffix = identity;
+  let counter = 2;
+  while (titles.has(sessionGroupLabel(session))) session.suffix = `${identity} (${counter++})`;
+}
+
+async function restoreSessions(): Promise<void> {
+  const sessions = await allSessions();
+  const seen = new Set<number>();
+  const shared = new Set<number>();
+  for (const session of sessions.values()) {
+    if (session.leaseHostId && session.ordinal !== undefined) {
+      const host = session.leaseHostId.toLowerCase();
+      hostOrdinals.set(host, Math.max(session.ordinal, hostOrdinals.get(host) ?? 0));
+    }
+    for (const id of new Set(session.controlledTabIds)) {
+      if (seen.has(id)) shared.add(id);
+      seen.add(id);
+    }
+  }
+  const titles = new Set<string>();
+  for (const session of sessions.values()) {
+    if (!session.leaseHostId) continue;
+    const previous = groupFor(session);
+    session.ordinal ??= nextOrdinal(session.leaseHostId);
+    disambiguateSession(session, titles);
+    const group = groupFor(session);
+    titles.add(group.label);
+    session.controlledTabIds = session.controlledTabIds.filter((id) => !shared.has(id));
+    await saveSessionState(session);
+    if (group.label !== previous.label) await browser.renameGroup(group, previous);
+  }
+  if (shared.size) {
+    await protectReclaimedTabs([...shared]);
+    await browser.detachTabs(shared);
+  }
 }
 
 async function controlledTabs(sessionId: string): Promise<Set<number>> {
@@ -799,28 +1075,52 @@ async function saveControlledTabs(sessionId: string, tabs: Set<number>): Promise
   await saveSessionState(session);
 }
 
-async function panelState(): Promise<PanelState> {
-  const state = await persistedState();
-  const sessions = [...(await allSessions()).values()].sort((a, b) => b.touchedAt - a.touchedAt);
-  const recent = sessions[0];
+async function panelTab(tabId: number): Promise<PanelTab | undefined> {
+  const tab = await chrome.tabs.get(tabId).catch(() => undefined);
+  if (!tab) return undefined;
+  const origin = tab.url ? exactOrigin(tab.url) : undefined;
+  const safeUrl = tab.url ? redactUrl(tab.url) : undefined;
   return {
-    nativeConnected,
-    pairedHosts: Object.keys(state.pairedHosts),
-    leaseHostId: recent?.leaseHostId,
-    controlledTabIds: recent?.controlledTabIds ?? [],
-    leases: sessions.map((session) => ({
-      sessionId: session.sessionId ?? "",
-      hostId: session.leaseHostId,
-      tabIds: session.controlledTabIds
-    })),
-    approvals: [...approvals.values()].map(({ request }) => request),
-    allowedSites: [...state.alwaysSiteGrants].sort(),
-    auditEvents: [...state.auditEvents].reverse().slice(0, 50)
+    tabId, windowId: tab.windowId, index: tab.index, title: tab.title || "Untitled tab", origin,
+    path: origin && safeUrl ? new URL(safeUrl).pathname : undefined
   };
 }
 
-async function broadcastState(): Promise<void> {
-  try { await chrome.runtime.sendMessage({ type: "state_changed", state: await panelState() }); } catch { /* panel closed */ }
+async function panelState(): Promise<PanelState> {
+  const [grants, all] = await Promise.all([readAlwaysSiteGrants(), allSessions()]);
+  const sessions = [...all.values()];
+  const leases = await Promise.all(sessions.flatMap((session) => {
+    if (!session.sessionId || !session.leaseHostId) return [];
+    const { sessionId, leaseHostId: hostId, controlledTabIds } = session;
+    return [Promise.all(controlledTabIds.map(panelTab)).then((tabs) => ({
+      sessionId, hostId, displayName: sessionGroupLabel(session), tabs: tabs.filter((tab) => tab !== undefined)
+    }))];
+  }));
+  leases.sort((a, b) => withoutLeadingMark(a.displayName).localeCompare(withoutLeadingMark(b.displayName), undefined, { numeric: true }));
+  return {
+    nativeConnected, leases,
+    approvals: [...approvals.values()].map(({ request }) => request),
+    allowedSites: grants.sort()
+  };
+}
+
+async function broadcastState(scope: "full" | "activity" = "full"): Promise<void> {
+  try {
+    await chrome.runtime.sendMessage(scope === "activity"
+      ? { type: "state_changed", scope: "activity" }
+      : { type: "state_changed" });
+  } catch { /* panel closed */ }
+}
+
+function canonicalSiteOrigin(value: unknown): string | undefined {
+  if (typeof value !== "string" || !value || value.trim() !== value) return undefined;
+  try {
+    const url = new URL(value);
+    if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.hostname.includes("*")) return undefined;
+    return url.origin === value ? value : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function actionTitle(method: string, risk: Risk): string {

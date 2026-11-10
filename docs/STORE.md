@@ -100,16 +100,19 @@ brew tap benedictjeremiahh/browser-connector https://github.com/benedictjeremiah
 brew install benedictjeremiahh/browser-connector/browser-connector
 browser-connector install --executable "$(brew --prefix)/bin/browser-connector"
 
-Then restart Chrome and approve Host Pairing in the Connector side panel.
+Then restart Chrome and check that the Connector side panel shows Connected.
 
 🛡️ Approval and control
 
 • Pages served from your own machine (localhost, 127.0.0.1, *.localhost, *.test) need no
   approval.
 • Any other site waits for you in the Connector Panel: once, for the session, or always.
-• Every javascript_tool, upload_file and download_file call is approved on its own.
-• The side panel records every call in an audit log, and the Control Lease can be revoked
-  at any time.
+• In Allowed sites, add the current website or enter its address. A saved site applies
+  across sessions to that exact origin.
+• JavaScript and file transfers require explicit approval. The request names the agent
+  session and the affected tab when there is one.
+• Give a tab to a specific session, take it back, or release all tabs. Your tabs stay open.
+  The panel keeps a local activity log.
 
 🛠️ Built for developers
 
@@ -204,8 +207,8 @@ The console asks for one per permission. Paste these:
 
 ## Shipping an update
 
-Nothing in the listing or the privacy practices changes for a normal feature
-release, so an update is three steps:
+Check that the listing still describes the current approval and control behavior before
+submitting an update.
 
 1. Bump `version` in `extension/public/manifest.json`. The console refuses a
    version that is not higher than the one it already has.

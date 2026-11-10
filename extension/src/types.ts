@@ -23,6 +23,8 @@ export interface ApprovalRequest {
   kind: "pairing" | "site" | "action";
   risk: Risk;
   hostId: string;
+  sessionName?: string;
+  targets?: PanelTab[];
   method: string;
   origin?: string;
   title: string;
@@ -50,18 +52,32 @@ export interface PersistedState {
   auditEvents: AuditEvent[];
 }
 
+export interface PanelTab {
+  tabId: number;
+  windowId: number;
+  index: number;
+  title: string;
+  origin?: string;
+  path?: string;
+}
+
+export interface PanelLease {
+  sessionId: string;
+  hostId: string;
+  displayName: string;
+  tabs: PanelTab[];
+}
+
 export interface PanelState {
   nativeConnected: boolean;
-  pairedHosts: string[];
-  leaseHostId?: string;
-  /* One entry per Agent Host session. leaseHostId and controlledTabIds stay as the most
-     recent session's, so a panel that has not been taught about several keeps working. */
-  leases?: { sessionId: string; hostId?: string; tabIds: number[] }[];
-  controlledTabIds: number[];
+  leases: PanelLease[];
   approvals: ApprovalRequest[];
-  /* Origins with an "always" Site Grant. Local development origins need none and are not listed. */
-  allowedSites?: string[];
-  auditEvents: AuditEvent[];
+  allowedSites: string[];
+}
+
+export interface ActivityState {
+  count: number;
+  events?: AuditEvent[];
 }
 
 export const DEFAULT_STATE: PersistedState = {

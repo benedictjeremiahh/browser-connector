@@ -8,51 +8,81 @@
   </head>
   <body>
     <header>
-      <div class="brand">
-        <img class="brand-mark" src="icons/128.png" alt="" width="30" height="30">
-        <div>
-          <p class="eyebrow">LOCAL CONNECTOR</p>
+      <div class="topbar">
+        <div class="brand">
+          <img class="brand-mark" src="icons/128.png" alt="" width="30" height="30">
           <h1>Browser Connector</h1>
         </div>
+        <span id="status" class="status disconnected" role="status">Connecting</span>
       </div>
-      <span id="status" class="status disconnected">Disconnected</span>
+      <div id="release-all" class="release-all" hidden>
+        <span id="controlled-count" class="count"></span>
+        <button id="revoke-lease" type="button" class="secondary" aria-describedby="release-help">Release all tabs</button>
+        <span id="release-help" class="sr-only">Ends control across all sessions. Tabs stay open.</span>
+      </div>
     </header>
 
     <main>
-      <section id="approvals-section" hidden>
-        <h2>Waiting for you</h2>
-        <ol id="approvals" class="approvals"></ol>
+      <section id="approvals-section" aria-labelledby="approvals-heading" hidden>
+        <h2 id="approvals-heading">Waiting for you</h2>
+        <ol id="approvals" class="approvals" aria-live="polite"></ol>
       </section>
-
-      <section>
-        <h2>Control</h2>
-        <dl class="facts">
-          <div><dt>Paired host</dt><dd id="paired-host">None</dd></div>
-          <div><dt>Control lease</dt><dd id="lease-host">None</dd></div>
-          <div><dt>Controlled tabs</dt><dd id="tab-count">0</dd></div>
-        </dl>
-        <div class="actions">
-          <button id="control-current">Control current tab</button>
-          <button id="revoke-lease" class="secondary">Revoke lease</button>
+      <p id="action-announcement" class="sr-only" role="status"></p>
+      <section aria-labelledby="current-heading">
+        <h2 id="current-heading">Current tab</h2>
+        <p id="current-title" class="tab-title">Checking the active tab…</p>
+        <p id="current-address" class="tab-address" hidden></p>
+        <p id="current-owner" class="owner" tabindex="-1" hidden></p>
+        <div id="handoff" class="handoff" hidden>
+          <label for="session-select">Give control to</label>
+          <div class="handoff-actions">
+            <select id="session-select" aria-describedby="control-help"></select>
+            <button id="control-current" type="button" aria-describedby="control-help">Give control</button>
+          </div>
         </div>
+        <p id="control-help" class="help"></p>
+        <div id="current-feedback"></div>
       </section>
 
-      <section>
-        <h2>Allowed sites</h2>
-        <p class="note">Local development pages (localhost, 127.0.0.1, *.localhost, *.test) are always allowed.</p>
-        <ul id="allowed-sites" class="sites"></ul>
-      </section>
-
-      <section>
+      <section aria-labelledby="sessions-heading">
         <div class="section-heading">
-          <h2>Recent activity</h2>
-          <button id="clear-log" class="link">Clear</button>
+          <h2 id="sessions-heading" tabindex="-1">Agent sessions</h2>
+          <span id="session-count" class="count"></span>
         </div>
-        <ol id="audit-log" class="audit"></ol>
+        <p id="sessions-empty" class="help">Checking agent sessions…</p>
+        <div id="sessions"></div>
       </section>
+
+      <details id="sites-details">
+        <summary>Allowed sites</summary>
+        <p class="help">An allowed site applies across agent sessions. Local development sites are already allowed.</p>
+        <div class="site-current">
+          <div>
+            <p class="small-label">Current site</p>
+            <p id="site-current-origin" class="tab-address"></p>
+          </div>
+          <button id="add-current-site" type="button" aria-describedby="site-current-origin">Add current site</button>
+        </div>
+        <form id="site-form">
+          <label for="site-input" class="small-label">Site address</label>
+          <div class="handoff-actions">
+            <input id="site-input" type="text" inputmode="url" placeholder="example.com" autocomplete="off" spellcheck="false" aria-describedby="site-help">
+            <button id="add-manual-site" type="submit">Add site</button>
+          </div>
+          <p id="site-help" class="help"></p>
+        </form>
+        <div id="site-feedback"></div>
+        <ul id="allowed-sites" class="sites"></ul>
+      </details>
+
+      <details id="activity-details">
+        <summary>Recent activity <span id="activity-count" class="count"></span></summary>
+        <p id="activity-empty" class="help">No activity yet.</p>
+        <ol id="audit-log" class="audit"></ol>
+        <button id="clear-log" type="button" class="secondary" hidden>Clear activity</button>
+      </details>
     </main>
 
     <script src="panel.js"></script>
   </body>
 </html>
-

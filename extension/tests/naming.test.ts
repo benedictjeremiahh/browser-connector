@@ -55,9 +55,22 @@ describe("tab group naming", () => {
 
   it("falls back to the host, never to an opaque session id", () => {
     const title = sessionGroupLabel({ leaseHostId: "opencode", sessionId: "abcdefgh-1234" });
-    expect(title).toBe(`${DEFAULT_MARK} opencode`);
+    expect(title).toBe(`${DEFAULT_MARK} OpenCode`);
     expect(title).not.toContain("abcdefgh");
     expect(sessionGroupLabel({ leaseHostId: "codex" })).toBe(`${DEFAULT_MARK} codex`);
+  });
+
+  it("keeps generic labels neutral and distinguishable", () => {
+    expect(sessionGroupLabel({ label: "Projects | OpenCode", leaseHostId: "opencode", ordinal: 2, mark: "🛒" }))
+      .toBe("🌐 OpenCode 2");
+    expect(sessionGroupLabel({ label: "Projects billing review", leaseHostId: "opencode", ordinal: 2 }))
+      .toBe("💳 Projects billing review");
+  });
+
+  it("keeps the suffix of a duplicate named session visible after truncation", () => {
+    const title = sessionGroupLabel({ label: "x".repeat(200), suffix: "cc-go 2" });
+    expect([...title]).toHaveLength(60);
+    expect(title).toMatch(/… · cc-go 2$/);
   });
 
   it("never leaves a title empty", () => {

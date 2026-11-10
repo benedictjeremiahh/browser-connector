@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Browser Connector",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Local provider-agnostic browser control for paired MCP agent hosts.",
   "incognito": "not_allowed",
   "icons": {

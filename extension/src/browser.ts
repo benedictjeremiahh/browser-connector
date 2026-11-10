@@ -183,13 +183,19 @@ export class BrowserController {
   }
 
   /* Every call re-syncs the favicon marks, so a tab is marked however it became controlled. */
-  async dispatch(method: string, params: Record<string, unknown>, controlledTabIds: Set<number>, group: GroupDescriptor = DEFAULT_GROUP): Promise<unknown> {
-    const result = await this.dispatchMethod(method, params, controlledTabIds, group);
+  async dispatch(
+    method: string, params: Record<string, unknown>, controlledTabIds: Set<number>, group: GroupDescriptor = DEFAULT_GROUP,
+    validateAction?: (method: string, params: Record<string, unknown>) => void
+  ): Promise<unknown> {
+    const result = await this.dispatchMethod(method, params, controlledTabIds, group, validateAction);
     await this.markers.sync(controlledTabIds).catch(() => undefined);
     return result;
   }
 
-  private async dispatchMethod(method: string, params: Record<string, unknown>, controlledTabIds: Set<number>, group: GroupDescriptor): Promise<unknown> {
+  private async dispatchMethod(
+    method: string, params: Record<string, unknown>, controlledTabIds: Set<number>, group: GroupDescriptor,
+    validateAction?: (method: string, params: Record<string, unknown>) => void
+  ): Promise<unknown> {
     switch (method) {
       case "tabs_context": return this.tabsContext(controlledTabIds);
       case "tabs_create": return this.tabsCreateSettled(controlledTabIds, params, group);
@@ -210,7 +216,7 @@ export class BrowserController {
       case "resize_window": return this.emulateViewport(params, controlledTabIds);
       case "upload_file": return this.uploadFile(params);
       case "download_file": return this.downloadFile(asTabId(params.tabId), asString(params.url));
-      case "browser_batch": return this.browserBatch(params, controlledTabIds, group);
+      case "browser_batch": return this.browserBatch(params, controlledTabIds, group, validateAction);
       default: throw connectorError("unknown_tool", `Unknown browser tool: ${method}`);
     }
   }
@@ -552,13 +558,20 @@ export class BrowserController {
       }
     }
     /* Work tabs open in the background: the person keeps the tab they are using (ADR-0024). */
-    const tab = await chrome.tabs.create({ url: url ?? "about:blank", active: false });
+    const groupId = this.groupIds.get(group.key) ?? await this.recoverGroup(group);
+    const currentGroup = groupId === undefined
+      ? undefined : await Promise.resolve(chrome.tabGroups?.get?.(groupId)).catch(() => undefined);
+    const options = { url: url ?? "about:blank", active: false };
+    const tab = currentGroup
+      ? await chrome.tabs.create({ ...options, windowId: currentGroup.windowId }).catch(() => chrome.tabs.create(options))
+      : await chrome.tabs.create(options);
     if (tab.id === undefined) throw connectorError("tab_create_failed", "Chrome did not return a tab ID");
     controlledTabIds.add(tab.id);
     await this.ensureTabGroup(group, tab.id);
+    const placed = await chrome.tabs.get(tab.id).catch(() => tab);
     return {
       tabId: tab.id,
-      windowId: tab.windowId,
+      windowId: placed.windowId,
       url: tab.url ? redactUrl(tab.url) : redactUrl(url ?? "about:blank"),
       reused: false,
       openElsewhere: url ? await this.countTabsOutsideBoundary(controlledTabIds, url) : 0
@@ -607,16 +620,21 @@ export class BrowserController {
     try {
       const existing = this.groupIds.get(group.key);
       if (existing !== undefined) {
-        await chrome.tabs.group({ groupId: existing, tabIds: [tabId] });
-        if (group.label) await chrome.tabGroups.update(existing, { title: group.label, ...colorProperty(group) }).catch(() => {});
-        return;
+        const joined = await chrome.tabs.group({ groupId: existing, tabIds: [tabId] }).catch(() => undefined);
+        if (joined !== undefined) {
+          if (group.label) await chrome.tabGroups.update(existing, { title: group.label, ...colorProperty(group) }).catch(() => {});
+          return;
+        }
+        this.groupIds.delete(group.key);
       }
       const recovered = await this.recoverGroup(group);
       if (recovered !== undefined) {
-        this.groupIds.set(group.key, recovered);
-        await chrome.tabs.group({ groupId: recovered, tabIds: [tabId] });
-        if (group.label) await chrome.tabGroups.update(recovered, { title: group.label, ...colorProperty(group) }).catch(() => {});
-        return;
+        const joined = await chrome.tabs.group({ groupId: recovered, tabIds: [tabId] }).catch(() => undefined);
+        if (joined !== undefined) {
+          this.groupIds.set(group.key, recovered);
+          if (group.label) await chrome.tabGroups.update(recovered, { title: group.label, ...colorProperty(group) }).catch(() => {});
+          return;
+        }
       }
       const groupId = await chrome.tabs.group({ tabIds: [tabId] });
       await chrome.tabGroups.update(groupId, { title: group.label, collapsed: false, ...colorProperty(group) });
@@ -653,10 +671,29 @@ export class BrowserController {
 
   /* A rename before any tab exists has no group to update yet; the label is already stored on
      the session, so the group picks it up when it is created. */
-  async renameGroup(group: GroupDescriptor): Promise<void> {
-    const groupId = this.groupIds.get(group.key);
+  async renameGroup(group: GroupDescriptor, previous = group): Promise<void> {
+    const groupId = this.groupIds.get(group.key) ?? await this.recoverGroup(previous);
     if (groupId === undefined) return;
-    try { await chrome.tabGroups.update(groupId, { title: group.label, ...colorProperty(group) }); } catch { /* group closed */ }
+    try {
+      await chrome.tabGroups.update(groupId, { title: group.label, ...colorProperty(group) });
+      this.groupIds.set(group.key, groupId);
+    } catch { /* group closed */ }
+  }
+
+  async releaseGroup(group: GroupDescriptor, released: number[], remaining: number[]): Promise<void> {
+    const groupId = this.groupIds.get(group.key) ?? await this.recoverGroup(group);
+    if (groupId === undefined) return;
+    const members = (await chrome.tabs.query({ groupId }).catch(() => []))
+      .flatMap((tab) => tab.id === undefined ? [] : [tab.id]);
+    const releasedMembers = released.filter((tabId) => members.includes(tabId));
+    const [firstReleased, ...otherReleased] = releasedMembers;
+    if (firstReleased === undefined) return;
+    if (remaining.some((tabId) => members.includes(tabId))) {
+      await chrome.tabs.ungroup([firstReleased, ...otherReleased]).catch(() => undefined);
+    } else {
+      await chrome.tabGroups.update(groupId, { title: `Released · ${group.label}`, color: "grey" }).catch(() => undefined);
+      this.groupIds.delete(group.key);
+    }
   }
 
   /* Bringing a controlled tab forward reads nothing on any origin, so it asks for no
@@ -1246,7 +1283,10 @@ export class BrowserController {
     return { ...(result.result?.value as object ?? {}), artifact: true };
   }
 
-  private async browserBatch(params: Record<string, unknown>, controlledTabIds: Set<number>, group: GroupDescriptor = DEFAULT_GROUP): Promise<unknown> {
+  private async browserBatch(
+    params: Record<string, unknown>, controlledTabIds: Set<number>, group: GroupDescriptor,
+    validateAction?: (method: string, params: Record<string, unknown>) => void
+  ): Promise<unknown> {
     const actions = Array.isArray(params.actions) ? params.actions : [];
     const results: unknown[] = [];
     for (let index = 0; index < actions.length; index += 1) {
@@ -1256,7 +1296,9 @@ export class BrowserController {
         throw connectorError("invalid_batch", `Invalid action at index ${index}`);
       }
       try {
-        results.push(await this.dispatch(action.tool, action.arguments as Record<string, unknown>, controlledTabIds, group));
+        const args = action.arguments as Record<string, unknown>;
+        validateAction?.(action.tool, args);
+        results.push(await this.dispatch(action.tool, args, controlledTabIds, group, validateAction));
       } catch (error) {
         return { completed: index, results, failedAt: index, error: normalizeError(error), atomic: false };
       }
@@ -2509,6 +2551,13 @@ function clipObserved(value: string): string {
 
 /* What an agent should do next for each failure, so an error ends a guess instead of starting one. */
 export const ERROR_HINTS: Record<string, string> = {
+  disconnected: "Reconnect the agent and refresh your tab context.",
+  control_releasing: "Refresh your tab context after the release finishes.",
+  session_host_mismatch: "Start a new Browser Connector session from this agent host.",
+  session_missing: "Start a browser task and select its session in the Connector Panel.",
+  tab_already_controlled: "Take the tab back in the Connector Panel before giving it to another session.",
+  unsupported_tab: "Choose an HTTP or HTTPS tab in the Connector Panel.",
+  tab_changed: "Check the active tab and its address before trying again.",
   stale_page_ref: "The page changed since that reference was read (navigation or re-render). Call find or read_page again and use the new reference.",
   tab_not_controlled: "Use a tab id from tabs_context for this session, or open one with tabs_create.",
   debugger_conflict: "DevTools or another debugger is attached to this tab. Ask the person to close DevTools there, or use another tab.",
