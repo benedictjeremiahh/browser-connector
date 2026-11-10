@@ -2,6 +2,8 @@
 
 <img src="extension/public/icons/128.png" alt="" width="72" height="72" align="right">
 
+A product by <img src="extension/public/icons/byceebee-symbol.svg" alt="" width="14" height="14"> ceebee.
+
 A local bridge that lets an external AI agent drive a browser you are already signed
 into. It is a Manifest V3 Chrome extension plus a Rust MCP server that speaks STDIO, so
 any agent host that can launch a local MCP server can use it — Codex, Claude, or your own.
@@ -35,7 +37,7 @@ macOS and Google Chrome. The extension and the companion are installed separatel
 
 ### Extension
 
-Install **Browser Connector** from the Chrome Web Store. For development, load
+Install [Browser Connector](https://chromewebstore.google.com/detail/browser-connector/joapggeojinhbnphdainoiinicnaaieo) from the Chrome Web Store. For development, load
 `extension/dist` from `chrome://extensions` with Developer mode on.
 
 ### Companion
@@ -98,6 +100,10 @@ numbered host name such as `🌐 OpenCode 2`. If two sessions use the same task 
 the second title gets a stable suffix. Pending approvals identify the requesting session and
 affected tab. In **Allowed sites**, use **Add current site** or enter a site address manually.
 A saved grant applies to the exact HTTP or HTTPS origin across agent sessions.
+
+![Browser Connector showing agent sessions and their controlled tabs](store/screenshot-1-docked.png)
+
+[See approvals](store/screenshot-2-panel.png) and [Allowed sites](store/screenshot-3-flow.png).
 
 ## Tools
 

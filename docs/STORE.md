@@ -1,24 +1,17 @@
 # Chrome Web Store submission pack
 
-Everything the developer console asks for, prepared. The store cannot be
-automated, but not for the reason it looks like: Chrome refuses the **debugger**
-on `chrome.google.com/webstore` ("the extensions gallery cannot be scripted"),
-and clicking and typing go through the debugger, so no field can be filled by
-driving the page. Reading is a different mechanism — `chrome.scripting` is not
-what Chrome blocks — so a controlled tab there can be inspected (its text, its
-elements, a form value) but never clicked. The developer console also sits behind
-a Google sign-in, which is a user-only step regardless.
-
-These fields are therefore pasted by hand, and the package is uploaded by hand.
+Use the [Chrome Web Store Developer Dashboard](https://chrome.google.com/webstore/devconsole/)
+to update the existing Browser Connector item, `joapggeojinhbnphdainoiinicnaaieo`.
+Upload the release ZIP and refresh the listing before submitting the update for review.
 
 ## Files
 
 | File | Where it goes |
 | --- | --- |
 | `browser-connector.zip` | **Package → Upload new package.** Build it with `node scripts/package-extension.mjs`. |
-| `store/screenshot-1-docked.png` (1280×800) | Store listing → Screenshots, first. |
-| `store/screenshot-2-panel.png` (1280×800) | Store listing → Screenshots. |
-| `store/screenshot-3-flow.png` (1280×800) | Store listing → Screenshots. |
+| `store/screenshot-1-docked.png` (1280×800) | Store listing → Screenshots, first: tab control. |
+| `store/screenshot-2-panel.png` (1280×800) | Store listing → Screenshots, second: approvals. |
+| `store/screenshot-3-flow.png` (1280×800) | Store listing → Screenshots, third: Allowed sites. |
 | `store/promo-440x280.png` | Store listing → Small promo tile. |
 | `store/promo-marquee-1400x560.png` | Store listing → Marquee promo image. PNG, 24-bit, **no alpha**, which is what the field demands. |
 | `extension/public/icons/128.png` | Already inside the package; the console also wants a store icon. |
@@ -54,80 +47,28 @@ panel still reports *disconnected* after registering, restart Chrome.
 
 **Name**: Browser Connector
 
-**Summary** (the console caps this): Drive the browser you are already signed
-into from a local AI agent. No account, no server, no telemetry.
+**Summary**: Give a local AI agent access to selected Chrome tabs. A product by ceebee.
 
 **Category**: Developer Tools
 
 Detailed description:
 
 ```text
-🚀 Browser Connector
+Browser Connector lets a local AI agent use the Chrome tabs you choose. A product by ceebee.
 
-Drive the browser you are already signed into from an AI agent running on your own
-machine. Browser Connector is a Chrome extension plus a local MCP server, built for one
-loop: build, test and debug in a real browser without copying state between tools.
+Give a tab to one session at a time. In the side panel you can bring it forward, take it back without closing it, or release every controlled tab at once. JavaScript and file transfers need your approval. The request names the session and the target tab when available.
 
-✨ What the agent can do
+Use Allowed sites to add the current site or enter an address. The panel shows the exact origin before you save it.
 
-• Read a controlled tab: accessibility tree, visible text, screenshots, console messages
-  and network metadata.
-• Act in it: navigate, click, type, scroll, drag, fill forms, upload and download files.
-• Verify the result: it sees the page after an action, including errors, notices and
-  changed elements.
+In a controlled tab, the agent can read the page, capture screenshots, inspect the console and network, and interact with the page. Its cursor shows where it acts. Page content goes to the agent host on your machine through Chrome native messaging. The extension keeps a local activity log and has no account, hosted backend, or telemetry.
 
-🔒 Local by design
-
-Everything stays on your computer. There is no account, no server and no telemetry.
-Page content travels over Chrome native messaging to the agent host you installed, and
-nowhere else.
-
-🧩 What you need
-
-1. This extension.
-2. The companion program, installed separately. It provides the MCP server and Chrome's
-   native-messaging host.
-
-📦 Install the companion
-
-npm (Node 18 or newer):
+Install the companion separately on macOS. With Node.js 18 or newer, run:
 
 npx @ceebee/browser-connector install
 
-Homebrew:
+Restart Chrome and check that the panel shows Connected. The repository has instructions for setting up your MCP client or installing with Homebrew.
 
-brew tap benedictjeremiahh/browser-connector https://github.com/benedictjeremiahh/browser-connector
-brew install benedictjeremiahh/browser-connector/browser-connector
-browser-connector install --executable "$(brew --prefix)/bin/browser-connector"
-
-Then restart Chrome and check that the Connector side panel shows Connected.
-
-🛡️ Approval and control
-
-• Pages served from your own machine (localhost, 127.0.0.1, *.localhost, *.test) need no
-  approval.
-• Any other site waits for you in the Connector Panel: once, for the session, or always.
-• In Allowed sites, add the current website or enter its address. A saved site applies
-  across sessions to that exact origin.
-• JavaScript and file transfers require explicit approval. The request names the agent
-  session and the affected tab when there is one.
-• Give a tab to a specific session, take it back, or release all tabs. Your tabs stay open.
-  The panel keeps a local activity log.
-
-🛠️ Built for developers
-
-Use it from Codex, Claude or any agent host that can launch a local MCP server. It speaks
-STDIO and works with the agent you already have.
-
-🔗 Open source
-
-Apache-2.0. Source, issues and the companion are at
 https://github.com/benedictjeremiahh/browser-connector
-
-⚠️ Development tool
-
-Once you approve a site, a paired agent can read and change it, including where you are
-signed in. Use it on sites you trust, and revoke the lease when you are done.
 ```
 
 ## Privacy practices
@@ -177,6 +118,9 @@ The console asks for one per permission. Paste these:
 - **`sidePanel`** — the Connector Panel is the status and audit view.
 - **`nativeMessaging`** — the only way to reach the local MCP server; the
   extension has no server of its own.
+- **`alarms`** — a local Chrome alarm checks for expired released tabs and orphaned
+  blank tabs created by an agent. Chrome keeps the cleanup scheduled while the
+  extension service worker sleeps.
 - **Host permissions (`http://*/*`, `https://*/*`)** — the extension cannot know
   which sites the user will ask the agent to work in, so it requests all of them.
   Access is still gated by the controlled-tab boundary: a page outside it is
@@ -192,9 +136,8 @@ The console asks for one per permission. Paste these:
 
 ## Console steps
 
-1. **Package** → upload `browser-connector.zip`. The manifest carries no `key`
-   (the store rejects one), so the id the console assigns is new. Note it down:
-   it is what step 3's `allowed_origins` must name.
+1. **Package** → upload `browser-connector.zip` to the existing item. The manifest
+   carries no development `key`. An update retains the Store extension ID.
 2. **Store listing** → name, summary, detailed description, category *Developer
    Tools*, language English, three screenshots, the small promo tile and the
    1400×560 marquee, store icon.
@@ -222,7 +165,8 @@ submitting an update.
    It prints the version and size it packed, and stops if `extension/dist` has
    no manifest, so a silent bad build cannot reach the console.
 3. **Package → Upload new package**, then **Submit for review**. An update does
-   not change the store id, so `allowed_origins` needs no edit.
+   not change the store id, so `allowed_origins` needs no edit. Choose automatic
+   publication if the release should go live once Google approves it.
 
 The one release that *does* need the native host registered is the first upload
 of a given id — see the note above. A review pass is not a test: submitting a
