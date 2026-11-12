@@ -9,12 +9,16 @@ Upload the release ZIP and refresh the listing before submitting the update for 
 | File | Where it goes |
 | --- | --- |
 | `browser-connector.zip` | **Package → Upload new package.** Build it with `node scripts/package-extension.mjs`. |
-| `store/screenshot-1-docked.png` (1280×800) | Store listing → Screenshots, first: tab control. |
-| `store/screenshot-2-panel.png` (1280×800) | Store listing → Screenshots, second: approvals. |
-| `store/screenshot-3-flow.png` (1280×800) | Store listing → Screenshots, third: Allowed sites. |
+| `store/screenshot-1-tab-control.png` (1280×800) | Store listing → Screenshots, first: tab control. |
+| `store/screenshot-2-approvals.png` (1280×800) | Store listing → Screenshots, second: approvals. |
+| `store/screenshot-3-allowed-sites.png` (1280×800) | Store listing → Screenshots, third: Allowed sites. |
 | `store/promo-440x280.png` | Store listing → Small promo tile. |
 | `store/promo-marquee-1400x560.png` | Store listing → Marquee promo image. PNG, 24-bit, **no alpha**, which is what the field demands. |
 | `extension/public/icons/128.png` | Already inside the package; the console also wants a store icon. |
+
+The three listing screenshots are composed from the 0.5.0 panel captures at
+1280×800. When the panel changes, recompose them from a fresh capture instead
+of editing the pixels; the store rejects portrait or non-1280×800 images.
 
 The package has **no `key` in its manifest**. The Web Store rejects an upload
 that carries one — *"Bidang key tidak diperbolehkan dalam manifes"* — and
@@ -54,19 +58,25 @@ panel still reports *disconnected* after registering, restart Chrome.
 Detailed description:
 
 ```text
-Browser Connector lets a local AI agent use the Chrome tabs you choose. A product by ceebee.
+🌐 Browser Connector puts a local AI agent to work in Chrome tabs you pick.
 
-Give a tab to one session at a time. In the side panel you can bring it forward, take it back without closing it, or release every controlled tab at once. JavaScript and file transfers need your approval. The request names the session and the target tab when available.
+🤖 In a controlled tab, the agent reads pages, captures screenshots, inspects the console and network, and clicks, types, or fills forms. A visible cursor shows where it acts.
 
-Use Allowed sites to add the current site or enter an address. The panel shows the exact origin before you save it.
+🗂️ A tab belongs to one agent session at a time. From the side panel, bring it forward, take control back without closing it, or release all controlled tabs.
 
-In a controlled tab, the agent can read the page, capture screenshots, inspect the console and network, and interact with the page. Its cursor shows where it acts. Page content goes to the agent host on your machine through Chrome native messaging. The extension keeps a local activity log and has no account, hosted backend, or telemetry.
+🔐 JavaScript and file transfers need approval; each request names the session and target tab when available.
 
-Install the companion separately on macOS. With Node.js 18 or newer, run:
+✅ In Allowed sites, add the current site or type an address; you see the exact origin before saving. Allowed sites persist across sessions. Allow only trusted sites: a paired agent can read and change them, including signed-in pages.
+
+🔒 Page content goes to the agent host on your computer over Chrome native messaging. There is no account, hosted backend, or telemetry; the activity log stays local.
+
+📦 Install the companion separately on macOS. With npm (Node.js 18+), run:
 
 npx @ceebee/browser-connector install
 
-Restart Chrome and check that the panel shows Connected. The repository has instructions for setting up your MCP client or installing with Homebrew.
+Restart Chrome; the panel shows Connected. The repository covers MCP client setup and Homebrew.
+
+A product by ceebee.
 
 https://github.com/benedictjeremiahh/browser-connector
 ```

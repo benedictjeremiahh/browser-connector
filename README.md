@@ -4,12 +4,13 @@
 
 A product by <img src="extension/public/icons/byceebee-symbol.svg" alt="" width="14" height="14"> ceebee.
 
-A local bridge that lets an external AI agent drive a browser you are already signed
-into. It is a Manifest V3 Chrome extension plus a Rust MCP server that speaks STDIO, so
-any agent host that can launch a local MCP server can use it — Codex, Claude, or your own.
-Nothing leaves the machine and no account exists.
+🌐 Browser Connector puts a local AI agent to work in the Chrome tabs you pick.
+It is a Manifest V3 Chrome extension plus a Rust MCP server that speaks STDIO, so any
+agent host that can launch a local MCP server can use it — Codex, Claude, or your own.
+Page content goes to the agent host on your computer through Chrome native messaging:
+no account, no hosted backend, no telemetry.
 
-**This is a development tool, and it asks only where it matters.** Pages served from this
+🛡️ **This is a development tool, and it asks only where it matters.** Pages served from this
 machine (`localhost`, `127.0.0.1`, `[::1]`, `*.localhost`, `*.test`) need no approval. Any other
 site waits for you in the Connector Panel, once, for the session, or always, and every
 `javascript_tool`, `upload_file` and `download_file` call is approved on its own.
@@ -90,20 +91,24 @@ See [docs/INSTALL.md](docs/INSTALL.md) for the Codex plugin route and troublesho
 
 ## Tab control
 
-The Connector Panel shows the active tab and each agent session. Choose a session under **Give
-control to**. Each tab can have one controlling session. **Show** brings the chosen tab forward.
-**Take back** releases that tab, keeps it open, and prevents automatic adoption until you give
-control again. **Release all tabs** applies the same behavior across sessions.
+🗂️ The Connector Panel shows the active tab and each agent session. Choose a session under
+**Give control to**. Each tab can have one controlling session. **Show** brings the chosen tab
+forward. **Take back** releases that tab, keeps it open, and prevents automatic adoption until
+you give control again. **Release all tabs** applies the same behavior across sessions.
 
 Chrome groups and the panel share a display name. Generic labels such as `Projects` use a
 numbered host name such as `🌐 OpenCode 2`. If two sessions use the same task name and emoji,
-the second title gets a stable suffix. Pending approvals identify the requesting session and
-affected tab. In **Allowed sites**, use **Add current site** or enter a site address manually.
-A saved grant applies to the exact HTTP or HTTPS origin across agent sessions.
+the second title gets a stable suffix.
 
-![Browser Connector showing agent sessions and their controlled tabs](store/screenshot-1-docked.png)
+🔐 Pending approvals identify the requesting session and affected tab.
 
-[See approvals](store/screenshot-2-panel.png) and [Allowed sites](store/screenshot-3-flow.png).
+✅ In **Allowed sites**, use **Add current site** or enter a site address manually. A saved
+grant applies to the exact HTTP or HTTPS origin across agent sessions. Allow only trusted
+sites: a paired agent can read and change them, including signed-in pages.
+
+![Browser Connector showing agent sessions and their controlled tabs](store/screenshot-1-tab-control.png)
+
+[See approvals](store/screenshot-2-approvals.png) and [Allowed sites](store/screenshot-3-allowed-sites.png).
 
 ## Tools
 
